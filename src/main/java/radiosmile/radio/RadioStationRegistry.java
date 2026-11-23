@@ -291,8 +291,8 @@ public final class RadioStationRegistry {
 		root.addProperty("_说明_播放模式", "mode 可选值见下面的示例条目；"
 				+ "单曲循环=block/false/0，列表循环=sequence/loop/true/1，随机播放=random");
 		root.addProperty("_说明_rate", "rate 是列表右侧显示的频率/档位，例如 FM90.7；不填显示 NETWORK");
-		root.addProperty("_说明_txt", "file 也可以指向一个 .txt（每行一个本地文件或网络地址，"
-				+ "第一行写 sequence 或 random 控制播放顺序）");
+		root.addProperty("_说明_txt", "file 也可以指向一个 .txt（每行一个本地文件或网络地址）；"
+				+ "txt 的第一行是打乱顺序开关：false/0=按顺序（默认），true/1=打乱");
 		root.addProperty("_说明_示例", "id 为 " + EXAMPLE_ID + " 的条目只是示范，不会被加载；"
 				+ "把 id 改成别的名字即生效");
 
@@ -346,16 +346,19 @@ public final class RadioStationRegistry {
 			}
 			String content = String.join("\n",
 					"# txt 重定向播放列表示例",
-					"# 第一行写播放模式：sequence（列表循环，按下面从上到下）或 random（随机）",
-					"# 留空则默认 sequence；这一行不是模式时会被当成普通条目",
-					"sequence",
+					"#",
+					"# 【第一行】打乱顺序开关：",
+					"#   false（或 0、或整行省略）= 不打乱，严格按下面从上到下的顺序播放",
+					"#   true （或 1）             = 打乱顺序，所有玩家听到的顺序一致",
+					"false",
 					"",
-					"# 之后每行一个来源，可以是本地文件（相对 audio/ 目录）……",
+					"# 【之后每行】一个音频来源，可以是：",
+					"#   本地文件（相对 audio/ 目录）：",
 					"sample.mp3",
-					"# ……也可以直接写网络地址（会下载到本地缓存后再转成 MP3 播放）",
+					"#   网络地址（会先下载到本地缓存，再转成 MP3 播放）：",
 					"# https://example.com/song.mp3",
 					"",
-					"# 空行与 # 开头的行会被忽略");
+					"# 空行、以及 # 开头的行都会被忽略");
 			Files.writeString(txt, content, StandardCharsets.UTF_8);
 		} catch (IOException e) {
 			SmileSRadio.LOGGER.debug("写入示例 txt 失败", e);

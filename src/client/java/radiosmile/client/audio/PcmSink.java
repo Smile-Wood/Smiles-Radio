@@ -536,6 +536,23 @@ public final class PcmSink {
 				int dropFloats = Math.min(buffer.length,
 						((overflow + OUT_CHANNELS - 1) / OUT_CHANNELS) * OUT_CHANNELS);
 				buffer.dropFront(dropFloats);
+				// <b>丢弃必须留痕</b>：这里丢掉的是<b>最旧</b>的音频，
+				// 听感是「一长串音频突然少了一块、后面的接上来」——不会报错、不会静音，
+				// 只会让人觉得"音质怪"。历史上这个症状被反复误判成解码/网络问题，
+				// 因为没有日志可查。
+				//
+				// <p>真正该触发它的场景极少（服务端配速严重过快，或客户端长时间卡住）。
+				// 一旦出现就说明<b>上游供数比声卡消费快</b>，属于 QoS 异常，必须能看见。
+				// 限流到每 5 秒最多一条，避免故障时刷屏。
+				long nowMs = System.currentTimeMillis();
+				if (nowMs - this.lastOverflowLogAt > 5000L) {
+					this.lastOverflowLogAt = nowMs;
+					SmileSRadio.LOGGER.warn(
+							"抖动缓冲溢出，丢弃 {} ms 最旧音频（缓冲上限 {} ms）——"
+									+ "通常意味着服务端发送速率高于实时播放速率",
+							Math.round(dropFloats / (float) OUT_CHANNELS / OUT_RATE * 1000),
+							Math.round(maxFloats / (float) OUT_CHANNELS / OUT_RATE * 1000));
+				}
 			}
 			buffer.append(converted, converted.length);
 		}
@@ -1758,6 +1775,9 @@ public final class PcmSink {
 	 * 太小会被直播流的正常块抖动误触发，太大会让真断线迟迟不提示。
 	 */
 	private static final int UNDERRUN_ALERT_BLOCKS = 8;
+	/** 上次打印「缓冲溢出」告警的时刻，用于限流（每次溢出都打会刷屏）。 */
+	private volatile long lastOverflowLogAt;
+
 	/** 当前已连续欠载的块数。 */
 	private int consecutiveUnderruns;
 	private long lastUnderrunsSeen;

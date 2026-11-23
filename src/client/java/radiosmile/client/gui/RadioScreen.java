@@ -40,13 +40,21 @@ public class RadioScreen extends Screen {
 	/** 音量同步节流间隔（毫秒）。 */
 	private static final long VOLUME_SYNC_INTERVAL_MS = 100L;
 	/**
-	 * 音量行程档数：<b>5 档</b>（0%、25%、50%、75%、100%）。
+	 * 音量<b>每动一次</b>的步进（百分比）。
 	 *
-	 * <p>用户要求把行程改成 5 档（原为 10 档）。档位少的好处是拖动手感干脆、
-	 * 每档差异明确听得出来；10 档在 18px 宽的滑块上每档不到 2 像素，
-	 * 拖动时几乎无法精确停在某一档。
+	 * <p>用户要求：音量条动一次 = <b>5%</b>，即 20 档（0%、5%、10% … 100%）。
+	 *
+	 * <p>注意这里和之前那次「改成 5 档」不是一回事，别搞混：
+	 * <ul>
+	 *   <li>旧值 {@code VOLUME_STEPS = 5} 表示「整条行程分 5 格」= 每格 20%；</li>
+	 *   <li>现在要的是「每格 5%」= 整条行程分 20 格。</li>
+	 * </ul>
+	 * 因此常量改成「步进百分比」，再由它反推行程格数，语义更直接、不易再误会。
 	 */
-	private static final int VOLUME_STEPS = 5;
+	private static final int VOLUME_STEP_PERCENT = 5;
+
+	/** 整条音量行程的格数（由步进百分比推出：5% -> 20 格）。 */
+	private static final int VOLUME_STEPS = 100 / VOLUME_STEP_PERCENT;
 	/** 上次音量同步时间。 */
 	private long lastVolumeSyncAt;
 	/** 是否有因节流而未发出的音量变更。 */
@@ -549,7 +557,7 @@ public class RadioScreen extends Screen {
 		float raw = (float) ((trackBottom - mouseY) / trackHeight);
 		raw = Math.max(0.0F, Math.min(1.0F, raw));
 
-		// 音量行程分 10 档（每档 10%），避免连续值在拖动时抖动
+		// 按 {@link #VOLUME_STEP_PERCENT} 量化（5% 一格），避免连续值在拖动时抖动
 		float volume = Math.round(raw * VOLUME_STEPS) / (float) VOLUME_STEPS;
 
 		// 0) 界面自己的权威值先更新（音量条读它，不再反查混音器缓存）

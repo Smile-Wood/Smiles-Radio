@@ -16,24 +16,29 @@ import radiosmile.SmileSRadio;
  *
  * <h2>文件格式</h2>
  * <pre>
- *   # 第一行是模式，可省略（省略时按 sequence 处理）
- *   sequence
+ *   # 第一行是【打乱顺序】开关，可省略（省略时 = false，按下面列出的顺序播放）
+ *   true
  *   # 之后每行一个来源，支持：
  *   #   1) 本地文件：相对 audio/ 的路径，或绝对路径
- *   2) song_a.mp3
- *   3) folder/song_b.ogg
- *   https://example.com/stream.mp3
- *   4) 空行与 # 开头的注释行会被忽略
+ *   song_a.mp3
+ *   folder/song_b.ogg
+ *   https://example.com/song.mp3
+ *   2) 空行与 # 开头的注释行会被忽略
  * </pre>
  *
- * <h2>第一行支持的取值</h2>
+ * <h2>第一行：打乱顺序（布尔值）</h2>
  * <table border="1">
  *   <tr><th>值</th><th>含义</th></tr>
- *   <tr><td>{@code sequence} / {@code order} / {@code loop}</td>
- *       <td>按文件里列出的顺序循环（默认）</td></tr>
- *   <tr><td>{@code random} / {@code shuffle}</td>
- *       <td>按固定 seed 打乱后循环（保证所有客户端顺序一致）</td></tr>
+ *   <tr><td>{@code false} / {@code 0} / 省略</td>
+ *       <td><b>不打乱</b>：严格按文件里从上到下的顺序循环（默认）</td></tr>
+ *   <tr><td>{@code true} / {@code 1}</td>
+ *       <td><b>打乱顺序</b>：按固定 seed 打乱后循环，
+ *           保证所有客户端听到的顺序完全一致</td></tr>
  * </table>
+ *
+ * <p>为什么用布尔而不是 {@code sequence}/{@code random}：
+ * 一个 txt 里只有两种互斥状态，布尔值最直接、最少歧义；
+ * 而且"顺序"其实是默认行为，不需要专门写一个词去表达它。
  *
  * <h2>网络地址怎么处理</h2>
  * <b>下载到本地并转成 MP3</b>（见 {@link RemoteAudioCache}），
@@ -177,15 +182,15 @@ public final class TxtPlaylist {
 			if (line.isEmpty()) {
 				continue;
 			}
-			// <b>第一行内容行是模式声明</b>。若它看起来不像音频来源，就按模式解析。
+			// <b>第一行内容行是「打乱顺序」布尔开关</b>（见类注释）。
+			// 若第一行既不是 true/false 也不是 0/1，就当成普通条目处理（默认不打乱）。
 			if (firstContentLine) {
 				firstContentLine = false;
-				String mode = line.toLowerCase(java.util.Locale.ROOT);
-				if (isModeKeyword(mode)) {
-					random = mode.startsWith("random") || mode.startsWith("shuffle");
+				Boolean shuffle = parseShuffleFlag(line);
+				if (shuffle != null) {
+					random = shuffle;
 					continue;
 				}
-				// 第一行不是模式关键字 → 当作普通条目处理（模式默认 sequence）
 			}
 
 			boolean isNetwork = line.startsWith("http://") || line.startsWith("https://");
@@ -258,10 +263,30 @@ public final class TxtPlaylist {
 		return false;
 	}
 
-	/** 是否是可识别的模式关键字。 */
-	private static boolean isModeKeyword(String lower) {
-		return lower.equals("sequence") || lower.equals("order") || lower.equals("loop")
-				|| lower.equals("random") || lower.equals("shuffle");
+	/**
+	 * 解析第一行的「打乱顺序」开关。
+	 *
+	 * <p>接受 {@code true}/{@code false}、{@code 1}/{@code 0}（大小写不敏感）。
+	 *
+	 * <p><b>兼容旧的单词写法</b>：{@code random}/{@code shuffle} 仍按"打乱"处理，
+	 * {@code sequence}/{@code order}/{@code loop} 按"不打乱"处理——
+	 * 这样服主已有的 txt 不会因为这次格式简化而突然改变行为。
+	 *
+	 * @return {@code true}=打乱，{@code false}=按顺序；该行不是开关时返回 {@code null}
+	 */
+	private static Boolean parseShuffleFlag(String raw) {
+		if (raw == null) {
+			return null;
+		}
+		String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+		switch (v) {
+			case "true", "1", "random", "shuffle":
+				return Boolean.TRUE;
+			case "false", "0", "sequence", "order", "loop":
+				return Boolean.FALSE;
+			default:
+				return null;
+		}
 	}
 
 	/**

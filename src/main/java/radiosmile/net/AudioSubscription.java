@@ -348,9 +348,37 @@ public final class AudioSubscription {
 		intervalMs = Math.max(20L, Math.min(1000L, intervalMs));
 
 		this.totalBytesSent += bytes;
-		// 锚点：本包发完后累计推出去的音频时长。只累加不重置，是自订阅起算的绝对量。
 		this.sentBytesFromStart += bytes;
-		this.audioSentMillis = this.sentBytesFromStart * 1000L / Math.max(1, this.bytesPerSecond);
+
+		// <b>锚点必须按「本块真实时长」累加，绝不能用「字节数 ÷ 码率」换算</b>。
+		//
+		// <h2>这曾经是播放列表「丢一半包 + 另一半变噪音」的根因</h2>
+		// 旧写法是 {@code audioSentMillis = sentBytesFromStart * 1000 / bytesPerSecond}。
+		// 对码率恒定的单曲没问题，但播放列表里
+		// {@link radiosmile.radio.PlaylistAudioSource#bytesPerSecond()} 返回的是
+		// <b>整条列表的平均码率</b>，而每首曲目的实际码率可能差一倍以上。
+		//
+		// <p>实测 realtest 列表：平均 <b>172.8 kbps</b>，但曲目分别是
+		// <b>128 kbps</b>（本地转码）与 <b>320 kbps</b>（网易云）。
+		// 于是：
+		// <ul>
+		//   <li>播 128kbps 曲目时，同样的字节被换算成 <b>1.74 倍</b>的毫秒数
+		//       → {@code desired} 大幅提前 → 服务端以约 <b>1.35 倍实时</b>速度猛发；</li>
+		//   <li>客户端缓冲持续净增长，撞上 3 秒上限后 {@code dropFront} 丢弃最旧数据
+		//       → 听感「一长串音频有规律地少了一半」；</li>
+		//   <li>播 320kbps 曲目时反向偏低到 <b>0.54 倍速</b>，缓冲被吃空、大片欠载
+		//       → 那段时间只剩静音/底噪，听感「丢的那一半变成了噪音」。</li>
+		// </ul>
+		//
+		// <p>现在改为<b>直接累加本块的真实音频时长</b>：MP3 帧头自带比特率与采样率，
+		// {@link radiosmile.radio.AudioDurationEstimator} 逐帧累加得到的毫秒数，
+		// 就是「这块音频本来要播多久」的<b>精确定义</b>，与 {@code bytesPerSecond}
+		// 这个字段是否准确完全无关。因此即使列表里混着 128k/320k、
+		// 甚至将来混入 VBR MP3，配速也不会失真。
+		//
+		// <p>{@code intervalMs} 已钳制在 [20,1000]，累加它同时保证单块异常值
+		// 不会把时间轴带飞（与它原本作为「下次发送间隔」的口径保持一致）。
+		this.audioSentMillis += intervalMs;
 
 		// 预热阶段不限速：全速补发历史内容，发送完立刻继续下一块。
 		// 此时不建立时间轴——预热包客户端是丢弃的，不该占配速；
@@ -367,10 +395,10 @@ public final class AudioSubscription {
 		// 首包立即发出、下一包在一个块时长后发出，中间不会空转。
 		if (!this.streamStarted) {
 			this.streamStarted = true;
-			// 本包之前推出去的量（按字节精确换算，不用估算器，免得两者的小误差被锚进时间轴）
-			long sentBeforeMillis = (this.sentBytesFromStart - bytes) * 1000L
-					/ Math.max(1, this.bytesPerSecond);
-			this.streamStartAt = now - Math.max(0L, sentBeforeMillis);
+			// 本包<b>之前</b>推出去的量：直接用累加值减去本块时长即可，
+			// 不再走「字节 ÷ 码率」那条会失真的换算（原因见上面锚点处的说明）。
+			long sentBeforeMillis = Math.max(0L, this.audioSentMillis - intervalMs);
+			this.streamStartAt = now - sentBeforeMillis;
 			this.nextSendAt = this.streamStartAt + this.audioSentMillis;
 			return;
 		}

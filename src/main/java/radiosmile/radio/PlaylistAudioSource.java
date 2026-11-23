@@ -184,15 +184,30 @@ public final class PlaylistAudioSource implements AudioSource {
 	}
 
 	/**
-	 * 整条列表的平均码率，<b>不是当前这首的</b>。
+	 * <b>当前正在播放那一首</b>的码率。
 	 *
-	 * <p>服务端配速把累计发送字节换算成毫秒，换算基数在订阅创建时就固定了。
-	 * 若这里随换曲返回不同值，换算基数会跳变、配速立刻失真。
-	 * 平均值对「顺序播完整条列表」这一稳态是单一基数里误差最小的。
+	 * <h2>这里曾经返回"整条列表的平均码率"，那是错的</h2>
+	 * 旧实现的理由是「配速把累计发送字节换算成毫秒，换算基数不能在换曲时跳变」。
+	 * 这个担心本身成立，但<b>解法错了</b>：用平均值回避跳变，代价是
+	 * <b>每一首的配速都算错</b>。实测 realtest 列表平均 172.8kbps，
+	 * 而曲目是 128kbps 与 320kbps 交替——偏差达 +35% / -46%：
+	 * 快的那些把客户端缓冲灌满、触发 {@code dropFront} 丢弃最旧音频
+	 * （听感「一半音频没了」），慢的那些则让缓冲饿死、大片欠载
+	 * （听感「剩下的一半是噪音」）。
+	 *
+	 * <p>根因的根因是<b>拿字节数去换算毫秒</b>这个做法本身脆弱：
+	 * 它要求码率字段在每个瞬间都精确。现在
+	 * {@code AudioSubscription.markSent()} 改为直接累加
+	 * {@link radiosmile.radio.AudioDurationEstimator} 解析出的<b>本块真实时长</b>，
+	 * 配速已与这个字段解耦。因此这里可以如实返回当前曲目的码率，
+	 * 让它只服务于「读块大小估算」这一本来用途。
 	 */
 	@Override
 	public int bytesPerSecond() {
-		return this.timeline.averageBytesPerSecond();
+		AudioSource source = this.current;
+		int live = source == null ? 0 : source.bytesPerSecond();
+		// 当前曲目还没打开（或拿不到码率）时退回平均，保证块大小估算不退化
+		return live > 512 ? live : this.timeline.averageBytesPerSecond();
 	}
 
 	@Override
