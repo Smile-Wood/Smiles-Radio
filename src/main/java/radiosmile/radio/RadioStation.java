@@ -26,11 +26,30 @@ import com.google.gson.JsonObject;
  * <p><b>关于同步</b>：随机播放绝不能在客户端用 {@link java.util.Random} 自行打乱，
  * 否则每个人听到的曲目和进度都不同。这里的 {@code seed} 让所有客户端算出同一个顺序。
  */
-public record RadioStation(String id, String name, String icon, String file, String mode, long seed) {
+public record RadioStation(String id, String name, String icon, String file, String mode, long seed,
+		String rate) {
 	/** 是否为网络流媒体（http/https 地址）。 */
 	public boolean isStreaming() {
 		return this.file != null
 				&& (this.file.startsWith("http://") || this.file.startsWith("https://"));
+	}
+
+	/**
+	 * 列表里显示的「频率/档位」文案。
+	 *
+	 * <p>{@code rate} 是给玩家看的自由文本（如 {@code FM105.7}、{@code 第一期}），
+	 * 不做任何格式校验——服主想写什么就写什么。
+	 *
+	 * <p><b>没配置时显示 {@code NETWORK}</b>：这是用户指定的默认值。
+	 * 语义上它表示"这不是一个有固定频率/期数的台，而是网络来源"，
+	 * 因此对网络电台尤其贴切；本地电台没配 {@code rate} 时同样显示它，
+	 * 免得右侧空一块、行列对不齐。
+	 */
+	public String displayRate() {
+		if (this.rate == null || this.rate.isBlank()) {
+			return "NETWORK";
+		}
+		return this.rate.trim();
 	}
 
 	/** 是否为顺序播放列表。 */
@@ -56,6 +75,7 @@ public record RadioStation(String id, String name, String icon, String file, Str
 		obj.addProperty("file", this.file);
 		obj.addProperty("mode", this.mode);
 		obj.addProperty("seed", this.seed);
+		obj.addProperty("rate", this.rate == null ? "" : this.rate);
 		return obj;
 	}
 
@@ -69,7 +89,9 @@ public record RadioStation(String id, String name, String icon, String file, Str
 				str(obj, "mode", "block"),
 				obj.has("seed") && !obj.get("seed").isJsonNull()
 						? obj.get("seed").getAsLong()
-						: deriveSeed(id));
+						: deriveSeed(id),
+				// rate 可选：不填时由 RadioStation.displayRate() 显示 NETWORK
+				str(obj, "rate", ""));
 	}
 
 	/** 未配置 seed 时按 id 派生一个稳定值，保证多次启动、多客户端结果一致。 */

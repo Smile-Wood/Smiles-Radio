@@ -459,6 +459,35 @@ public final class ClientAudioPlayer {
 	}
 
 	/**
+	 * 处理「方块上记着的频道根本不存在」这一类故障。
+	 *
+	 * <h2>为什么单独一个入口</h2>
+	 * 它和 {@link #stopForFailure(BlockPos)} 的区别在于<b>数据永远不会来</b>：
+	 * <ul>
+	 *   <li>{@code stopForFailure}：这是一次"暂时失败"，服务端可能重连、玩家可能走进范围，
+	 *       所以保留播放意图让底噪响，也留着恢复的可能；</li>
+	 *   <li>本方法：频道 id 在配置里已经不存在了（被删/改名/配置失效），
+	 *       <b>再怎么等也不会有数据</b>。但用户要求这种方块"持续噪音 + NOSIGNAL"，
+	 *       所以同样要保留意图、注册噪音归属，只是不必再给它"恢复"的期待。</li>
+	 * </ul>
+	 *
+	 * <p>之所以不直接复用 {@code stopForFailure}：那个方法依赖 {@link #REQUESTED}
+	 * （玩家点过确认）。而未知频道往往发生在"玩家进服时方块已经坏了"的场景，
+	 * 本机可能从没发出过订阅请求，{@code REQUESTED} 是空的——
+	 * 复用会导致底噪不响，正好违反用户要求。
+	 *
+	 * <p><b>线程</b>：主线程（AutoSubscriber 的 tick 回调）。
+	 */
+	public static void markUnknownStationFailure(BlockPos pos) {
+		if (pos == null) {
+			return;
+		}
+		PcmSink.INSTANCE.setPlaybackWanted(true);
+		PcmSink.INSTANCE.markFaultReported();
+		PcmSink.INSTANCE.setNetworkNoiseSource(pos);
+	}
+
+	/**
 	 * 玩家「还想要这些台的数据」的集合（方块坐标）。
 	 *
 	 * <p>与 {@link #STREAMS} 的区别：

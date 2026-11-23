@@ -139,9 +139,15 @@ public final class ClientRadioNetwork {
 							//
 							//   其它非 OK：玩家仍然想听，只是暂时失败——走 stopForFailure()，
 							//     保留播放意图，让故障提示音与自动重连都有依据。
+							// <b>UNKNOWN_STATION 也要"持续噪音"</b>（用户明确要求）：
+							// 方块记着一个不存在的频道时，玩家听到的应该是底噪，
+							// 而不是死寂——死寂分不清"设备坏了"和"台没了"。
+							// stopForFailure 保留播放意图，底噪因此有依据持续响。
 							if (status == radiosmile.net.AudioStatus.TOO_FAR) {
 								radiosmile.client.audio.ClientAudioPlayer.stop(pos);
 							} else {
+								// stopForFailure 内部已经处理了"保留播放意图 + 注册噪音归属方块"，
+								// 这里不要再重复调一遍 PcmSink（会绕开 REQUESTED 判据）。
 								radiosmile.client.audio.ClientAudioPlayer.stopForFailure(pos);
 							}
 						} else {
@@ -184,6 +190,16 @@ public final class ClientRadioNetwork {
 		if (status == radiosmile.net.AudioStatus.OK) {
 			return radiosmile.net.AudioStatus.OK;
 		}
+
+		// <b>未知频道 / 配置已失效的频道：一定要显示 NOSIGNAL</b>（用户明确要求）。
+		//
+		// 场景：方块上存着某个频道 id，但服主重载配置后那个条目没了或变无效。
+		// 这时玩家面对的是一台"有频道、却什么都放不出来"的收音机——
+		// 如果屏幕保持干净，他会以为设备坏了；显示 NOSIGNAL 才是对的。
+		if (status == radiosmile.net.AudioStatus.UNKNOWN_STATION) {
+			return status;
+		}
+
 		// 只有"数据超时/链路断了"才是信号问题
 		if (status != radiosmile.net.AudioStatus.TIMEOUT) {
 			return radiosmile.net.AudioStatus.OK;
@@ -196,6 +212,13 @@ public final class ClientRadioNetwork {
 		if (client.level.getBlockEntity(pos)
 				instanceof radiosmile.block.entity.RadioBlockEntity be) {
 			String stationId = be.getStation();
+			// <b>方块记着的频道已经不在配置里了</b>（重载后失效 / 一直被写坏）：
+			// 同样按"未知频道"报警。这条覆盖了"客户端没收到 UNKNOWN_STATION 状态包"
+			// 的情况（例如重载时玩家正好不在线、或状态包在途丢失）。
+			if (!stationId.isBlank()
+					&& radiosmile.client.radio.ClientRadioData.findStation(stationId) == null) {
+				return radiosmile.net.AudioStatus.UNKNOWN_STATION;
+			}
 			for (radiosmile.radio.RadioStation station : radiosmile.client.radio.ClientRadioData.stations()) {
 				if (station.id().equals(stationId)) {
 					return station.isStreaming()
@@ -204,7 +227,7 @@ public final class ClientRadioNetwork {
 				}
 			}
 		}
-		// 找不到频道定义：保守不显示
+		// 读不到方块（区块没加载等）：保守不显示
 		return radiosmile.net.AudioStatus.OK;
 	}
 

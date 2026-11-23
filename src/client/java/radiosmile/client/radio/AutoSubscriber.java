@@ -255,6 +255,23 @@ public final class AutoSubscriber implements ClientModInitializer {
 			// 它的数据就在服务器硬盘上，读不到是服主配置或转码的问题，
 			// 显示 NOSIGNAL 会误导玩家（明明不是网络问题）。
 			// 所以先用 {@link #isStreamingStation} 判断电台类型再决定是否点亮。
+			//
+			// <b>另外两类也要报 NOSIGNAL</b>（用户明确要求）：
+			//   1) <b>未知频道</b>：方块 NBT 里的 id 已经不在配置里（重载后被删/改名/变无效）。
+			//      它永远不会再有任何数据，属于工程性故障，必须持续提示。
+			//   2) 配置有效、但<b>已配置过却被重载搞坏</b>的频道——从客户端看就是"未知频道"，
+			//      因为服务端已把它从下发列表里摘掉了（见 RadioStationRegistry#isPlayable）。
+			// 这两种情况都没有"信号"可言，所以不受 isStreamingStation 限制。
+			boolean unknownStation = ClientRadioData.findStation(entry.getValue()) == null;
+			if (unknownStation) {
+				// 未知频道：直接点亮 + 持续噪音（不再等 8 秒超时窗口，它注定不会好）
+				ClientRadioNetwork.markLocalFault(entry.getKey(),
+						radiosmile.net.AudioStatus.UNKNOWN_STATION);
+				if (radiosmile.client.audio.ClientAudioPlayer.wantsStream(entry.getKey())) {
+					radiosmile.client.audio.ClientAudioPlayer.markUnknownStationFailure(entry.getKey());
+				}
+				continue;
+			}
 			if (stale && isStreamingStation(entry.getValue())) {
 				ClientRadioNetwork.markLocalFault(entry.getKey(),
 						radiosmile.net.AudioStatus.TIMEOUT);

@@ -55,6 +55,29 @@ public final class RadioStationRegistry {
 
 	private static volatile List<RadioStation> stations = List.of();
 	private static volatile Map<String, String> fileHashes = Map.of();
+
+	/**
+	 * <b>配置校验失败的频道 id</b>：有配置条目，但音频/文件不可用。
+	 *
+	 * <h2>为什么要把"配置失败"与"没配置"分开</h2>
+	 * 用户要求两句截然不同的处理：
+	 * <ol>
+	 *   <li><b>配置失败就不显示这个频道</b>——它根本不该出现在选台列表里，
+	 *       玩家没法选一个注定放不出来的台；</li>
+	 *   <li>但<b>已经配置好、被重载搞坏</b>的频道（以及完全不存在的未知频道）
+	 *       要<b>持续噪音 + 显示 NOSIGNAL</b>——因为玩家的收音机方块上
+	 *       还记着那个频道 id，不能让他面对一块"什么都不显示"的死方块。</li>
+	 * </ol>
+	 *
+	 * <p>判据的差别就在这：<b>列表要不要展示</b>用「配置是否有效」；
+	 * <b>方块要不要报警</b>用「该方块记的频道能否播出来」。
+	 */
+	private static volatile java.util.Set<String> invalidStationIds = java.util.Set.of();
+
+	/** 配置校验失败（音频不可用）的频道 id 集合（不可变快照）。 */
+	public static java.util.Set<String> invalidStationIds() {
+		return invalidStationIds;
+	}
 	/** 播放计时基准：所有客户端用它计算「当前应播放到第几毫秒」。 */
 	private static volatile long startEpochMillis = System.currentTimeMillis();
 	private static Path baseDir;
@@ -103,12 +126,34 @@ public final class RadioStationRegistry {
 			return;
 		}
 
-		stations = readIndex();
+		List<RadioStation> all = readIndex();
+		// <b>加载时即校验</b>：把"配置了但放不出来"的频道挑出来。
+		//
+		// 用户要求「配置失败就不显示这个频道」——所以无效条目<b>不进入 stations</b>，
+		// 客户端列表里根本看不到它；同时把 id 记进 invalidStationIds，
+		// 供"方块上还记着它"的场景去报警（持续噪音 + NOSIGNAL）。
+		//
+		// 注意这里<b>不能</b>把无效频道直接丢掉不管：玩家的收音机方块 NBT 里
+		// 可能还存着那个 id，需要在播放/显示层据此判定为未知频道。
+		java.util.Set<String> invalid = new java.util.LinkedHashSet<>();
+		List<RadioStation> valid = new ArrayList<>();
+		for (RadioStation station : all) {
+			if (isPlayable(station)) {
+				valid.add(station);
+			} else {
+				invalid.add(station.id());
+				SmileSRadio.LOGGER.warn("频道 {} 配置无效，将从列表中隐藏：{}",
+						station.id(), station.file());
+			}
+		}
+		invalidStationIds = java.util.Collections.unmodifiableSet(invalid);
+		stations = java.util.Collections.unmodifiableList(valid);
 		rebuildCacheIfChanged();
 
 		// 每次加载 / 重载都重置播放计时基准
 		startEpochMillis = System.currentTimeMillis();
-		SmileSRadio.LOGGER.info("电台配置已加载：{} 个频道，计时基准 {}", stations.size(), startEpochMillis);
+		SmileSRadio.LOGGER.info("电台配置已加载：{} 个频道（另有 {} 个配置无效已隐藏），计时基准 {}",
+				stations.size(), invalid.size(), startEpochMillis);
 	}
 
 	private static List<RadioStation> readIndex() {
@@ -185,6 +230,9 @@ public final class RadioStationRegistry {
 		obj.addProperty("icon", icon);
 		obj.addProperty("file", file);
 		obj.addProperty("mode", mode);
+		// rate 可选：列表右侧显示的频率/档位（如 FM90.7、"第一期"）。
+		// 不填则显示 NETWORK（见 RadioStation#displayRate）。
+		obj.addProperty("rate", "");
 		return obj;
 	}
 
@@ -243,6 +291,45 @@ public final class RadioStationRegistry {
 
 		// 校验完顺手预热：还没转码成 MP3 的文件在这里统一排队
 		AudioTranscoder.preheat(needBake);
+	}
+
+	/**
+	 * 该频道<b>配置是否有效</b>（能不能真正放出声）。
+	 *
+	 * <p>用于「配置失败就不显示这个频道」：
+	 * <ul>
+	 *   <li><b>网络电台</b>：只要地址是合法 http(s) 就认为有效——
+	 *       上游此刻通不通<b>不在配置校验范围内</b>（那是运行时的事，
+	 *       断流时客户端显示 NOSIGNAL，而不是把它从列表里删掉）。</li>
+	 *   <li><b>本地电台</b>：解析出的音频文件列表非空，且<b>至少有一首能转码/直接播</b>。
+	 *       文件不存在、目录为空、格式无法转码 → 无效。</li>
+	 * </ul>
+	 *
+	 * <p>这样「配了一个放不出来的本地台」不会挂在列表里误导玩家，
+	 * 而「配好的网络台偶尔断流」仍然留在列表里正常报警。
+	 */
+	public static boolean isPlayable(RadioStation station) {
+		if (station == null || station.id() == null || station.id().isBlank()) {
+			return false;
+		}
+		if (station.isStreaming()) {
+			return true;
+		}
+		List<Path> tracks = resolveTracks(station);
+		if (tracks.isEmpty()) {
+			return false;
+		}
+		// 至少有一首是可播的（MP3 原文件，或能转码的格式）
+		for (Path track : tracks) {
+			if (radiosmile.radio.AudioFormat.ofFile(track.getFileName().toString())
+					== radiosmile.radio.AudioFormat.MP3) {
+				return true;
+			}
+			if (AudioTranscoder.isTranscodableSource(track)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** 是否为示例条目：id 等于保留值 {@link #EXAMPLE_ID} 时整条忽略。 */

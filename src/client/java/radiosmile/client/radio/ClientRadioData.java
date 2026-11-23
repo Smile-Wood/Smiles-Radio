@@ -32,6 +32,24 @@ public final class ClientRadioData {
 		return stations;
 	}
 
+	/**
+	 * 按 id 找频道；找不到返回 {@code null}。
+	 *
+	 * <p>用于区分「配置里没有这个频道」与「有但暂时放不出来」——
+	 * 前者要显示 NOSIGNAL 并持续报噪音（见 {@code ClientRadioNetwork}）。
+	 */
+	public static RadioStation findStation(String stationId) {
+		if (stationId == null || stationId.isBlank()) {
+			return null;
+		}
+		for (RadioStation station : stations) {
+			if (station.id().equals(stationId)) {
+				return station;
+			}
+		}
+		return null;
+	}
+
 	public static long startEpochMillis() {
 		return startEpochMillis;
 	}

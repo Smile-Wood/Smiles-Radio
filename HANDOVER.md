@@ -717,15 +717,86 @@ JDK / 原版都没有可用的 MP3 时长解析，会导致定位逻辑整段失
 > 这些状态<b>仍然照常打日志</b>（排查需要），只是不上屏幕。
 > 这样 `NOSIGNAL` 的含义就是单一且准确的：**这台网络电台的上游断了**。
 
+#### P. 第六轮：配置校验 / 未知频道报警 / rate 字段
+
+##### 1. 配置失败的频道<b>不显示</b>
+
+新增 `RadioStationRegistry#isPlayable()`，在 `load()` 时逐条校验：
+
+- <b>网络电台</b>：合法 http(s) 即有效。上游此刻通不通<b>不算配置错误</b>——
+  断流时显示 NOSIGNAL，而不是把它从列表里删掉。
+- <b>本地电台</b>：`resolveTracks()` 非空，且至少一首是 MP3 或可转码格式。
+
+无效的频道<b>不进入 `stations`</b>（客户端列表里看不到），
+同时把 id 记进 `invalidStationIds()`，供"方块上还记着它"的场景报警。
+
+##### 2. 已配置却被重载搞坏 / 未知频道 → <b>持续噪音 + NOSIGNAL</b>
+
+关键在于分辨两种"放不出来"：
+
+| 情形 | 列表 | 方块上的表现 |
+|---|---|---|
+| 配置就写错了（文件不存在） | <b>隐藏</b> | — |
+| 配好过，重载后变无效/被删 | 隐藏 | <b>持续噪音 + NOSIGNAL</b> |
+| 方块记着完全不存在的 id | — | <b>持续噪音 + NOSIGNAL</b> |
+
+从客户端角度看，后两者是同一件事：<b>方块 NBT 里的 id 在 `ClientRadioData` 里找不到</b>。
+
+实现要点：
+- `ClientRadioData.findStation()`：判"配置里到底有没有这个频道"
+- `ClientRadioNetwork.displayStatusFor()`：`UNKNOWN_STATION` <b>一律</b>上屏幕；
+  `TIMEOUT` 时若方块 id 已不在配置中，也升级成 `UNKNOWN_STATION`
+- `AutoSubscriber`：`unknownStation` 分支<b>不等 8 秒超时窗口</b>就点亮
+  （它注定不会好，等窗口没意义），并且<b>不再发起订阅</b>
+- `ClientAudioPlayer.markUnknownStationFailure()`：<b>新入口，不复用 stopForFailure</b>。
+  原因：`stopForFailure` 依赖 `REQUESTED`（玩家点过确认），
+  而未知频道常见于"进服时方块已经坏了"，本机从没发过订阅请求、`REQUESTED` 为空，
+  复用会导致底噪不响，正好违反要求。
+
+> 注意"持续"两个字：底噪由混音器按缓冲状态维持，不会被一次状态包清掉；
+> NOSIGNAL 由方块实体状态维持，直到数据真的回来或玩家处理。
+
+##### 3. `rate` 字段（列表右侧）
+
+`RadioStation` 新增 `rate`；`displayRate()` 未配置时返回 <b>`NETWORK`</b>。
+
+界面：`RadioScreen.renderList()` 先算 rate 宽度并右对齐，
+<b>再用它反推名字可用宽度</b>（`nameBudget`）——否则长频道名会盖住 rate，两者都读不清。
+rate 用较暗的颜色，不抢频道名的注意力。
+
+示例配置与自动生成的 `stations.json` 都带上了 `rate` 键（空串 = NETWORK）。
+
+##### 4. 测试配置更新
+
+`run/saves/新的世界/serverconfig/radio-smile/stations.json` 与 `run/world/...`：
+
+| id | 内容 | rate |
+|---|---|---|
+| `tiehen` | 本地 OGG | FM105.7 |
+| `testaudio` | 本地 OGG | （空 → NETWORK）|
+| `qtfm` | 蜻蜓 FM 网络台 | （空 → NETWORK）|
+| **`fm907`** | **杭州潮流音乐电台**，`https://lhttp-hw.qtfm.cn/live/15318146/64k.mp3`，图标 `fm907.png` | **FM90.7** |
+| `broken` | 故意写一个不存在的文件 → 应被隐藏 | — |
+
+新流已实测可用：HTTP 200、`audio/mpeg`、`icy-metaint=16000`。
+
 ### 当前构建状态
 
-- **`build/libs/radio-smile-1.0.0.jar`，约 300 KB**
+- **`build/libs/radio-smile-1.0.0.jar`，约 301 KB**
 - `gradlew clean build` → BUILD SUCCESSFUL
 - **git 已初始化**（单条初始提交，含本轮全部修复）
 
 ### 待用户实测确认（下次会话优先问这些）
 
-**第五轮刚改、优先确认**：
+**第六轮刚改、优先确认**：
+- ⚠️ **配置失败的频道不出现在列表** — 测试配置里的 `broken`（文件不存在）应看不到。
+- ⚠️ **选中已配置但重载后失效的频道** → 持续噪音 + NOSIGNAL（不是死寂）。
+- ⚠️ **未知频道**（我把 `broken` 的 id 直接写进方块 NBT 也能测）→ 同样持续噪音 + NOSIGNAL。
+- ⚠️ **`fm907` 能播且显示 FM90.7 + 附图图标**；`tiehen` 显示 FM105.7；
+  其余两个显示 NETWORK。右侧文字不与应用频道名重叠。
+- ⚠️ 重载日志应有「另有 N 个配置无效已隐藏」。
+
+**第五轮**：
 - ⚠️ **自定义电台（本地文件/播放列表）断网时不应出现 NOSIGNAL** — 这是本轮收窄的重点。
   只有网络电台断流才允许点亮红灯 + NOSIGNAL。
 - ⚠️ **弱网只响底噪、不重建订阅** — 断网期间日志不应出现反复的"订阅缺失/开始自动重试"，
