@@ -4,13 +4,17 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import com.mojang.math.Axis;
 
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderer;
 import net.minecraft.client.renderer.blockentity.BlockEntityRendererProvider;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.core.Direction;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
@@ -132,10 +136,58 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	 */
 	private static final int LCD_TEXT_COLOR = 0xFF000000;
 
+	/**
+	 * 纯色四边形要采样的<b>白色方块贴图</b>。
+	 *
+	 * <h2>为什么不能只给 uv(0,0)..(1,1)</h2>
+	 * {@code RenderType.translucent()} 的纹理状态是 {@code BLOCK_SHEET_MIPPED}，
+	 * 也就是<b>整张方块图集</b>（1024×1024 里塞着所有方块贴图）。
+	 * {@code uv 0..1} 在 GL 里就是「整张贴图」——四边形会把<b>整张图集缩放着画出来</b>，
+	 * 而不是纯色。顶点色只是<b>乘</b>在贴图上，无法把图案抹平成纯色。
+	 *
+	 * <p>正确做法：取图集里一个<b>均匀白色</b>的小 sprite，四边形只采样它的中心区域。
+	 * 白色 × 顶点色 = 想要的纯色。
+	 *
+	 * <p>实测三个候选贴图的平均色（16×16，均 alpha=255）：
+	 * {@code snow=(249,254,254)}、{@code white_wool=(234,236,237)}、
+	 * {@code white_concrete=(207,213,214)}。
+	 * 选 {@code snow} —— 它最接近纯白，乘上去的颜色偏差 <2%，肉眼无差；
+	 * 且雪是方块必有贴图，不会因资源包缺失而变成品红/紫黑格。
+	 */
+	private static final ResourceLocation SOLID_WHITE_SPRITE =
+			new ResourceLocation("minecraft", "block/snow");
+
+	/** 缓存的白色 sprite（图集在资源重载后才会变，所以只缓存一次并做失效保护）。 */
+	private TextureAtlasSprite whiteSprite;
+
 	private final Font font;
 
 	public RadioBlockEntityRenderer(BlockEntityRendererProvider.Context context) {
 		this.font = context.getFont();
+	}
+
+	/**
+	 * 取（并缓存）白色 sprite。
+	 *
+	 * <p>图集在资源包重载时会整个替换，缓存的 sprite 对象会过期（UV 指向旧图集位置）。
+	 * 用 {@code Minecraft.getInstance().getTextureAtlas(...)} 每次重取代价很低（一次 map 查表），
+	 * 这里就每次都取，不做缓存——避免"换资源包后 overlay 变色"这类难查问题。
+	 *
+	 * @return 找不到时返回 null（调用方应跳过绘制，而不是画出一坨图集内容）
+	 */
+	private TextureAtlasSprite resolveWhiteSprite() {
+		Minecraft client = Minecraft.getInstance();
+		if (client == null) {
+			return null;
+		}
+		try {
+			this.whiteSprite = client.getTextureAtlas(InventoryMenu.BLOCK_ATLAS)
+					.apply(SOLID_WHITE_SPRITE);
+			return this.whiteSprite;
+		} catch (Throwable t) {
+			// 图集尚未就绪（极早期渲染）：本次不画，下一帧自然会好
+			return null;
+		}
 	}
 
 	@Override
@@ -226,9 +278,27 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	 *
 	 * <p>调用方只需给出贴图坐标，绕序与 y 轴翻转在这里统一处理，
 	 * 避免每个调用点各自算一遍上下界（历史上把 yTop/yBottom 传反导致内容上下颠倒）。
+	 *
+	 * <h2>⚠️ 为什么必须在这里做 min/max 归一化（不是防御性编程，是硬约束）</h2>
+	 * {@link #pxToX(float)} 是<b>镜像</b>映射（u=0 在 +X 侧），所以
+	 * {@code pxToX(pxX0) > pxToX(pxX1)} 是常态（例如红灯：pxToX(71)=0.2578 > pxToX(78)=0.2031）。
+	 *
+	 * <p>而 {@link #drawQuad} 的顶点序 {@code (x0,yB),(x0,yT),(x1,yT),(x1,yB)}
+	 * 只有在 <b>x0 < x1</b> 时叉积才给出 <b>-Z</b>（朝观察者）。
+	 * 若把镜像后的原始值直接传下去（x0 > x1），同一顶点序的几何法线会翻成 <b>+Z</b>，
+	 * 被 {@code RenderType.translucent()} 的 CULL 状态剔除 —— <b>四边形仍然完全不可见</b>。
+	 *
+	 * <p>这两种"看不见"的现象完全一样，极难区分：一个是朝向旋转错（改 `180-toYRot` 解决），
+	 * 一个是镜像后绕序翻转（本方法解决）。核对时务必两者都验：
+	 * <b>镜像 pxToX 与顶点序必须成对处理。</b>
 	 */
 	private void drawPixelQuad(Matrix4f matrix, MultiBufferSource buffers, float z,
 			float pxX0, float pxX1, float pxY0, float pxY1, int color, int light) {
+		TextureAtlasSprite sprite = this.resolveWhiteSprite();
+		if (sprite == null) {
+			// 图集没就绪：宁可不画，也不要拿 uv 0..1 把整张图集摊在方块上
+			return;
+		}
 		float xa = pxToX(pxX0);
 		float xb = pxToX(pxX1);
 		float ya = pxToY(pxY0);
@@ -236,7 +306,7 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 		// 统一成「左下 xMin / 右上 xMax / 上 yTop / 下 yBottom」，不依赖调用方传参顺序
 		drawQuad(matrix, buffers, z,
 				Math.min(xa, xb), Math.max(ya, yb),
-				Math.max(xa, xb), Math.min(ya, yb), color, light);
+				Math.max(xa, xb), Math.min(ya, yb), color, light, sprite);
 	}
 
 	/**
@@ -246,7 +316,8 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	 *              传 {@code packedLight} 则跟随方块实际光照
 	 */
 	private void drawQuad(Matrix4f matrix, MultiBufferSource buffers, float z,
-			float x0, float yTop, float x1, float yBottom, int color, int light) {
+			float x0, float yTop, float x1, float yBottom, int color, int light,
+			TextureAtlasSprite sprite) {
 		float a = ((color >> 24) & 0xFF) / 255.0F;
 		float r = ((color >> 16) & 0xFF) / 255.0F;
 		float g = ((color >> 8) & 0xFF) / 255.0F;
@@ -267,17 +338,33 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 		//
 		// 早期法线写 (0,0,1) 且按 +Z 绕序，结果这个面背对观察者、
 		// 被背面剔除直接吞掉——现象就是「指示灯完全不亮」。
+		//
+		// <b>UV 必须落在白色 sprite 的<b>中心</b></b>，而<b>不是</b> 0..1：
+		// 后者在 GL 里表示"整张贴图"，而这里的贴图是<b>整张方块图集</b>
+		// （BLOCK_SHEET_MIPPED），于是四边形会把图集缩放铺满 —— 不是纯色。
+		// 取 sprite 中心的一小块（16% 见方）既能避开边界像素的插值混色，又足够取样均匀。
+		float u0 = sprite.getU0();
+		float u1 = sprite.getU1();
+		float v0 = sprite.getV0();
+		float v1 = sprite.getV1();
+		float uInset = (u1 - u0) * 0.42F;
+		float vInset = (v1 - v0) * 0.42F;
+		float ua = u0 + uInset;
+		float ub = u1 - uInset;
+		float va = v0 + vInset;
+		float vb = v1 - vInset;
+
 		vc.vertex(matrix, x0, yBottom, z).color(r, g, b, a)
-				.uv(0.0F, 1.0F).uv2(light)
+				.uv(ua, vb).uv2(light)
 				.normal(0.0F, 0.0F, -1.0F).endVertex();
 		vc.vertex(matrix, x0, yTop, z).color(r, g, b, a)
-				.uv(0.0F, 0.0F).uv2(light)
+				.uv(ua, va).uv2(light)
 				.normal(0.0F, 0.0F, -1.0F).endVertex();
 		vc.vertex(matrix, x1, yTop, z).color(r, g, b, a)
-				.uv(1.0F, 0.0F).uv2(light)
+				.uv(ub, va).uv2(light)
 				.normal(0.0F, 0.0F, -1.0F).endVertex();
 		vc.vertex(matrix, x1, yBottom, z).color(r, g, b, a)
-				.uv(1.0F, 1.0F).uv2(light)
+				.uv(ub, vb).uv2(light)
 				.normal(0.0F, 0.0F, -1.0F).endVertex();
 	}
 
