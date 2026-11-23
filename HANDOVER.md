@@ -971,9 +971,47 @@ https://example.com/song.mp3
 - `AudioTranscoder.cacheKey()` **同步改用同一函数**——两处不一致会导致
   "校验认为没变、但缓存键变了"，表现为每次启动都重新转码却始终不命中缓存
 
+#### U. 第十一轮：真实网络链接适配（B 站 .m4s / 网易云 .mp3）
+
+用用户提供的真实链接实测，发现并修掉 5 个缺陷：
+
+| # | 缺陷 | 修复 |
+|---|---|---|
+| 1 | `.m4s` 不在转码白名单 → B 站链接直接被跳过 | 白名单加入 `m4s/mp4/mkv/webm`。**实测 .m4s 是 MP4/ISO-BMFF 容器**（magic `ftypiso5`，音轨 AAC 48kHz 立体声），ffmpeg 能正常提取 |
+| 2 | Content-Type 不可信：B 站代理把 .m4s 标成 `audio/mpeg` | 不依赖响应头判格式，只看扩展名 + 交给 ffmpeg |
+| 3 | 无扩展名 URL 下载成 `.bin` 后永远转不了码 | 新增**魔数嗅探** `sniffAndRename`：按文件头识别 mp3/ogg/flac/wav/m4a 并改名 |
+| 4 | **临时签名链接过期后缓存被误丢** | 关键取舍：**拿不到校验证明 ≠ 文件变了**。请求失败/不返回 206 时**继续信任已有缓存**（本地文件是完整的），只有"拿到新头部却对不上"才判失效 |
+| 5 | 解析阶段每条网络地址等 1 秒做 Range 校验 | 解析只查本地存在性（`verify=false`），有效性校验带 **10 分钟 TTL 缓存**。实测 **4477ms → 216ms（20 倍）** |
+
+##### 实测结果（真实链接）
+
+| 链接 | 结果 |
+|---|---|
+| 网易云 .mp3（6.8MB） | 下载 1.8s，原生 MP3 无需转码，二次命中 **24ms** |
+| B 站 .m4s（4.5MB） | 下载 12.4s，识别为 `.m4s`，转出 **3分11秒** MP3 |
+| 校验包 | 每个 8200 字节（8KB 头部 + 8 字节长度） |
+
+##### 测试配置
+
+`run/config/radio-smile/audio/realtest.txt`：
+
+```
+sequence
+test_station.ogg          # 本地
+https://.../xxx.mp3       # 网易云
+https://.../xxx.m4s       # B站（m4s）
+https://.../yyy.mp3
+https://.../yyy.m4s
+```
+
+调 `realtest` 频道即可验证：前 4 个已缓存立即可播，未缓存的挂起并后台下载。
+
+> ⚠️ **B 站链接带 `deadline` 参数，约 2 小时后失效**。失效后再校验会走"拿不到证明 → 沿用缓存"分支，
+> 已下载的文件仍能正常播放。但要重新下载就必须换新链接。
+
 ### 当前构建状态
 
-- **`build/libs/radio-smile-1.0.0.jar`，约 320 KB**
+- **`build/libs/radio-smile-1.0.0.jar`，约 323 KB**
 - `gradlew clean build` → BUILD SUCCESSFUL
 - **git 已初始化**（单条初始提交，含本轮全部修复）
 

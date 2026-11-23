@@ -207,7 +207,11 @@ public final class TxtPlaylist {
 			// 这份 txt 的解析会一直阻塞（它被 resolveTracks/isPlayable 反复调用）。
 			// 现在改为：缓存命中就立刻并入可播列表；未命中就记为<b>挂起</b>，
 			// 播放到那一行时直接跳过，等后台下完再自然生效。
-			Path cached = RemoteAudioCache.cachedFileIfValid(line);
+			// <b>解析阶段不做网络校验</b>（verify=false）：
+			// 解析会被 resolveTracks() 反复调用，而每次 Range 请求实测约 1 秒/条目，
+			// 一份含 4 个网络地址的 txt 就要卡 4.5 秒。
+			// 这里只看"本地有没有这个文件"，真正的有效性校验推迟到播放时（那里有 TTL 缓存）。
+			Path cached = RemoteAudioCache.cachedFileIfValid(line, false);
 			if (cached != null) {
 				entries.add(cached);
 			} else {

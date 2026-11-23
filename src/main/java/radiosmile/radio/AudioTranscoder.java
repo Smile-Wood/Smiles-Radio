@@ -56,7 +56,16 @@ public final class AudioTranscoder {
 			"mp3",
 			// 常见无损 / 有损音频源格式，全部经 ffmpeg 转成 MP3 后再推流
 			"wav", "ogg", "oga", "flac", "m4a", "aac", "opus",
-			"wma", "aiff", "aif", "alac", "ape", "wv");
+			"wma", "aiff", "aif", "alac", "ape", "wv",
+			// <b>流媒体分片格式</b>：B 站等站点的音轨分片就是 .m4s
+			// （实际是 MP4/ISO-BMFF 容器，实测 magic 为 `ftypiso5`）。
+			// 有些站点还会把 Content-Type 误标成 audio/mpeg，
+			// 所以<b>不能靠响应头判断格式，只能看扩展名 + 交给 ffmpeg</b>。
+			// 注意：这里收 \"m4s\" 只是让 ffmpeg 有机会试着解码，
+			// 真正能不能转仍由 ffmpeg 决定——这正是本白名单的一贯原则。
+			"m4s",
+			// 常见视频容器（有些音频直链其实封装在视频容器里，取音轨即可）
+			"mp4", "mkv", "webm");
 
 	/**
 	 * 该文件是否是「可转码的音频源」。
