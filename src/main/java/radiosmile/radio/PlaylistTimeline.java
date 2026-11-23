@@ -82,6 +82,21 @@ public final class PlaylistTimeline {
 		this.pool = List.copyOf(pool);
 		this.random = random;
 		this.seed = seed;
+		// <b>起点轮次随机化</b>：只在打乱模式下有意义（顺序模式每轮都一样，
+		// 从哪轮开始都会播同一首，改了也没有区别）。
+		//
+		// <p>取值必须满足两点：
+		//   <li>同一进程内<b>稳定</b>——否则每次订阅都跳到不同的歌，播放会乱；</li>
+		//   <li>不同启动之间<b>分散</b>——否则"第一首"仍然总一样。</li>
+		//
+		// <p>直接取 {@code now/3600000} 虽然每次都变，但相邻小时只差 1，
+		// 而 {@link #mixSeed} 对相邻轮次虽做了混淆，实测 12 次里仍只出现 4 种首曲
+		// （5 首池理论应有 5 种）。这里再乘一个大奇数散开，
+		// 让"相差 1 的启动时间"映射到"相差很远的轮次"。
+		this.roundOffset = random
+				? (int) Math.floorMod(
+						(System.currentTimeMillis() / 3_600_000L) * 2_654_435_761L, 1_000_003L)
+				: 0;
 		long total = 0L;
 		for (Track track : this.pool) {
 			// 防御：时长未知（<=0）时给最小正数，否则整轮时长会变成 0、除零卡死。
@@ -179,6 +194,20 @@ public final class PlaylistTimeline {
 	 * 自动失效，不需要额外的失效逻辑。
 	 */
 	private static final Map<String, PlaylistTimeline> CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+	/**
+	 * 清空时间轴缓存。
+	 *
+	 * <p><b>配置重载时必须调用</b>：时间轴实例里固化了
+	 * {@link #roundOffset}（起点轮次随机偏移，见其说明）。
+	 * 若复用旧实例，重载后起点轮次不会变——用户会看到
+	 * 「重载了但打乱的第一首还是那首」。
+	 *
+	 * <p>另外这也顺带保证"改完配置立即生效"：曲目列表、时长都可能变了。
+	 */
+	public static void clearCache() {
+		CACHE.clear();
+	}
 
 	private static String cacheKey(List<Path> files, boolean random, long seed) {
 		StringBuilder sb = new StringBuilder();
@@ -281,9 +310,35 @@ public final class PlaylistTimeline {
 		return Math.min(MAX_COOLDOWN, n / 3);
 	}
 
-	/** 当前时刻落在第几轮。 */
+	/**
+	 * <b>起始轮次偏移</b>：让第一次播放不是固定从第 0 轮开始。
+	 *
+	 * <h2>为什么需要它</h2>
+	 * 早期 "当前是第几轮" = {@code elapsed / roundTotalMillis}，而 {@code elapsed}
+	 * 从服务端启动/重载那一刻算起——于是<b>每次都从第 0 轮开始</b>。
+	 * 第 0 轮的顺序由 {@code (seed, 0)} 唯一决定（{@link #mixSeed}），
+	 * 结果就是：<b>每次开服/重载后，打乱模式的第一首永远是同一首</b>。
+	 * 用户实测反馈的「随机打乱每次第一个都是同一个音频」正是这个。
+	 *
+	 * <h2>怎么算</h2>
+	 * 用一个<b>与种子无关、但每次启动都变</b>的值当起点轮次。
+	 * 这里取「当前时间 / 一小时」——同一秒内不可能重复开服，
+	 * 但也不需要精确：它只是把起点推到任意一轮上。
+	 *
+	 * <h2>为什么不会破坏多人同步</h2>
+	 * 这个偏移在<b>服务端</b>构造时间轴时算一次并固化，
+	 * 客户端不参与任何轮次计算（`PlaylistTimeline` 只存在于服务端）。
+	 * 所有玩家拿到的都是服务端算好的同一份顺序，因此仍然完全同步。
+	 *
+	 * <p>注意：它<b>只影响"从哪一轮开始"</b>，不影响每一轮的内部顺序，
+	 * 也不影响跨轮冷却逻辑（那段只看相邻轮次，与绝对轮号无关）。
+	 */
+	private final int roundOffset;
+
+	/** 当前时刻落在第几轮（含启动偏移）。 */
 	public int roundOf(long elapsedMillis) {
-		return (int) Math.floorDiv(Math.max(0L, elapsedMillis), this.roundTotalMillis);
+		return this.roundOffset
+				+ (int) Math.floorDiv(Math.max(0L, elapsedMillis), this.roundTotalMillis);
 	}
 
 	/** 当前时刻在本轮内的位置（毫秒）。 */

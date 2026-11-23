@@ -205,8 +205,11 @@ public final class RadioStationRegistry {
 		// 旧位置（存档内 serverconfig）→ 新位置，只在"新位置还没有配置"时搬
 		migrateFromWorldIfNeeded(worldRoot);
 
-		// 配置重载：清掉各层缓存，保证内容变更立即生效
+		// 配置重载：清掉各层缓存，保证内容变更立即生效。
+		// PlaylistTimeline 也要清：它固化了「起点轮次随机偏移」，
+		// 复用旧实例会导致重载后打乱模式的第一首仍然是同一首。
 		TxtPlaylist.clearCache();
+		radiosmile.radio.PlaylistTimeline.clearCache();
 		clearIconCache();
 
 		List<RadioStation> all = readIndex();
