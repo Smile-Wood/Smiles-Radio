@@ -46,6 +46,18 @@ public final class AutoSubscriber implements ClientModInitializer {
 	private final Map<BlockPos, Long> lastResubscribeAt = new HashMap<>();
 
 	/**
+	 * 已经为哪些方块打过「开始自动重试」的日志。
+	 *
+	 * <p>用来把重试日志压成<b>每次故障一行</b>：断网时重订阅每 6 秒一次，
+	 * 若每次都打 WARN，一次故障就能刷满日志。恢复后从这里移除，下次故障才会再报。
+	 */
+	private final java.util.Set<BlockPos> retryLogged = new java.util.HashSet<>();
+
+	/**
+	 * 已经为哪些方块打过「开始自动重试」的日志。
+	 *
+
+	/**
 	 * 同一方块两次重订阅之间的最小间隔（毫秒）。
 	 *
 	 * <p>取 6 秒：比网络流建连（约 1 秒）+ 首块缓冲（约 0.3 秒）宽裕得多，
@@ -61,6 +73,7 @@ public final class AutoSubscriber implements ClientModInitializer {
 				// 离开世界：清空本地记录并重置计数，
 				// 否则下次进入时可能带着旧计数，导致首次扫描被推迟。
 				this.subscribed.clear();
+				this.retryLogged.clear();
 				this.tickCounter = 0;
 				return;
 			}
@@ -158,8 +171,20 @@ public final class AutoSubscriber implements ClientModInitializer {
 			boolean canRetry = System.currentTimeMillis() - this.lastResubscribeAt
 					.getOrDefault(entry.getKey(), 0L) >= RESUBSCRIBE_INTERVAL_MS;
 			if (isNew || (stalled && canRetry)) {
-				SmileSRadio.LOGGER.info("[自动订阅] {} @{}（{}）", entry.getValue(), entry.getKey(),
-						isNew ? "新增/换台" : (stale ? "数据超时，重新拉流" : "恢复中断"));
+				// <b>日志只在「开始」时打一次</b>，不随每次重试重复。
+				//
+				// 早期这里是 INFO 级、每次重订阅都打一条。真断网时扫描每 0.5 秒一次、
+				// 退避 6 秒，一次故障就能刷出几十行「数据超时，重新拉流」——
+				// 用户实测反馈「现在会刷屏」。恢复的「结束」日志由音频摄入线程在
+				// 真正收到数据时打（见 ClientAudioPlayer 的恢复日志），这里只管开始。
+				if (isNew) {
+					SmileSRadio.LOGGER.info("[自动订阅] 开始接收 {} @{}", entry.getValue(), entry.getKey());
+				} else if (!this.retryLogged.contains(entry.getKey())) {
+					// 同一方块在一次故障里只报一次「开始重试」。
+					this.retryLogged.add(entry.getKey());
+					SmileSRadio.LOGGER.warn("[自动订阅] {} 无数据，开始自动重试 @{}",
+							entry.getValue(), entry.getKey());
+				}
 				this.lastResubscribeAt.put(entry.getKey(), System.currentTimeMillis());
 				ClientRadioNetwork.subscribeAudio(entry.getKey(), entry.getValue());
 			}
@@ -200,6 +225,14 @@ public final class AutoSubscriber implements ClientModInitializer {
 			if (!found.containsKey(entry.getKey())) {
 				ClientRadioNetwork.unsubscribeAudio(entry.getKey());
 				radiosmile.client.audio.ClientAudioPlayer.stop(entry.getKey());
+				this.retryLogged.remove(entry.getKey());
+			}
+		}
+		// 已经在正常收流的不再算「重试中」：撤掉标记，
+		// 这样它下次真的断线时还能再报一次「开始自动重试」。
+		for (BlockPos pos : found.keySet()) {
+			if (radiosmile.client.audio.ClientAudioPlayer.isStreaming(pos)) {
+				this.retryLogged.remove(pos);
 			}
 		}
 

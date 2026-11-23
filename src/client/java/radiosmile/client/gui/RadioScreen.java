@@ -39,8 +39,14 @@ public class RadioScreen extends Screen {
 	private static long lastRequestMillis;
 	/** 音量同步节流间隔（毫秒）。 */
 	private static final long VOLUME_SYNC_INTERVAL_MS = 100L;
-	/** 音量行程档数：10 档（0%、10%、20% … 100%）。 */
-	private static final int VOLUME_STEPS = 10;
+	/**
+	 * 音量行程档数：<b>5 档</b>（0%、25%、50%、75%、100%）。
+	 *
+	 * <p>用户要求把行程改成 5 档（原为 10 档）。档位少的好处是拖动手感干脆、
+	 * 每档差异明确听得出来；10 档在 18px 宽的滑块上每档不到 2 像素，
+	 * 拖动时几乎无法精确停在某一档。
+	 */
+	private static final int VOLUME_STEPS = 5;
 	/** 上次音量同步时间。 */
 	private long lastVolumeSyncAt;
 	/** 是否有因节流而未发出的音量变更。 */
@@ -399,7 +405,8 @@ public class RadioScreen extends Screen {
 		// 它在 init() 时从方块 NBT 读一次，之后由拖动/确认维护。
 		float volume = this.currentVolume;
 		int trackHeight = trackBottom - trackTop;
-		// 与 5 档行程对齐，让滑块位置与实际音量一致
+		// 与 {@link #VOLUME_STEPS} 档行程对齐：滑块只停在档位上，
+		// 而不是显示任意中间值——否则"拖到 62%"这种位置会让人以为还能更细。
 		int filled = Math.round(trackHeight * volume);
 		graphics.fill(trackX, trackBottom - filled, trackX + 4, trackBottom, 0xFF7ED97E);
 

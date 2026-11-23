@@ -707,6 +707,11 @@ public final class ClientAudioPlayer {
 			}
 			radiosmile.client.radio.ClientRadioNetwork.markLocalFault(
 					snapshot, radiosmile.net.AudioStatus.OK);
+			// <b>本次故障的「结束」日志</b>：只在死亡→存活的那一次跳变打印。
+			// 恢复的日志必须在这里而不是每秒的扫描里，否则又会变成刷屏。
+			SmileSRadio.LOGGER.info("音频已恢复 @{}", snapshot);
+			// 允许该方块下次故障时再报一次日志
+			resetFaultLog(snapshot);
 		});
 	}
 
@@ -761,5 +766,49 @@ public final class ClientAudioPlayer {
 	public static void noteFaultShown(boolean shown) {
 		faultShown = shown;
 		FAULT_GENERATION.incrementAndGet();
+	}
+
+	/**
+	 * 上次为哪个方块、哪种状态打过故障日志。
+	 *
+	 * <p>用途见 {@link #logFaultOnce(BlockPos, int)}。只记最近一次：
+	 * 正常情况下同时出问题的收音机很少，用单个槽位足够，也避免再引入一张会漏清理的 Map。
+	 */
+	private static volatile long lastFaultLoggedPos = Long.MIN_VALUE;
+	private static volatile int lastFaultLoggedStatus = Integer.MIN_VALUE;
+
+	/**
+	 * <b>同一方块的同一种故障只打一条日志。</b>
+	 *
+	 * <h2>为什么需要它</h2>
+	 * 断网重试期间，服务端可能对同一次失败反复回同一个状态码；
+	 * 客户端每次收到都打一条 WARN，一次断网就能刷出几十行完全相同的
+	 * 「音频订阅失败 @... status=N」——用户实测反馈「现在会刷屏」。
+	 *
+	 * <p>判据是「<b>方块 + 状态码</b>都没变」：换了台、或故障类型变了（比如从
+	 * NO_AUDIO 变成 TIMEOUT）仍然会照常报，信息不丢。
+	 *
+	 * <p><b>线程</b>：只在客户端主线程调用（S2C 处理器里已经 {@code client.execute}）。
+	 */
+	public static void logFaultOnce(BlockPos pos, int status) {
+		if (pos == null) {
+			return;
+		}
+		long key = pos.asLong();
+		if (key == lastFaultLoggedPos && status == lastFaultLoggedStatus) {
+			return;
+		}
+		lastFaultLoggedPos = key;
+		lastFaultLoggedStatus = status;
+		SmileSRadio.LOGGER.warn("音频订阅失败 @{} status={}（自动重试中，后续重复不再打印）",
+				pos, status);
+	}
+
+	/** 故障结束后调用：让同一个方块的故障日志下次还能再报一次。 */
+	public static void resetFaultLog(BlockPos pos) {
+		if (pos != null && pos.asLong() == lastFaultLoggedPos) {
+			lastFaultLoggedPos = Long.MIN_VALUE;
+			lastFaultLoggedStatus = Integer.MIN_VALUE;
+		}
 	}
 }

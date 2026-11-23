@@ -25,7 +25,7 @@ import radiosmile.block.entity.RadioBlockEntity;
 import radiosmile.net.AudioStatus;
 
 /**
- * 收音机方块的状态显示层：<b>故障时</b>点亮红灯并在液晶屏上写出错误码。
+ * 收音机方块的状态显示层：<b>故障时</b>红灯快闪，并在液晶屏上写出 {@code NOSIGNAL}。
  *
  * <h2>为什么用 BlockEntityRenderer 而不是改方块模型</h2>
  * 需求是「故障时<b>无视亮度</b>」。1.20.1 的原版方块模型没有自发光（emissive）支持，
@@ -129,6 +129,32 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	private static final int LED_COLOR_FAULT = 0xFFFF2020;
 
 	/**
+	 * 故障时红灯<b>闪烁</b>的半周期（毫秒）。
+	 *
+	 * <p>红灯是「通路坏了」的告警灯，真实设备上就是一闪一闪的；
+	 * 常亮反而像"电源正常"。
+	 *
+	 * <p>取 <b>250ms</b>（即 2Hz、每 0.5 秒一个明暗周期）——用户反馈「闪得快一点」，
+	 * 这个速率既明显又不刺眼。再快（≤120ms）会和显示器刷新产生拍频，
+	 * 看起来像"抖动"而不是"闪"。
+	 *
+	 * <p>用墙钟而不是 {@code level.getGameTime()}：后者受暂停影响，
+	 * 单人游戏暂停时灯会"冻"在半亮状态，很怪。
+	 */
+	private static final long LED_BLINK_HALF_PERIOD_MS = 250L;
+
+	/**
+	 * 液晶屏上显示的故障文字。
+	 *
+	 * <p>用户要求把 {@code ERRnnn} 改成 <b>{@code NOSIGNAL}</b>：
+	 * 玩家不需要看懂错误码，只需要知道「没信号」。
+	 *
+	 * <p><b>不闪烁、常显</b>——文字是给人读的，闪起来根本读不清；
+	 * 需要"闪"的是红灯，那是余光可见的告警信号。两者职责不同。
+	 */
+	private static final String FAULT_TEXT = "NOSIGNAL";
+
+	/**
 	 * 液晶屏文字颜色：<b>黑色</b>。
 	 *
 	 * <p>用户明确要求「字要黑的」。真实设备上液晶的笔画是深色（透光/遮光），
@@ -218,20 +244,41 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 		// 才能压住方块表面而不被它遮挡。
 		float z = FRONT_Z - Z_EPSILON;
 
-		// 1) 红灯（POWER 指示灯）：<b>最大亮度</b>。
+		// 1) 红灯（POWER 指示灯）：<b>最大亮度</b> + <b>快闪</b>。
 		//
 		// 真实设备的电源灯是自发光的，暗处也必须看得见——这是「设备是否通电」
 		// 的唯一视觉信号，若跟着环境变暗就失去意义，所以用 FULL_BRIGHT。
 		//
+		// 故障时按 {@link #LED_BLINK_HALF_PERIOD_MS} 闪烁：灭相时<b>整个四边形都不画</b>
+		// （而不是画成黑色）——方块本身的贴图上那里是暗红"未点亮"状态，
+		// 不画就自然露出它，观感正是"灯灭了"。
+		//
 		// <b>液晶屏底色不绘制</b>：用户要求保持贴图原样，只有文字变黑。
-		drawPixelQuad(matrix, buffers, z,
-				LED_PX_X0, LED_PX_X1, LED_PX_Y0, LED_PX_Y1,
-				LED_COLOR_FAULT, LightTexture.FULL_BRIGHT);
+		if (blinkOn()) {
+			drawPixelQuad(matrix, buffers, z,
+					LED_PX_X0, LED_PX_X1, LED_PX_Y0, LED_PX_Y1,
+					LED_COLOR_FAULT, LightTexture.FULL_BRIGHT);
+		}
 
-		// 2) 错误码文字：黑色，写在贴图自带的绿色液晶屏上。
-		drawFaultText(pose, buffers, be, fault, z, packedLight);
+		// 2) NOSIGNAL 文字：黑色，写在贴图自带的绿色液晶屏上。
+		// <b>不跟随闪烁</b>：文字要能读，闪起来就废了（见 FAULT_TEXT 说明）。
+		drawFaultText(pose, buffers, z, packedLight);
 
 		pose.popPose();
+	}
+
+	/**
+	 * 当前是否是红灯的「亮」相。
+	 *
+	 * <p>用 {@link System#currentTimeMillis()} 而不是游戏时间：
+	 * 游戏暂停（单人 ESC / 后台）时美术资源仍会渲染一帧，
+	 * 用 {@code level.getGameTime()} 会让灯卡在某一个相位不动。
+	 *
+	 * <p>纯函数、无状态：同一帧内红灯与文字各调一次也不会看到不同结果
+	 * （文字本来就不闪，这里只是说明为什么不做"计时器累加"）。
+	 */
+	private static boolean blinkOn() {
+		return (System.currentTimeMillis() / LED_BLINK_HALF_PERIOD_MS) % 2L == 0L;
 	}
 
 	/**
@@ -369,7 +416,7 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	}
 
 	/**
-	 * 在液晶屏区域写出错误码（<b>黑色</b>）。
+	 * 在液晶屏区域写出 <b>{@code NOSIGNAL}</b>（黑色，常显不闪）。
 	 *
 	 * <h2>文字变换为什么是 {@code scale(s, -s, s)} 再绕 Y 转 180°</h2>
 	 * 字体空间约定：{@code +x} = 阅读方向（向右），{@code +y} = <b>向下</b>，
@@ -392,21 +439,28 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	 * <p>旧实现只有 {@code scale(s, s, s)}、缺了 {@code -s}，
 	 * 于是文字上下颠倒；再叠加当时错误的朝向旋转，最终呈「镜像 + 倒置」。
 	 */
-	private void drawFaultText(PoseStack pose, MultiBufferSource buffers, RadioBlockEntity be,
-			int fault, float z, int packedLight) {
+	private void drawFaultText(PoseStack pose, MultiBufferSource buffers,
+			float z, int packedLight) {
 		if (this.font == null) {
 			return;
 		}
-		String text = AudioStatus.errorCode(fault);
-		if (text == null || text.isBlank()) {
-			return;
-		}
+		// <b>固定文案 NOSIGNAL</b>，不再按状态码拼 {@code ERRnnn}。
+		//
+		// 早期屏幕上是 ERR403/404/408 这类设备式故障码，出发点（真实设备观感）没错，
+		// 但用户实测后明确要求：玩家只需要知道「没信号」，不需要懂错误码。
+		// 具体原因仍可在日志里查到，屏幕上保持最简。
+		String text = FAULT_TEXT;
 		// 基准字号。
 		//
-		// 液晶屏绿区换算到方块约 0.35 × 0.09 格；{@code ERR408} 在默认字体下约 36px 宽，
-		// 因此 0.009 左右正好铺满（36 × 0.009 = 0.324 < 0.35）。
-		// 下方另有按实际宽度回缩的兜底，防止不同字体/语言溢出。
-		float scale = 0.009F;
+		// 关键约束：{@code NOSIGNAL} 是 <b>8 个字符</b>，比原来的 {@code ERR408}（6 个）更宽。
+		// 按原版默认字体的字形宽度逐字累加（含 1px 字距）实测为 <b>50px</b>：
+		// N/O/S/G/A 各 6、L 5、I 2，共 43px + 7×1px 字距。
+		// 液晶屏绿区换算到方块约 0.3516 格，留 0.02 边距后可用 0.3316 格，
+		// 故基准字号取 <b>0.0065</b>（50 × 0.0065 = 0.325 ≤ 0.3316，恰好铺满且不溢出）。
+		//
+		// 不能用 0.009（那是原来 ERR408 的值）：50 × 0.009 = 0.45 格，
+		// 会超出屏幕 28%，被下方回缩逻辑硬压下去，字反而变小且不稳定。
+		float scale = 0.0065F;
 		float maxWidthBlocks = Math.abs(pxToX(LCD_PX_X0) - pxToX(LCD_PX_X1)) - 0.02F;
 		float maxWidthPx = maxWidthBlocks / scale;
 

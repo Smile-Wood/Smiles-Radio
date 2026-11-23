@@ -59,8 +59,35 @@ public final class StreamAudioSource implements AudioSource {
 	private volatile long nextReconnectAt;
 	/** 已连续重试次数（成功后清零）。 */
 	private volatile int reconnectAttempts;
-	/** 单次故障最多重试多少次。 */
-	private static final int MAX_RECONNECT_ATTEMPTS = 120;
+
+	/**
+	 * <b>本次故障是否已经打过日志。</b>
+	 *
+	 * <h2>为什么需要这个标志</h2>
+	 * 早期每安排一次重连就打一条 WARN（"…第 N 次重连"）。
+	 * 断网时退避封顶 3 秒、最长重试 120 次，于是一次断网能在日志里刷出
+	 * 几十上百行，把真正有用的信息（谁订阅了、什么时候恢复）埋掉——
+	 * 用户实测反馈「现在会刷屏」就是这个。
+	 *
+	 * <p>现在改为<b>一次故障只打两行</b>：失联时一行（含原因），恢复时一行（含重试次数与耗时）。
+	 * 中间的每次尝试完全静默。想排查重试细节时把日志级别调到 DEBUG 即可。
+	 */
+	private volatile boolean episodeLogged;
+	/** 本次故障开始时刻（毫秒），用于恢复时报告总耗时。 */
+	private volatile long episodeStartedAt;
+
+	/**
+	 * 单次故障最多重试多少次。
+	 *
+	 * <p><b>已改为不放弃</b>（{@link Integer#MAX_VALUE}）：断网可能持续很久（地铁、电梯、路由器重启），
+	 * 「重试 120 次后彻底放弃」等于让电台在长断网后永久沉默，必须靠客户端重订阅才救回来，
+	 * 而重订阅会重建整条订阅、丢掉已有的抖动缓冲。
+	 *
+	 * <p>长断网真正该担心的不是"重试太久"，而是"退避太密"——那由
+	 * {@link #RECONNECT_MAX_DELAY_MS}（3 秒封顶）保证，代价可忽略。
+	 * 因此这里保留上限字段只为将来可配，实际不再触发放弃。
+	 */
+	private static final int MAX_RECONNECT_ATTEMPTS = Integer.MAX_VALUE;
 	/**
 	 * 退避起始间隔（毫秒）。
 	 *
@@ -142,8 +169,14 @@ public final class StreamAudioSource implements AudioSource {
 			// 每成功连上（含重连）都递增会话号：
 			// 重连后的字节与断线前不连续，下游必须据此重置解码状态。
 			this.sessionId++;
-			SmileSRadio.LOGGER.info("已连接网络电台 {}（icy-metaint={}，会话 {}）",
-					target, this.icyMetaInt, this.sessionId);
+			// <b>只在首次连接时打 INFO</b>，重连成功由 maintainReconnect() 统一报
+			// （它会带上重试次数与失联时长，信息更全）。
+			// 否则一次断网恢复会在日志里出现两行「已连接」+「已恢复」，重复且费解。
+			if (this.sessionId == 1) {
+				SmileSRadio.LOGGER.info("已连接网络电台 {}（icy-metaint={}）", target, this.icyMetaInt);
+			} else {
+				SmileSRadio.LOGGER.debug("重连成功（会话 {}）：{}", this.sessionId, target);
+			}
 			return;
 		}
 		throw new IOException("重定向次数过多: " + this.url);
@@ -160,6 +193,14 @@ public final class StreamAudioSource implements AudioSource {
 		closeConnectionQuietly();
 		this.stream = null;
 
+		// <b>只在本次故障的第一次失败时打日志</b>（见 episodeLogged 的说明）。
+		// 之后每次重试都静默，避免断网时几十上百行刷屏。
+		if (!this.episodeLogged) {
+			this.episodeLogged = true;
+			this.episodeStartedAt = System.currentTimeMillis();
+			SmileSRadio.LOGGER.warn("网络电台失联（{}），开始自动重试：{}", reason, this.url);
+		}
+
 		this.reconnectAttempts++;
 		if (this.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
 			this.finished = true;
@@ -172,8 +213,9 @@ public final class StreamAudioSource implements AudioSource {
 				RECONNECT_BASE_DELAY_MS << Math.min(4, this.reconnectAttempts - 1));
 		this.nextReconnectAt = System.currentTimeMillis() + delay;
 		this.reconnecting = true;
-		SmileSRadio.LOGGER.warn("网络电台连接中断（{}），{} ms 后第 {} 次重连：{}",
-				reason, delay, this.reconnectAttempts, this.url);
+		// 逐次尝试降为 DEBUG：默认 WARN 级别下完全静默。
+		SmileSRadio.LOGGER.debug("网络电台重连尝试：第 {} 次，{} ms 后（{}）",
+				this.reconnectAttempts, delay, this.url);
 	}
 
 	/** 安静地关闭当前连接。 */
@@ -215,11 +257,20 @@ public final class StreamAudioSource implements AudioSource {
 			this.connect();
 			// 成功：重置重试计数，恢复正常读取
 			this.reconnecting = false;
+			// <b>本次故障的「结束」日志</b>：只在真的恢复时打一行，
+			// 带上重试次数与总耗时——排查「断了多久、试了几次」全靠这一行。
+			if (this.episodeLogged) {
+				long elapsed = System.currentTimeMillis() - this.episodeStartedAt;
+				SmileSRadio.LOGGER.info("网络电台已恢复（重试 {} 次，失联 {} ms）：{}",
+						this.reconnectAttempts, elapsed, this.url);
+				this.episodeLogged = false;
+			}
 			this.reconnectAttempts = 0;
-			SmileSRadio.LOGGER.info("网络电台重连成功：{}", this.url);
 			return this.stream == null;
 		} catch (IOException e) {
-			// 还没恢复：继续退避（scheduleReconnect 会自增计数并拉长间隔）
+			// 还没恢复：继续退避（scheduleReconnect 会自增计数并拉长间隔）。
+			// 注意这里传的是<b>真实原因</b>，但 scheduleReconnect 只在首次失败时打印，
+			// 所以不会因为这条路径而刷屏。
 			this.scheduleReconnect("重连失败：" + e.getMessage());
 			return true;
 		}

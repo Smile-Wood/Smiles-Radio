@@ -116,7 +116,10 @@ public final class ClientRadioNetwork {
 						// 非 OK 一律记为故障；OK 表示恢复正常，清除故障显示。
 						markFault(client, pos, status);
 						if (status != radiosmile.net.AudioStatus.OK) {
-							radiosmile.SmileSRadio.LOGGER.warn("音频订阅失败 @{} status={}", pos, status);
+							// <b>同一方块的同一种故障只报一次</b>：重试期间服务端可能反复回同一个状态码，
+							// 每次打 WARN 会把日志刷满。状态没变就不再重复（变化时仍会报）。
+							radiosmile.client.audio.ClientAudioPlayer
+									.logFaultOnce(pos, status);
 							// <b>走哪条入口要按语义分流</b>——这里是 HANDOVER 第十二节
 							// 「一个函数不要承担两种语义」的直接应用：
 							//
