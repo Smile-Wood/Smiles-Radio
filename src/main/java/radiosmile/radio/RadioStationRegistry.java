@@ -93,8 +93,60 @@ public final class RadioStationRegistry {
 		return startEpochMillis;
 	}
 
+	/** 配置根目录名。 */
+	private static final String CONFIG_DIR_NAME = "radio-smile";
+
 	public static Path baseDir() {
 		return baseDir;
+	}
+
+	/**
+	 * 解析配置文件根目录：{@code <游戏根目录>/config/radio-smile/}。
+	 *
+	 * <p>用 Fabric 的 {@code getConfigDir()} 而不是自己拼 `.`：
+	 * 专用服务器与开发环境的"根目录"不同（{@code run/} vs 服务器目录），
+	 * Fabric 已经帮我们处理了。
+	 */
+	private static Path resolveConfigRoot() {
+		return net.fabricmc.loader.api.FabricLoader.getInstance()
+				.getConfigDir().resolve(CONFIG_DIR_NAME);
+	}
+
+	/**
+	 * 把旧位置（存档内 {@code serverconfig/radio-smile/}）的配置迁移到新的全局位置。
+	 *
+	 * <p>只在<b>新位置还没有 stations.json</b> 且旧位置存在时执行，
+	 * 因此不会覆盖服主已经在新位置改好的配置。
+	 *
+	 * <p>迁移是<b>整棵目录复制</b>（含 audio/ icons/），因为配置文件里的
+	 * {@code file}/{@code icon} 都是相对路径，只搬 json 会让它们全部失效。
+	 */
+	private static void migrateFromWorldIfNeeded(Path worldRoot) {
+		if (worldRoot == null) {
+			return;
+		}
+		Path oldDir = worldRoot.resolve("serverconfig").resolve(CONFIG_DIR_NAME);
+		Path oldIndex = oldDir.resolve(INDEX_NAME);
+		Path newIndex = baseDir.resolve(INDEX_NAME);
+		if (Files.exists(newIndex) || !Files.exists(oldIndex)) {
+			// 新位置已有配置（不覆盖），或旧位置根本没有（无需迁移）
+			return;
+		}
+		try {
+			Files.walkFileTree(oldDir, new java.nio.file.SimpleFileVisitor<Path>() {
+				@Override
+				public java.nio.file.FileVisitResult visitFile(Path file,
+						java.nio.file.attribute.BasicFileAttributes attrs) throws IOException {
+					Path target = baseDir.resolve(oldDir.relativize(file).toString());
+					Files.createDirectories(target.getParent());
+					Files.copy(file, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+					return java.nio.file.FileVisitResult.CONTINUE;
+				}
+			});
+			SmileSRadio.LOGGER.info("电台配置已从旧位置迁移到全局 config：{} -> {}", oldDir, baseDir);
+		} catch (IOException e) {
+			SmileSRadio.LOGGER.warn("电台配置迁移失败（旧位置 {}），请手动搬移到 {}", oldDir, baseDir, e);
+		}
 	}
 
 	public static Path audioDir() {
@@ -112,10 +164,24 @@ public final class RadioStationRegistry {
 	/**
 	 * 加载 / 重载电台配置。服务端启动与 /reload 都走这里。
 	 *
-	 * @param worldRoot 世界存档根目录
+	 * <h2>配置位置已从「存档内」迁到「全局 config 下」</h2>
+	 * 早期路径是 {@code <世界存档>/serverconfig/radio-smile/}——按<b>存档</b>隔离。
+	 * 那带来两个实际麻烦：
+	 * <ol>
+	 *   <li>换存档、开新世界就要把音频和配置重配一遍（几十 MB 的文件复制）；</li>
+	 *   <li>服务端开多个存档/多世界时，每个存档各有一份，改了一处别处不同步。</li>
+	 * </ol>
+	 * 现在统一放到 {@code <游戏根目录>/config/radio-smile/}（全局唯一），
+	 * 与客户端的 {@code config/radio-smile-client.json} 同级，服主只需维护一份。
+	 *
+	 * <p><b>旧位置会自动迁移</b>：若新位置还没有配置、而旧存档里有，
+	 * 首次加载时把整棵目录搬过来（见 {@link #migrateFromWorldIfNeeded}），
+	 * 服主无需手动搬文件。
+	 *
+	 * @param worldRoot 世界存档根目录（仅用于旧位置迁移，不再作为配置主目录）
 	 */
 	public static synchronized void load(Path worldRoot) {
-		baseDir = worldRoot.resolve("serverconfig").resolve("radio-smile");
+		baseDir = resolveConfigRoot();
 		try {
 			Files.createDirectories(baseDir);
 			Files.createDirectories(audioDir());
@@ -125,6 +191,11 @@ public final class RadioStationRegistry {
 			SmileSRadio.LOGGER.error("无法创建电台目录 {}", baseDir, e);
 			return;
 		}
+		// 旧位置（存档内 serverconfig）→ 新位置，只在"新位置还没有配置"时搬
+		migrateFromWorldIfNeeded(worldRoot);
+
+		// 配置重载：清掉 txt 解析缓存，保证 txt 内容变更立即生效
+		TxtPlaylist.clearCache();
 
 		List<RadioStation> all = readIndex();
 		// <b>加载时即校验</b>：把"配置了但放不出来"的频道挑出来。
@@ -261,13 +332,18 @@ public final class RadioStationRegistry {
 				continue;
 			}
 			// 播放列表：把所有曲目的哈希合并成一个频道级哈希，
-			// 这样任一首新增/修改/删除都会使缓存失效
+			// 这样任一首新增/修改/删除都会使缓存失效。
+			//
+			// <b>用 quickHash 而不是整文件 sha256</b>：这里每个文件都要算，
+			// 频道一多就是"每次 /reload 重读所有音频"。音频头 + 文件大小
+			// 已经足够判断"变了没有"（见 quickHash 的说明）。
 			StringBuilder combined = new StringBuilder();
 			for (Path track : tracks) {
-				combined.append(track.getFileName().toString()).append(':').append(sha256(track)).append(';');
+				combined.append(track.getFileName().toString()).append(':')
+						.append(quickHash(track)).append(';');
 			}
 			current.put(station.id(), tracks.size() == 1
-					? sha256(tracks.get(0))
+					? quickHash(tracks.get(0))
 					: sha256Text(combined.toString()));
 
 			// 同一趟遍历里收集待转码文件
@@ -291,6 +367,13 @@ public final class RadioStationRegistry {
 
 		// 校验完顺手预热：还没转码成 MP3 的文件在这里统一排队
 		AudioTranscoder.preheat(needBake);
+
+		// <b>txt 里的网络地址也要在后台下载</b>：
+		// 上面的 resolveTracks() 用的是 parseCached，首次遇到网络条目会同步下载——
+		// 那是发生在主线程上的（load() 由服务端启动/reload 调用）。
+		// 因此这里单独起一次后台预热，让"首次下载"发生在后台线程，
+		// 玩家进入时若还没下完就当"暂时没有音频"，下完后再订阅即可。
+		preheatTxtNetworkEntries();
 	}
 
 	/**
@@ -315,7 +398,24 @@ public final class RadioStationRegistry {
 		if (station.isStreaming()) {
 			return true;
 		}
-		List<Path> tracks = resolveTracks(station);
+		// <b>txt 播放列表要特殊处理</b>：resolveTracks() 会下载网络条目，
+		// 而本方法在服务端启动主线程上被调用——下载几十 MB 会把开服卡死。
+		// 这里只解析本地条目，网络条目交给后台预热（见 preheat 流程）。
+		Path direct = resolveAudioPath(station);
+		List<Path> tracks;
+		if (direct != null && Files.isRegularFile(direct)
+				&& TxtPlaylist.isTxtPlaylist(direct)) {
+			TxtPlaylist.Parsed local = TxtPlaylist.parseLocalOnly(direct, audioDir());
+			tracks = local == null ? List.of() : local.entries();
+			if (tracks.isEmpty()) {
+				// 还没有任何本地可用条目：先不判定为无效。
+				// 含网络地址的 txt 要等后台预热下载完成后才算"能播"，
+				// 此时返回 true 让它留在列表里（预热完成后再由实际播放验证）。
+				return TxtPlaylist.hasNetworkEntries(direct);
+			}
+		} else {
+			tracks = resolveTracks(station);
+		}
 		if (tracks.isEmpty()) {
 			return false;
 		}
@@ -330,6 +430,53 @@ public final class RadioStationRegistry {
 			}
 		}
 		return false;
+	}
+
+	/** 是否已启动过 txt 网络预热线程（避免重复提交）。 */
+	private static volatile boolean txtPreheatStarted;
+
+	/**
+	 * 后台预热 txt 播放列表里的网络条目（下载 + 转码）。
+	 *
+	 * <p>为什么要单独做：{@code resolveTracks()} 遇到网络地址会同步下载，
+	 * 而它在首次 {@link #load} 时是被主线程调用的。若某个 txt 里放了几个
+	 * 几十 MB 的网络音频，开服会卡住很久——用户看到的是"服务器卡在启动"。
+	 *
+	 * <p>这里把下载放到后台单线程：启动立刻返回，音频在后台陆续就绪。
+	 * 下载完成后 {@link TxtPlaylist#parseCached} 会命中缓存，播放时无需再等。
+	 */
+	private static void preheatTxtNetworkEntries() {
+		if (txtPreheatStarted) {
+			return;
+		}
+		txtPreheatStarted = true;
+		Thread thread = new Thread(() -> {
+			// 收集所有 txt 频道（只读配置，不碰世界状态）
+			for (RadioStation station : stations) {
+				if (station.isStreaming()) {
+					continue;
+				}
+				Path path = resolveAudioPath(station);
+				if (path == null || !Files.isRegularFile(path)
+						|| !TxtPlaylist.isTxtPlaylist(path)) {
+					continue;
+				}
+				try {
+					// parse()（无缓存版）会真正下载网络条目
+					TxtPlaylist.Parsed parsed = TxtPlaylist.parse(path, audioDir());
+					if (parsed != null) {
+						SmileSRadio.LOGGER.info("txt 播放列表已预热：{}（{} 个条目）",
+								path.getFileName(), parsed.entries().size());
+					}
+				} catch (Throwable t) {
+					SmileSRadio.LOGGER.warn("预热 txt 播放列表失败 {}", path.getFileName(), t);
+				}
+			}
+			// 预热完成后清一次解析缓存，让下次 resolveTracks() 拿到完整结果
+			TxtPlaylist.clearCache();
+		}, "RadioSmile-TxtPreheat");
+		thread.setDaemon(true);
+		thread.start();
 	}
 
 	/** 是否为示例条目：id 等于保留值 {@link #EXAMPLE_ID} 时整条忽略。 */
@@ -388,6 +535,18 @@ public final class RadioStationRegistry {
 			return List.of();
 		}
 		if (Files.isRegularFile(path)) {
+			// <b>txt 重定向播放列表</b>：文件里逐行列出本地文件或网络地址。
+			// 网络地址会在这里被下载并缓存到本地（见 TxtPlaylist / RemoteAudioCache），
+			// 解析后得到的就是一份普通的本地文件列表。
+			// 用带缓存的入口：避免每次 resolveTracks() 都重新访问网络
+			if (TxtPlaylist.isTxtPlaylist(path)) {
+				TxtPlaylist.Parsed parsed = TxtPlaylist.parseCached(path, audioDir());
+				if (parsed == null || parsed.entries().isEmpty()) {
+					SmileSRadio.LOGGER.warn("txt 播放列表没有可用条目：{}", path.getFileName());
+					return List.of();
+				}
+				return parsed.entries();
+			}
 			// 单文件：无论 mode 为何都按单曲循环处理
 			return List.of(path);
 		}
@@ -454,6 +613,60 @@ public final class RadioStationRegistry {
 			return "";
 		}
 	}
+
+	/**
+	 * <b>轻量哈希</b>：只读文件头 + 文件大小，用于缓存校验。
+	 *
+	 * <h2>为什么不再对整文件算 SHA-256</h2>
+	 * 缓存校验的唯一目的是回答「这个文件变了没有」。
+	 * 对一个 20MB 的音频做完整 SHA-256 要几十毫秒，而频道一多、
+	 * 每次 {@code /reload} 都要把全部文件重算一遍——纯粹浪费算力，
+	 * 而且这些计算发生在<b>服务端启动路径</b>上，会拖慢开服。
+	 *
+	 * <p>改用「前 {@link #HASH_HEAD_BYTES} 字节 + 文件大小」：
+	 * <ul>
+	 *   <li>音频文件（MP3/OGG/FLAC…）的头部含编码参数、ID3 等，
+	 *       音频被替换/重新导出时几乎必然变化；</li>
+	 *   <li>再叠加<b>文件大小</b>，可排除"头部相同但内容不同"的常见情形；</li>
+	 *   <li>代价从"读整个文件"降到"读 64KB"，几十 MB 的文件从 ~50ms 降到 ~0.1ms。</li>
+	 * </ul>
+	 *
+	 * <p><b>这不是加密用途</b>：只用于"变了没有"的本地判断，
+	 * 不需要抗碰撞强度。真正的唯一性由 {@link #sha256Text(String)} 处理的事情保证。
+	 *
+	 * <p>读失败（文件不存在/无权限）返回空串，调用方按"无法校验"处理。
+	 */
+	public static String quickHash(Path file) {
+		if (file == null || !Files.isRegularFile(file)) {
+			return "";
+		}
+		try {
+			long size = Files.size(file);
+			java.security.MessageDigest digest =
+					java.security.MessageDigest.getInstance("SHA-256");
+			// 先吃进文件大小，再吃头部字节：两者共同决定哈希
+			digest.update(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(size).array());
+			try (var in = Files.newInputStream(file)) {
+				byte[] buf = new byte[(int) Math.min(HASH_HEAD_BYTES, Math.max(1, size))];
+				int read = in.readNBytes(buf, 0, buf.length);
+				if (read > 0) {
+					digest.update(buf, 0, read);
+				}
+			}
+			return HexFormat.of().formatHex(digest.digest());
+		} catch (IOException | NoSuchAlgorithmException e) {
+			SmileSRadio.LOGGER.error("计算轻量哈希失败 {}", file, e);
+			return "";
+		}
+	}
+
+	/**
+	 * 缓存校验时读取的文件头字节数。
+	 *
+	 * <p>取 64KB：足够覆盖 MP3 的 ID3/首帧、OGG 的页头与首个 Vorbis 头、
+	 * FLAC 的 STREAMINFO 等编码标识；读取成本可忽略（一次 64KB 顺序读）。
+	 */
+	private static final int HASH_HEAD_BYTES = 64 * 1024;
 
 	public static String sha256(Path file) {
 		try {

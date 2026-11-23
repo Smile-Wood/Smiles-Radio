@@ -101,7 +101,14 @@ public final class AudioTranscoder {
 		return dir;
 	}
 
-	/** 源文件对应的缓存键（文件名前段 + 内容哈希前 12 位）。 */
+	/**
+	 * 源文件对应的缓存键（文件名前段 + 内容哈希前 12 位）。
+	 *
+	 * <p>哈希用 {@link RadioStationRegistry#quickHash}（文件头 + 大小），
+	 * 与缓存校验流程<b>同一条判定链</b>——两处必须用同一个函数，
+	 * 否则会出现"校验认为没变、但缓存键已经变了"的错位：
+	 * 表现为每次启动都重新转码一遍，却始终命中不了缓存。
+	 */
 	private static String cacheKey(Path source) {
 		String name = source.getFileName().toString();
 		String base = name;
@@ -109,7 +116,7 @@ public final class AudioTranscoder {
 		if (dot > 0) {
 			base = name.substring(0, dot);
 		}
-		String hash = RadioStationRegistry.sha256(source);
+		String hash = RadioStationRegistry.quickHash(source);
 		if (hash.isEmpty()) {
 			return null;
 		}
