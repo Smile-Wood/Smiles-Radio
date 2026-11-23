@@ -24,8 +24,19 @@ public class AudioLifecycleHooks implements ClientModInitializer {
 			radiosmile.client.audio.PcmSink.INSTANCE.releaseDevice();
 		});
 
-		// 进入世界时清掉上一局残留的数据（但不关设备，保持热备）
-		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) ->
-				ClientAudioPlayer.stopAll());
+		// <b>进入世界 / 重连回到服务器</b>：清掉本地残留的流表（但不关设备，保持热备）。
+		//
+		// 这一步是"重连后能自动恢复播放"的关键前提：
+		// 服务端在玩家下线时已经清空该玩家的订阅，所以重连回来时<b>服务端那边是空的</b>，
+		// 必须让客户端也把 {@code STREAMS} 清空，AutoSubscriber 才会认为
+		// 「本地没有这条订阅」从而重新发起订阅。
+		//
+		// 若不清：旧的 Stream 对象还留在表里，{@code isStreaming()} 返回 true，
+		// AutoSubscriber 会认为"已经在播了"，于是永远不再订阅——
+		// 现象就是「断网重连后收音机永久沉默」。
+		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+			SmileSRadio.LOGGER.info("已连接服务器，清空本地音频流表（将重新订阅）");
+			ClientAudioPlayer.stopAll();
+		});
 	}
 }

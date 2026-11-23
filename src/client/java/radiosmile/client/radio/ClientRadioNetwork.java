@@ -112,9 +112,17 @@ public final class ClientRadioNetwork {
 					int status = buf.readVarInt();
 					client.execute(() -> {
 						// 把状态记进方块实体的「客户端显示状态」：
-						// 渲染层据此点亮红灯并在液晶屏上写出失败原因。
-						// 非 OK 一律记为故障；OK 表示恢复正常，清除故障显示。
-						markFault(client, pos, status);
+						// 渲染层据此点亮红灯并在液晶屏上写出 NOSIGNAL。
+						//
+						// <b>只有"网络电台没信号"才点亮屏幕</b>（本轮收窄）。
+						// 屏幕上的 NOSIGNAL 是给玩家的一句话："上游网络断了"。
+						// 而下面这些状态<b>不是</b>信号问题，点亮会误导：
+						//   - TOO_FAR    ：玩家自己走远了（走进范围就会自动恢复）
+						//   - STOPPED    ：服务端主动停推（重载 / 服主操作）
+						//   - UNKNOWN_STATION / NO_AUDIO / UNSUPPORTED_FORMAT：
+						//                  服主配置或转码问题，与"信号"无关
+						// 它们仍然要打日志（排查需要），只是不上屏幕。
+						markFault(client, pos, displayStatusFor(client, pos, status));
 						if (status != radiosmile.net.AudioStatus.OK) {
 							// <b>同一方块的同一种故障只报一次</b>：重试期间服务端可能反复回同一个状态码，
 							// 每次打 WARN 会把日志刷满。状态没变就不再重复（变化时仍会报）。
@@ -143,6 +151,61 @@ public final class ClientRadioNetwork {
 						}
 					});
 				});
+	}
+
+	/**
+	 * 把「服务端状态码」翻译成「屏幕上该显示什么」。
+	 *
+	 * <h2>为什么需要这一层</h2>
+	 * 状态码是<b>传输层</b>的事实（订阅成功/失败及原因），
+	 * 而屏幕上的 {@code NOSIGNAL} 是给玩家看的一句<b>话</b>：
+	 * "上游网络断了"。两者<b>不是一一对应</b>的关系。
+	 *
+	 * <p>早期直接把所有非 OK 都显示成 NOSIGNAL，于是：
+	 * <ul>
+	 *   <li>玩家走远了（{@code TOO_FAR}）→ 屏幕显示"无信号"，
+	 *       但其实是玩家自己的位置问题，走进范围就恢复；</li>
+	 *   <li>服主把音频文件删了（{@code NO_AUDIO}）→ 也显示"无信号"，
+	 *       这个提示会把人往"查网络"的方向带偏，而真因在文件。</li>
+	 * </ul>
+	 *
+	 * <h2>规则</h2>
+	 * <ul>
+	 *   <li>{@code OK} → 清除显示（不点亮）。</li>
+	 *   <li>{@code TIMEOUT} → 点亮 NOSIGNAL。<b>但仅当该方块当前频道是网络电台</b>：
+	 *       本地文件不存在"信号"这回事，读不到是配置/转码问题，
+	 *       显示 NOSIGNAL 属于误导。</li>
+	 *   <li>其它 → <b>不点亮</b>（日志照打，屏幕保持干净）。</li>
+	 * </ul>
+	 *
+	 * @return 要写入方块实体的状态；返回 {@code OK} 表示不显示故障
+	 */
+	private static int displayStatusFor(Minecraft client, net.minecraft.core.BlockPos pos, int status) {
+		if (status == radiosmile.net.AudioStatus.OK) {
+			return radiosmile.net.AudioStatus.OK;
+		}
+		// 只有"数据超时/链路断了"才是信号问题
+		if (status != radiosmile.net.AudioStatus.TIMEOUT) {
+			return radiosmile.net.AudioStatus.OK;
+		}
+		// 再确认频道类型：本地/自定义电台不该出现"无信号"
+		if (client == null || client.level == null || !client.level.isLoaded(pos)) {
+			// 读不到方块就保守不显示，避免误报
+			return radiosmile.net.AudioStatus.OK;
+		}
+		if (client.level.getBlockEntity(pos)
+				instanceof radiosmile.block.entity.RadioBlockEntity be) {
+			String stationId = be.getStation();
+			for (radiosmile.radio.RadioStation station : radiosmile.client.radio.ClientRadioData.stations()) {
+				if (station.id().equals(stationId)) {
+					return station.isStreaming()
+							? status
+							: radiosmile.net.AudioStatus.OK;
+				}
+			}
+		}
+		// 找不到频道定义：保守不显示
+		return radiosmile.net.AudioStatus.OK;
 	}
 
 	/**

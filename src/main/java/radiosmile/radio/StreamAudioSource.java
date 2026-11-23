@@ -5,7 +5,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 
 import radiosmile.SmileSRadio;
 
@@ -16,9 +15,33 @@ import radiosmile.SmileSRadio;
  * 若每个客户端各自连上游，各自缓冲深度不同，就会错开好几秒。
  * 服务端只开一条连接，把所有字节按同一节奏分发。
  *
- * <p><b>ICY 元数据</b>：很多网络电台（含测试地址）会启用 {@code icy-metadata}，
- * 在音频字节中每 {@code icy-metaint} 字节插入一段带长度前缀的元数据
- * （如当前曲名）。这里用 {@link IcyInputStream} 把这些块剔掉，
+ * <h2>服务端<b>不维护</b>网络电台的生命周期（本轮架构调整）</h2>
+ * 这个类只管「连上之后把字节搬下来」，<b>不做任何重连</b>。
+ *
+ * <p>职责划分是刻意这样定的：
+ * <ul>
+ *   <li><b>服务端</b>只负责<b>自定义电台（本地文件）</b>与<b>方块数据</b>；
+ *       网络电台只是它顺手转发的一根管子，管子断了就断了，
+ *       服务端既不修、也不重试、更不因此去打扰玩家。</li>
+ *   <li><b>客户端</b>负责「连不上服务器」这件事的处理：只要还没和服务器彻底断开，
+ *       表现就是<b>底噪变大 + 屏幕 NOSIGNAL</b>，<b>不会</b>发起重订阅。</li>
+ *   <li>真正的恢复路径只有一条：<b>玩家重新连回服务器</b>。
+ *       那时服务端会先清理该玩家的全部订阅（视为下线），客户端重新订阅，一切从头开始。</li>
+ * </ul>
+ *
+ * <p>早期这里有一套指数退避重连状态机（每 3 秒重试、最多 120 次）。
+ * 它带来两个问题：① 日志在断网期间被几十上百行「第 N 次重连」刷满；
+ * ② 与客户端的重订阅叠加，形成"服务端在重连、客户端也在重订阅"的双重抖动。
+ * 按上面的职责划分，这套机制整体删除——服务端不管网络电台的死活。
+ *
+ * <h2>读不到数据时怎么办</h2>
+ * 返回<b>空数组</b>（= 暂时没有数据）而不是 {@code null}（= 流已结束）：
+ * {@code null} 会让上层读线程直接退出、整条订阅作废。
+ * 建连期间与上游卡顿都走空数组，让上层按自己的节奏继续轮询。
+ *
+ * <h2>ICY 元数据</h2>
+ * 很多网络电台会启用 {@code icy-metadata}，在音频字节中每 {@code icy-metaint} 字节
+ * 插入一段带长度前缀的元数据（如当前曲名）。这里用 {@link IcyInputStream} 把这些块剔掉，
  * 只把纯音频字节转发给客户端——否则客户端解码器会被垃圾数据打断。
  */
 public final class StreamAudioSource implements AudioSource {
@@ -29,80 +52,21 @@ public final class StreamAudioSource implements AudioSource {
 	private final String url;
 	private HttpURLConnection connection;
 	private volatile InputStream stream;
+	/** 流已彻底不可用（建连失败 / 读到 EOF / 已关闭）。此后 {@link #read} 返回 null。 */
 	private volatile boolean finished;
 	/** 是否已被显式关闭（区别于「暂时读不到数据」）。 */
 	private volatile boolean closed;
 
 	/**
-	 * 流会话号：<b>每次成功（重新）连接上游都会递增</b>。
+	 * 流会话号。
 	 *
-	 * <p>用途是告诉下游「字节流在这里断过一次」。
-	 * 网络直播流重连后，新连接的字节与断线前的字节<b>不是连续的</b>
-	 * （中间缺了断线期间的内容），但 MP3 帧自包含，解码器会把它们
-	 * 当成同一条流继续解——听感就是声音突然「卡回」到断线前的位置附近。
-	 *
-	 * <p>因此客户端一旦发现会话号变化，必须<b>重建解码器</b>，
-	 * 丢掉断线前残留的解码状态与已缓冲数据。
+	 * <p>保留协议字段（客户端按它判断"字节流是否连续"），但本类<b>不再重连</b>，
+	 * 因此一条 {@code StreamAudioSource} 的会话号恒为 1。
+	 * 玩家重新连回服务器时会新建一条订阅、也就新建一个本类实例，
+	 * 客户端那边的 {@code STREAMS} 早已清空，不会因会话号相同而误判。
 	 */
 	private volatile int sessionId;
 	private int icyMetaInt;
-
-	/**
-	 * 重连状态机。
-	 *
-	 * <p>断网/上游抖动时会走这里：指数退避地重试，直到成功或超过上限。
-	 * 重试在<b>读线程</b>里同步进行（每个 read() 调用推进一步），
-	 * 因此不额外开线程，也不会阻塞服务端主线程。
-	 */
-	private volatile boolean reconnecting;
-	/** 下次允许尝试重连的时刻。 */
-	private volatile long nextReconnectAt;
-	/** 已连续重试次数（成功后清零）。 */
-	private volatile int reconnectAttempts;
-
-	/**
-	 * <b>本次故障是否已经打过日志。</b>
-	 *
-	 * <h2>为什么需要这个标志</h2>
-	 * 早期每安排一次重连就打一条 WARN（"…第 N 次重连"）。
-	 * 断网时退避封顶 3 秒、最长重试 120 次，于是一次断网能在日志里刷出
-	 * 几十上百行，把真正有用的信息（谁订阅了、什么时候恢复）埋掉——
-	 * 用户实测反馈「现在会刷屏」就是这个。
-	 *
-	 * <p>现在改为<b>一次故障只打两行</b>：失联时一行（含原因），恢复时一行（含重试次数与耗时）。
-	 * 中间的每次尝试完全静默。想排查重试细节时把日志级别调到 DEBUG 即可。
-	 */
-	private volatile boolean episodeLogged;
-	/** 本次故障开始时刻（毫秒），用于恢复时报告总耗时。 */
-	private volatile long episodeStartedAt;
-
-	/**
-	 * 单次故障最多重试多少次。
-	 *
-	 * <p><b>已改为不放弃</b>（{@link Integer#MAX_VALUE}）：断网可能持续很久（地铁、电梯、路由器重启），
-	 * 「重试 120 次后彻底放弃」等于让电台在长断网后永久沉默，必须靠客户端重订阅才救回来，
-	 * 而重订阅会重建整条订阅、丢掉已有的抖动缓冲。
-	 *
-	 * <p>长断网真正该担心的不是"重试太久"，而是"退避太密"——那由
-	 * {@link #RECONNECT_MAX_DELAY_MS}（3 秒封顶）保证，代价可忽略。
-	 * 因此这里保留上限字段只为将来可配，实际不再触发放弃。
-	 */
-	private static final int MAX_RECONNECT_ATTEMPTS = Integer.MAX_VALUE;
-	/**
-	 * 退避起始间隔（毫秒）。
-	 *
-	 * <p>取 500ms 而不是 1 秒：断网恢复往往只断几秒，
-	 * 起步慢会显著拉长恢复时间（用户实测「恢复用了非常久」）。
-	 */
-	private static final long RECONNECT_BASE_DELAY_MS = 500L;
-	/**
-	 * 退避上限（毫秒）。
-	 *
-	 * <p>封顶 3 秒而不是 15 秒：这是「感知延迟」的关键——
-	 * 断网 10 秒恢复时，最坏情况也只需再等 3 秒就能接上，
-	 * 而不是先等满 15 秒的退避。
-	 */
-	private static final long RECONNECT_MAX_DELAY_MS = 3000L;
 
 	/**
 	 * <b>异步建连</b>：立即返回，真正连上游在后台线程做。
@@ -115,7 +79,7 @@ public final class StreamAudioSource implements AudioSource {
 	 * 多人服务器上则是所有人一起卡。
 	 *
 	 * <p>异步化之后，订阅立即成功、状态立即回给客户端，数据在连上后由读线程自然取到。
-	 * 代价是「刚开始订阅时 {@link #read} 可能因为还在建连而短暂返回 0/阻塞」，
+	 * 代价是「刚开始订阅时 {@link #read} 可能因为还在建连而短暂返回空数组」，
 	 * 这与「上游暂时没数据」是同一种情况，上层读线程本来就能正确等待。
 	 */
 	public StreamAudioSource(String url) {
@@ -125,12 +89,18 @@ public final class StreamAudioSource implements AudioSource {
 		connector.start();
 	}
 
+	/**
+	 * 首次建连（只有这一次）。
+	 *
+	 * <p>失败就是失败：把流标记为结束，<b>不重试</b>。
+	 * 玩家会看到底噪与 {@code NOSIGNAL}，这符合「服务端不管网络电台死活」的约定。
+	 */
 	private void connectQuietly() {
 		try {
 			this.connect();
 		} catch (IOException e) {
-			if (!this.finished) {
-				SmileSRadio.LOGGER.warn("连接网络电台失败：{}", this.url, e);
+			if (!this.closed) {
+				SmileSRadio.LOGGER.warn("连接网络电台失败（不重试）：{}", this.url, e);
 			}
 			this.finished = true;
 		}
@@ -169,53 +139,11 @@ public final class StreamAudioSource implements AudioSource {
 			// 每成功连上（含重连）都递增会话号：
 			// 重连后的字节与断线前不连续，下游必须据此重置解码状态。
 			this.sessionId++;
-			// <b>只在首次连接时打 INFO</b>，重连成功由 maintainReconnect() 统一报
-			// （它会带上重试次数与失联时长，信息更全）。
-			// 否则一次断网恢复会在日志里出现两行「已连接」+「已恢复」，重复且费解。
-			if (this.sessionId == 1) {
-				SmileSRadio.LOGGER.info("已连接网络电台 {}（icy-metaint={}）", target, this.icyMetaInt);
-			} else {
-				SmileSRadio.LOGGER.debug("重连成功（会话 {}）：{}", this.sessionId, target);
-			}
+			SmileSRadio.LOGGER.info("已连接网络电台 {}（icy-metaint={}，会话 {}）",
+					target, this.icyMetaInt, this.sessionId);
 			return;
 		}
 		throw new IOException("重定向次数过多: " + this.url);
-	}
-
-	/**
-	 * 标记进入重连状态，并按退避安排下一次尝试。
-	 *
-	 * <p>退避间隔随失败次数翻倍（1s → 2s → 4s → … 上限 15s）：
-	 * 断网时不要每秒猛敲上游，但恢复后也要能较快（最迟 15 秒内）接上。
-	 */
-	private void scheduleReconnect(String reason) {
-		// 丢掉坏连接，避免句柄泄漏
-		closeConnectionQuietly();
-		this.stream = null;
-
-		// <b>只在本次故障的第一次失败时打日志</b>（见 episodeLogged 的说明）。
-		// 之后每次重试都静默，避免断网时几十上百行刷屏。
-		if (!this.episodeLogged) {
-			this.episodeLogged = true;
-			this.episodeStartedAt = System.currentTimeMillis();
-			SmileSRadio.LOGGER.warn("网络电台失联（{}），开始自动重试：{}", reason, this.url);
-		}
-
-		this.reconnectAttempts++;
-		if (this.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-			this.finished = true;
-			SmileSRadio.LOGGER.error(
-					"网络电台重连失败次数超限（{} 次），放弃：{}", MAX_RECONNECT_ATTEMPTS, this.url);
-			return;
-		}
-
-		long delay = Math.min(RECONNECT_MAX_DELAY_MS,
-				RECONNECT_BASE_DELAY_MS << Math.min(4, this.reconnectAttempts - 1));
-		this.nextReconnectAt = System.currentTimeMillis() + delay;
-		this.reconnecting = true;
-		// 逐次尝试降为 DEBUG：默认 WARN 级别下完全静默。
-		SmileSRadio.LOGGER.debug("网络电台重连尝试：第 {} 次，{} ms 后（{}）",
-				this.reconnectAttempts, delay, this.url);
 	}
 
 	/** 安静地关闭当前连接。 */
@@ -239,43 +167,6 @@ public final class StreamAudioSource implements AudioSource {
 		this.connection = null;
 	}
 
-	/**
-	 * 若处于重连状态且已到时间，则发起一次重连。
-	 *
-	 * <p>由 {@link #read} 驱动（每次空转调用一次），所以不需要额外线程。
-	 *
-	 * @return 是否仍处于「未连上」状态（true 表示本块没有数据可读）
-	 */
-	private boolean maintainReconnect() {
-		if (!this.reconnecting) {
-			return false;
-		}
-		if (System.currentTimeMillis() < this.nextReconnectAt) {
-			return true;
-		}
-		try {
-			this.connect();
-			// 成功：重置重试计数，恢复正常读取
-			this.reconnecting = false;
-			// <b>本次故障的「结束」日志</b>：只在真的恢复时打一行，
-			// 带上重试次数与总耗时——排查「断了多久、试了几次」全靠这一行。
-			if (this.episodeLogged) {
-				long elapsed = System.currentTimeMillis() - this.episodeStartedAt;
-				SmileSRadio.LOGGER.info("网络电台已恢复（重试 {} 次，失联 {} ms）：{}",
-						this.reconnectAttempts, elapsed, this.url);
-				this.episodeLogged = false;
-			}
-			this.reconnectAttempts = 0;
-			return this.stream == null;
-		} catch (IOException e) {
-			// 还没恢复：继续退避（scheduleReconnect 会自增计数并拉长间隔）。
-			// 注意这里传的是<b>真实原因</b>，但 scheduleReconnect 只在首次失败时打印，
-			// 所以不会因为这条路径而刷屏。
-			this.scheduleReconnect("重连失败：" + e.getMessage());
-			return true;
-		}
-	}
-
 	private static int parseInt(String value, int fallback) {
 		if (value == null) {
 			return fallback;
@@ -292,37 +183,55 @@ public final class StreamAudioSource implements AudioSource {
 		if (this.closed) {
 			return null;
 		}
-		// 处于重连中：推进重连状态机；还没连上就先返回空数组（稍后再试）
-		if (this.maintainReconnect() || this.stream == null) {
-			// 还没连上。这里必须返回「暂时没数据」而不是 null：
-			// null 表示「流已结束」，会让上层读线程直接退出、整个订阅作废。
-			// 返回空数组则被上层当作「这一轮没读到」，稍后再试。
-			return new byte[0];
+		// 还没连上（建连进行中）或流已彻底结束：返回「暂时没有数据」。
+		//
+		// <b>已结束也返回空数组、不返回 null</b>：让读线程继续按自己的节奏轮询，
+		// 而不是把整条订阅判死。订阅是否结束由服务端的管理层决定，
+		// 不由这个管子断没断决定（服务端不管网络电台死活）。
+		if (this.finished) {
+			InputStream in = this.stream;
+			if (in == null) {
+				// 从未连上：给上层一个等待节奏，避免读线程空转烧 CPU
+				sleepQuietly(50L);
+				return new byte[0];
+			}
 		}
 		InputStream in = this.stream;
+		if (in == null) {
+			// 建连尚未完成：稍等再试，避免忙等
+			sleepQuietly(50L);
+			return new byte[0];
+		}
 		byte[] buffer = new byte[maxBytes];
 		int read;
 		try {
 			read = in.read(buffer);
 		} catch (IOException e) {
-			// <b>读失败不能直接判死</b>：断网、上游抖动、连接被对端重置都会走到这里。
-			// 早期只是把 finished 置 true 就返回 null，读线程随即退出，
-			// 订阅变成「还挂着但永远没数据」的静默死亡——用户实测「断网恢复后电台没恢复」
-			// 就是这个原因。
-			// 现在改为：丢弃这条坏连接，进入重连状态，由上层继续调用 read() 驱动重试。
+			// 读失败：这条连接已经废了。<b>不重连</b>——按职责划分，
+			// 管子断了服务端就不管了（见类注释）。标记结束后由上层继续轮询空数组。
 			if (this.closed) {
 				return null;
 			}
-			this.scheduleReconnect("读取失败：" + e.getMessage());
+			if (!this.finished) {
+				SmileSRadio.LOGGER.info("网络电台连接已断开（上游不再恢复）：{}", this.url);
+			}
+			this.finished = true;
+			closeConnectionQuietly();
+			this.stream = null;
 			return new byte[0];
 		}
 		if (read <= 0) {
-			// 对端正常关闭（直播流被切断）：同样按可恢复处理，而不是终止。
+			// 对端正常关闭（直播流被切断）：同样不重连。
 			if (this.closed) {
 				this.finished = true;
 				return null;
 			}
-			this.scheduleReconnect("上游关闭连接");
+			if (!this.finished) {
+				SmileSRadio.LOGGER.info("上游关闭连接（不再恢复）：{}", this.url);
+			}
+			this.finished = true;
+			closeConnectionQuietly();
+			this.stream = null;
 			return new byte[0];
 		}
 		if (read == buffer.length) {
@@ -331,6 +240,14 @@ public final class StreamAudioSource implements AudioSource {
 		byte[] trimmed = new byte[read];
 		System.arraycopy(buffer, 0, trimmed, 0, read);
 		return trimmed;
+	}
+
+	private static void sleepQuietly(long millis) {
+		try {
+			Thread.sleep(millis);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
 	}
 
 	/** 网络直播流总长未知。 */
@@ -342,9 +259,8 @@ public final class StreamAudioSource implements AudioSource {
 	/**
 	 * 当前的流会话号。
 	 *
-	 * <p>随每个音频块下发给客户端；变化即表示「上游断过又重连」，
-	 * 客户端必须重建解码器，否则会把不连续的字节当连续流来解，
-	 * 听感是声音突然卡回到之前的位置。
+	 * <p>本类不再重连，所以一条实例的会话号恒为 1；
+	 * 新订阅会新建实例，客户端那时也已清空本地流表，不会误判。
 	 */
 	@Override
 	public int sessionId() {
@@ -364,12 +280,11 @@ public final class StreamAudioSource implements AudioSource {
 	@Override
 	public void close() {
 		// <b>closed 与 finished 必须分开</b>：
-		// closed 表示「是被主动关掉的」，此后 read() 立即返回 null，也不再重连；
-		// finished 表示「这个流已经彻底不可用了」（含重试超限）。
-		// 早期只有 finished，导致读失败与主动关闭无法区分，无法做重连。
+		// closed 表示「是被主动关掉的」，此后 read() 立即返回 null；
+		// finished 表示「这个流已经彻底不可用了」。
+		// 早期只有 finished，导致读失败与主动关闭无法区分。
 		this.closed = true;
 		this.finished = true;
-		this.reconnecting = false;
 		closeConnectionQuietly();
 	}
 

@@ -603,13 +603,22 @@ public final class ClientAudioPlayer {
 	/**
 	 * 某个方块的流是否<b>僵住了</b>：流对象还在，但超过 {@link #STALL_TIMEOUT_MILLIS} 没收到任何数据。
 	 *
-	 * <h2>为什么需要它</h2>
-	 * {@link #isStreaming} 只看「流对象是否存在」。但服务端断网、上游卡死时，
-	 * 服务端只是<b>不再发包</b>——订阅仍然有效、流对象仍然存在，客户端却永远收不到数据。
-	 * 此时 {@code isStreaming} 依然返回 true，{@code AutoSubscriber} 认为一切正常、
-	 * 不会重新订阅，于是断网恢复后电台就<b>永久沉默</b>。
+	 * <h2>它现在的唯一用途是<b>显示故障</b>，不再触发重订阅</h2>
+	 * 这是本轮架构调整后的重要变化。职责划分：
+	 * <ul>
+	 *   <li>服务端不管网络电台死活（上游断了它不修，见 {@code StreamAudioSource}）；</li>
+	 *   <li>客户端只要还没和服务器彻底断开，就<b>不重订阅、不重连</b>，
+	 *       只把表现做成「<b>底噪变大 + 屏幕 NOSIGNAL</b>」；</li>
+	 *   <li>真正的恢复只有一条路：玩家重新连回服务器
+	 *       （服务端在 DISCONNECT 时已清空该玩家订阅，客户端 JOIN 时清空本地流表，
+	 *       之后从零订阅）。</li>
+	 * </ul>
 	 *
-	 * <p>用「多久没收到数据」才能识别这种僵住状态，进而触发重订阅。
+	 * <p>因此 {@code AutoSubscriber} 只用它来<b>点亮故障显示</b>，
+	 * 「要不要重新订阅」看的是另一件事：<b>本地有没有这条订阅</b>（{@link #isStreaming}）。
+	 *
+	 * <p>早期把 stale 也当成"该重订阅"，于是断网期间客户端每 6 秒重发一次订阅、
+	 * 服务端反复重建网络流——既刷日志，又让本来就抖的音频抖得更厉害。
 	 */
 	public static boolean isStalled(BlockPos pos) {
 		Stream stream = STREAMS.get(pos.asLong());

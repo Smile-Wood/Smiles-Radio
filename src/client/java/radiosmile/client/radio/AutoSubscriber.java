@@ -22,6 +22,23 @@ import radiosmile.client.audio.ClientAudioPlayer;
  * <p>这里每 {@link #SCAN_INTERVAL_TICKS} tick 扫一次玩家周围已加载的收音机方块实体，
  * 对「有频道但本机未订阅」的补发订阅请求；离开范围或频道失效的自动退订。
  * 扫描开销很小：只遍历玩家附近已加载区块的方块实体。
+ *
+ * <h2>这里<b>不负责</b>网络重连（本轮架构调整）</h2>
+ * 职责划分：
+ * <ul>
+ *   <li><b>服务端</b>只管<b>自定义电台（本地文件）</b>与<b>方块数据</b>。
+ *       网络电台对它而言只是顺手转发的一根管子，管子断了它<b>不修</b>
+ *       （见 {@code StreamAudioSource}）。</li>
+ *   <li><b>玩家掉线 / 断网</b> → 服务端判定下线 → 清理该玩家全部订阅。
+ *       玩家重连回来 → 算重新上线 → 客户端从零订阅。</li>
+ *   <li><b>客户端与服务器的连接只是不顺畅</b>（还没彻底断开）→
+ *       <b>不重订阅、不重连</b>，表现只是<b>底噪变大 + 屏幕 NOSIGNAL</b>。</li>
+ * </ul>
+ *
+ * <p>因此本类只在「本地压根没有这条订阅」时才补订阅（{@code notStreaming}），
+ * 而「订阅还在、只是没数据」（{@code stale}）只用来<b>显示故障</b>。
+ * 早期把两者混为一谈，导致断网期间客户端每 6 秒重发订阅、
+ * 服务端反复重建网络流，音频一直抖、日志也刷屏。
  */
 public final class AutoSubscriber implements ClientModInitializer {
 	/**
@@ -108,6 +125,28 @@ public final class AutoSubscriber implements ClientModInitializer {
 		radiosmile.client.audio.PcmSink.INSTANCE.setVolumeFor(pos.asLong(), volume);
 	}
 
+	/**
+	 * 该频道是否是<b>网络电台</b>（http/https 流）。
+	 *
+	 * <p>判断依据是服务端随列表下发的 {@code file} 字段，
+	 * 由 {@link radiosmile.radio.RadioStation#isStreaming()} 统一判定，
+	 * 客户端不自己猜协议前缀。
+	 *
+	 * <p>找不到该频道（列表还没到 / 被移除）时返回 false：
+	 * 宁可不点亮"无信号"，也不要在本地电台上误报——见调用点的说明。
+	 */
+	private static boolean isStreamingStation(String stationId) {
+		if (stationId == null || stationId.isBlank()) {
+			return false;
+		}
+		for (radiosmile.radio.RadioStation station : ClientRadioData.stations()) {
+			if (station.id().equals(stationId)) {
+				return station.isStreaming();
+			}
+		}
+		return false;
+	}
+
 	private void scanAndSync(Minecraft client) {
 		BlockPos playerPos = client.player.blockPosition();
 		Map<BlockPos, String> found = new HashMap<>();
@@ -153,43 +192,47 @@ public final class AutoSubscriber implements ClientModInitializer {
 
 			String previous = this.subscribed.get(entry.getKey());
 			boolean isNew = previous == null || !previous.equals(entry.getValue());
-			// 关键补充：服务端可能因「走远 / 换台 / 重载」主动停推，
-			// 但本地记录仍显示「已订阅」，于是再也不发起订阅——表现为
-			// 「离开范围再回来，有概率不会重新激活」。
-			// 因此以「客户端是否真的在播」为准判断，而不是只看 map。
+			// <b>流对象根本不存在</b>：这不是"网络抖动"，而是本机这边没有这条订阅
+			// （刚进世界、区块重新加载、服务端清理过订阅等）。
+			// 只有这种情况才需要向服务端发起订阅。
 			boolean notStreaming = !isNew && !ClientAudioPlayer.isStreaming(entry.getKey());
 			// <b>流僵住</b>：流对象还在，但很久没收到数据。
-			// 服务端断网/上游卡死时正是这种状态——订阅有效但永远没数据，
-			// 只判 isStreaming 会认为「一切正常」而不重订阅，
-			// 结果断网恢复后电台永久沉默。
+			//
+			// <b>这不算"要重订阅"，只是"要显示故障"</b>——这是本轮最重要的语义区分：
+			//   - 服务端不管网络电台的死活（上游断了它不修）；
+			//   - 客户端只要还没和服务器彻底断连，就<b>不重订阅</b>，
+			//     表现只是"底噪变大 + 屏幕 NOSIGNAL"；
+			//   - 真正的恢复只有一条路：玩家重新连回服务器
+			//     （那时服务端清空该玩家订阅，客户端 JOIN 后一切从头订阅）。
+			//
+			// 早期这里把 stale 也当成"该重订阅"，于是断网期间客户端每 6 秒
+			// 重发一次订阅、服务端反复重建订阅与网络流——既刷日志又让音频永远抖。
 			boolean stale = !isNew && ClientAudioPlayer.isStalled(entry.getKey());
-			boolean stalled = notStreaming || stale;
-			// <b>重订阅必须有退避</b>：扫描每 0.5 秒一次，若每次都重发订阅请求，
-			// 服务端会被重建请求淹没（网络流建连要 1 秒，永远赶不上），
-			// 实测日志里每秒都在重建连、永远等不到数据。
-			// 这里限制同一方块最短重试间隔。
+
+			// <b>只有"没有订阅"才补订阅</b>；网络抖动/上游断流一律不动订阅。
+			//
+			// 退避仍然保留：扫描每 0.5 秒一次，若流对象反复建不起来，
+			// 没有退避会每 0.5 秒发一次订阅请求。
 			boolean canRetry = System.currentTimeMillis() - this.lastResubscribeAt
 					.getOrDefault(entry.getKey(), 0L) >= RESUBSCRIBE_INTERVAL_MS;
-			if (isNew || (stalled && canRetry)) {
-				// <b>日志只在「开始」时打一次</b>，不随每次重试重复。
-				//
-				// 早期这里是 INFO 级、每次重订阅都打一条。真断网时扫描每 0.5 秒一次、
-				// 退避 6 秒，一次故障就能刷出几十行「数据超时，重新拉流」——
-				// 用户实测反馈「现在会刷屏」。恢复的「结束」日志由音频摄入线程在
-				// 真正收到数据时打（见 ClientAudioPlayer 的恢复日志），这里只管开始。
+			if (isNew || (notStreaming && canRetry)) {
 				if (isNew) {
 					SmileSRadio.LOGGER.info("[自动订阅] 开始接收 {} @{}", entry.getValue(), entry.getKey());
 				} else if (!this.retryLogged.contains(entry.getKey())) {
-					// 同一方块在一次故障里只报一次「开始重试」。
+					// 同一方块在一次故障里只报一次。
 					this.retryLogged.add(entry.getKey());
-					SmileSRadio.LOGGER.warn("[自动订阅] {} 无数据，开始自动重试 @{}",
+					SmileSRadio.LOGGER.warn("[自动订阅] 订阅缺失，重新建立 {} @{}",
 							entry.getValue(), entry.getKey());
 				}
 				this.lastResubscribeAt.put(entry.getKey(), System.currentTimeMillis());
 				ClientRadioNetwork.subscribeAudio(entry.getKey(), entry.getValue());
 			}
-			// 数据超时：立刻点亮红灯 + 液晶屏提示，让玩家知道「不是坏了，是在重连」。
-			// 这比干等着什么反应都没有要明确得多。
+			// 数据超时：点亮红灯 + 屏幕 NOSIGNAL，让玩家知道「不是设备坏了，是没信号」。
+			//
+			// <b>注意：这里只显示故障，不做任何"修复"动作</b>——不重订阅、不重连。
+			// 上游断流是服务端也不管的事（见 StreamAudioSource 类注释），
+			// 玩家的实际体验应该是「底噪变大、屏幕 NOSIGNAL，等网络自己好」，
+			// 而不是客户端在后台反复折腾、把音频抖得更厉害。
 			//
 			// <b>这里只负责"点灯"，不负责"灭灯"</b>——而且是有意为之。
 			//
@@ -205,7 +248,14 @@ public final class AutoSubscriber implements ClientModInitializer {
 			// 由 ClientAudioPlayer.handleChunk() 跳回主线程去清
 			// （见 clearClientFaultOnResume）。这里保持"只点灯"，
 			// 让"点灯"与"灭灯"各自只有一处，符合 HANDOVER 第十二节的原则。
-			if (stale) {
+			//
+			// <b>而且只对"网络电台"点亮</b>（本轮收窄）：
+			// 「无信号」这个概念只属于网络电台——上游 HTTP 流断了，才叫没信号。
+			// 自定义电台（本地文件 / 播放列表）不存在"信号"问题：
+			// 它的数据就在服务器硬盘上，读不到是服主配置或转码的问题，
+			// 显示 NOSIGNAL 会误导玩家（明明不是网络问题）。
+			// 所以先用 {@link #isStreamingStation} 判断电台类型再决定是否点亮。
+			if (stale && isStreamingStation(entry.getValue())) {
 				ClientRadioNetwork.markLocalFault(entry.getKey(),
 						radiosmile.net.AudioStatus.TIMEOUT);
 				// 本地判定为故障：告诉混音器"这是明确故障，不必等本流出过声就可以响"。

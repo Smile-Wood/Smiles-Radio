@@ -195,6 +195,22 @@ public final class AudioSubscription {
 					// 网络流是异步建连的（见 StreamAudioSource），建连期间 read() 返回空数组。
 					// 若把空数组也当成 EOF，订阅会在连上之前就被判死——正是「切到网络电台
 					// 要等很久 / 有时干脆没声」的一个原因。
+					//
+					// <b>但「源已彻底结束」必须能退出这个循环</b>（本轮新增）：
+					// 按新的职责划分，服务端<b>不重连</b>网络电台——上游断了就永久结束，
+					// 之后 read() 一直返回空数组。若不在这里退出，读线程会每 50ms 空转，
+					// 订阅也一直挂着占名额，直到玩家下线才清理。
+					//
+					// 退出后订阅仍是 active 的（服务端不主动踢），只是不再产生数据：
+					// 客户端表现为底噪 + NOSIGNAL，玩家重连服务器时 DISCONNECT/JOIN 会清掉它。
+					if (this.source.isFinished()) {
+						SmileSRadio.LOGGER.info("音频源已结束，停止读取（订阅保留待玩家重连）：{}",
+								this.station.id());
+						synchronized (this.queue) {
+							this.queue.notifyAll();
+						}
+						return;
+					}
 					synchronized (this.queue) {
 						this.queue.wait(50);
 					}

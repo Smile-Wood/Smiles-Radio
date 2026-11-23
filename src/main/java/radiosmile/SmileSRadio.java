@@ -58,9 +58,41 @@ public class SmileSRadio implements ModInitializer {
 		// 线程在第一次有订阅时惰性启动（见 AudioStreamManager）。
 		radiosmile.net.AudioStreamManager.startPusher();
 
-		// 玩家断开时清理其订阅，避免泄漏音频源
+		// ---------------------------------------------------------------- 连接生命周期
+		//
+		// <b>服务端只对"连接"负责，不对"上游网络电台"负责</b>（本轮架构调整）：
+		//
+		//   玩家掉线 / 退出游戏 / 断网被判定为下线  → DISCONNECT → 清空该玩家全部订阅
+		//   玩家重新连回服务器（算重新上线）        → JOIN       → 一切从零，客户端重新订阅
+		//
+		// 这里"清空订阅"是<b>唯一</b>的重置入口。它同时带来一个重要性质：
+		// 玩家只要还连着服务器，就不会因为偶尔收不到上游音频而被踢掉订阅——
+		// 那种情况客户端只显示底噪 + NOSIGNAL，等网好或等玩家重连。
 		net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.DISCONNECT.register(
-				(handler, server) -> radiosmile.net.AudioStreamManager.unsubscribeAll(handler.getPlayer()));
+				(handler, server) -> {
+					var player = handler.getPlayer();
+					if (player == null) {
+						return;
+					}
+					// 上来就全清：包括音频源（网络流会 close 掉那条 HTTP 连接）。
+					radiosmile.net.AudioStreamManager.unsubscribeAll(player);
+					LOGGER.info("玩家 {} 已下线，已清理其全部音频订阅", player.getName().getString());
+				});
+
+		// 玩家上线（含重连回来）：订阅表里不该有它的残留。
+		//
+		// DISCONNECT 已经清过一次，这里是<b>幂等的保险</b>：
+		// 服务端崩溃恢复、或 DISCONNECT 因异常没跑到时，残留订阅会让
+		// "订阅数超限"误判、并让 AudioStreamManager 继续往一个已失效的连接发包。
+		net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.JOIN.register(
+				(handler, sender, server) -> {
+					var player = handler.getPlayer();
+					if (player == null) {
+						return;
+					}
+					radiosmile.net.AudioStreamManager.unsubscribeAll(player);
+					LOGGER.info("玩家 {} 已上线，音频订阅从零开始", player.getName().getString());
+				});
 
 		// 服务端停止时统一关闭所有音频源
 		ServerLifecycleEvents.SERVER_STOPPING.register(server ->
