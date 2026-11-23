@@ -1,0 +1,47 @@
+{
+	"block.radio-smile.radio": "Radio",
+	"gui.radio-smile.radio.title": "Radio",
+	"gui.radio-smile.search": "Search stations",
+	"gui.radio-smile.empty": "No stations available",
+	"gui.radio-smile.loading": "Fetching stations from server...",
+	"gui.radio-smile.exit": "Exit",
+	"gui.radio-smile.scan": "Scan",
+	"gui.radio-smile.confirm": "Confirm",
+	"gui.radio-smile.volume": "Volume",
+
+	"config.radio-smile.title": "Radio Settings",
+	"config.radio-smile.tab.stream": "Audio Stream",
+	"config.radio-smile.tab.debug": "Debug",
+
+	"config.radio-smile.enableStreaming": "Receive audio stream",
+	"config.radio-smile.enableStreaming.tip": "When off, radios stay silent but the UI still works",
+
+	"config.radio-smile.maxBandwidth": "Bandwidth (KB/s)",
+	"config.radio-smile.maxBandwidth.tip": "Expected audio stream bandwidth. The server derives chunk sizes from this; actual values adapt to network conditions",
+
+	"config.radio-smile.maxChunk": "Max chunk (bytes)",
+	"config.radio-smile.maxChunk.tip": "Largest audio payload per packet. Bigger chunks reduce overhead but raise latency and memory use",
+
+	"config.radio-smile.buffer": "Buffer (ms)",
+	"config.radio-smile.buffer.tip": "Target audio buffer duration. Larger tolerates more jitter but adds delay",
+
+	"config.radio-smile.showStats": "Show network stats",
+	"config.radio-smile.showStats.tip": "Display chunk sizes and buffer levels in the radio screen",
+
+	"config.radio-smile.hint.bandwidth": "Note: the bandwidth limit is a target; chunk sizes adapt to network conditions and never exceed Max chunk size."
+,
+
+	"command.radio-smile.reloaded": "Radio config reloaded: %s station(s), playback progress reset (epoch %s)",
+	"command.radio-smile.status": "Current: %s station(s), epoch %s"
+,
+
+	"gui.radio-smile.status.ok": "Playing",
+	"gui.radio-smile.status.unknown_station": "Station not found",
+	"gui.radio-smile.status.no_audio": "No audio",
+	"gui.radio-smile.status.too_far": "Too far",
+	"gui.radio-smile.status.unsupported": "Unsupported",
+	"gui.radio-smile.status.stopped": "Stopped",
+	"gui.radio-smile.status.timeout": "Data timeout",
+	"gui.radio-smile.status.unknown": "Unknown error"
+
+}

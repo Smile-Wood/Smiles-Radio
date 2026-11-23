@@ -1,0 +1,49 @@
+{
+	"schemaVersion": 1,
+	"id": "radio-smile",
+	"version": "${version}",
+	"name": "Smile's Radio",
+	"description": "This is an example description! Tell everyone what your mod is about!",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/radio-smile/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"radiosmile.SmileSRadio"
+		],
+		"client": [
+			"radiosmile.client.SmileSRadioClient",
+			"radiosmile.client.audio.AudioLifecycleHooks",
+			"radiosmile.client.audio.VanillaVolumeTracker",
+			"radiosmile.client.radio.AutoSubscriber",
+			"radiosmile.client.audio.BgmSuppressor"
+		],
+		"modmenu": [
+			"radiosmile.client.integration.ModMenuIntegration"
+		]
+	},
+	"mixins": [
+		"radio-smile.mixins.json",
+		{
+			"config": "radio-smile.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.20.1",
+		"minecraft": "~1.20.1",
+		"java": ">=17",
+		"fabric-api": "*",
+		"smile_libbox": ">=1.0.26"
+	},
+	"suggests": {
+		"modmenu": "*"
+	}
+}

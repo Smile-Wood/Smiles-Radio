@@ -1,0 +1,46 @@
+{
+	"block.radio-smile.radio": "收音机",
+	"gui.radio-smile.radio.title": "收音机",
+	"gui.radio-smile.search": "搜索电台",
+	"gui.radio-smile.empty": "没有可用电台",
+	"gui.radio-smile.loading": "正在从服务器拉取列表...",
+	"gui.radio-smile.exit": "退出",
+	"gui.radio-smile.scan": "扫描",
+	"gui.radio-smile.confirm": "确认",
+	"gui.radio-smile.volume": "音量",
+
+	"config.radio-smile.title": "收音机设置",
+	"config.radio-smile.tab.stream": "音频流",
+	"config.radio-smile.tab.debug": "调试",
+
+	"config.radio-smile.enableStreaming": "接收音频流",
+	"config.radio-smile.enableStreaming.tip": "关闭后收音机不会出声，仅保留界面操作",
+
+	"config.radio-smile.maxBandwidth": "带宽上限",
+	"config.radio-smile.maxBandwidth.tip": "期望的音频流带宽。服务端据此决定分块大小，实际值会随网络状况自动调整",
+
+	"config.radio-smile.maxChunk": "单块上限",
+	"config.radio-smile.maxChunk.tip": "单个网络包的最大音频字节数。块越大开销越小，但延迟和内存占用越高",
+
+	"config.radio-smile.buffer": "缓冲时长",
+	"config.radio-smile.buffer.tip": "音频缓冲区目标时长。调大更抗网络抖动，但延迟更高",
+
+	"config.radio-smile.showStats": "显示网络状态",
+	"config.radio-smile.showStats.tip": "在收音机界面显示分块大小、缓冲量等调试信息",
+
+	"config.radio-smile.hint.bandwidth": "提示：带宽上限是期望值，实际分块会随网络状况自动调整；块大小不会超过上面的「单块上限」。",
+
+	"command.radio-smile.reloaded": "电台配置已重新加载：%s 个频道，播放进度已重置（计时基准 %s）",
+	"command.radio-smile.status": "当前 %s 个频道，计时基准 %s"
+,
+
+	"gui.radio-smile.status.ok": "正常播放",
+	"gui.radio-smile.status.unknown_station": "频道不存在",
+	"gui.radio-smile.status.no_audio": "频道无音频",
+	"gui.radio-smile.status.too_far": "距离太远",
+	"gui.radio-smile.status.unsupported": "格式不支持",
+	"gui.radio-smile.status.stopped": "已停止推送",
+	"gui.radio-smile.status.timeout": "数据超时",
+	"gui.radio-smile.status.unknown": "未知错误"
+
+}

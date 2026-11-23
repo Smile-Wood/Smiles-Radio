@@ -1,0 +1,32 @@
+{
+  "stations": [
+    {
+      "id": "example",
+      "name": "示例：单个音频（把 id 改成别的名字即可生效）",
+      "icon": "example/sample.png",
+      "file": "example/sample.ogg",
+      "mode": "block"
+    },
+    {
+      "id": "example",
+      "name": "示例：文件夹顺序播放 1,2,3...（id 改成别的名字即可生效）",
+      "icon": "example/playlist.png",
+      "file": "example/myfolder",
+      "mode": "sequence"
+    },
+    {
+      "id": "example",
+      "name": "示例：文件夹随机播放（id 改成别的名字即可生效）",
+      "icon": "example/playlist.png",
+      "file": "example/myfolder2",
+      "mode": "random"
+    },
+    {
+      "id": "example",
+      "name": "示例：网络电台（id 改成别的名字即可生效）",
+      "icon": "example/webradio.png",
+      "file": "https://example.com/stream.ogg",
+      "mode": "block"
+    }
+  ]
+}
