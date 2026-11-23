@@ -1335,9 +1335,35 @@ this.roundOffset = random
 用户问「网络电台为什么感觉是服务端重分发而非客户端直连」——**感觉是对的**，
 详见 Z 节第 3 小节（三个硬理由：多人同步 / ICY 剥离 / 客户端无需外网）。
 
+#### AB. 第十八轮：音量滑条底部遮挡
+
+**现象**：用户反馈「音量滑条下段往上一点，有点遮挡」。
+
+**根因**：`volumeBottom = height - 50`，而底部按钮从 `height - 30` 开始、高 20。
+滑条面板背景还向外扩 2px，于是面板底边到 `height - 48`，
+与按钮区（`height - 30`）重叠约 18px——
+**百分比文字画在 `volumeBottom - 10`，正好被按钮压住**。
+
+**修复**：`volumeBottom` 改为 `height - 38`，并按自下而上的布局需求推导：
+
+```
+按钮底边           = height - 10
+按钮顶边           = height - 30
+留 6px 间隙        -> 面板底边上限 = height - 36
+面板背景外扩 2px   -> volumeBottom 上限 = height - 38
+```
+
+实测四种窗口高度（240 / 300 / 480 / 720）均满足：
+- 面板与按钮间隙恒为 **6px**（无重叠）
+- 百分比文字底边距面板底 **2px**（不贴边）
+- 滑条轨道底始终在文字上方
+
+点击/拖动命中区（`mouseY <= volumeBottom`）与音量映射（`volumeBottom - 12`）
+用的都是同一个字段，随之自动一致，无需另行修改。
+
 ### 当前构建状态
 
-- **`build/libs/radio-smile-1.0.0.jar`，约 329 KB**
+- **`build/libs/radio-smile-1.0.0.jar`，约 330 KB**
 - `gradlew clean build` → BUILD SUCCESSFUL
 - **git 已初始化**（单条初始提交，含本轮全部修复）
 

@@ -128,7 +128,19 @@ public class RadioScreen extends Screen {
 		this.volumeRight = centerX + 170;
 		this.volumeLeft = this.volumeRight - 18;
 		this.volumeTop = 52;
-		this.volumeBottom = Math.max(this.volumeTop + 60, this.height - 50);
+		// <b>底部必须给百分比文字留出空间</b>。
+		//
+		// 早期取 `height - 50`，而底部按钮从 `height - 30` 开始、高 20——
+		// 于是滑条面板（含外扩 2px 背景）与按钮区重叠约 18px，
+		// 百分比文字正好被按钮压住。用户反馈「滑条下段往上一点，有点遮挡」。
+		//
+		// 布局需求（自下而上）：
+		//   按钮底边        = height - 30 + 20 = height - 10
+		//   按钮顶边         = height - 30
+		//   留 6px 间隙      -> 滑条面板底边上限 = height - 36
+		//   面板背景再外扩 2px -> volumeBottom 上限 = height - 38
+		//   百分比文字占 10px（底边对齐 volumeBottom）
+		this.volumeBottom = Math.max(this.volumeTop + 60, this.height - 38);
 
 		this.listLeft = centerX - 170;
 		this.listRight = this.volumeLeft - 10;
@@ -441,10 +453,14 @@ public class RadioScreen extends Screen {
 		int knobY = trackBottom - filled;
 		graphics.fill(this.volumeLeft + 2, knobY - 2, this.volumeRight - 2, knobY + 2, 0xFFE0E0E0);
 
+		int centerX = (this.volumeLeft + this.volumeRight) / 2;
 		graphics.drawCenteredString(this.font, Component.translatable("gui.radio-smile.volume"),
-				(this.volumeLeft + this.volumeRight) / 2, this.volumeTop + 1, 0xFFFFFF);
+				centerX, this.volumeTop + 1, 0xFFFFFF);
+		// 百分比文字：<b>底边对齐 volumeBottom 而不越界</b>。
+		// 字体高度 8px，再留 2px 内边距 => 起始 y = volumeBottom - 10，
+		// 这样"100%"的底边正好落在 volumeBottom 上方 2px 处，不会贴到面板边框。
 		graphics.drawCenteredString(this.font, Math.round(volume * 100) + "%",
-				(this.volumeLeft + this.volumeRight) / 2, this.volumeBottom - 10, 0xC0C0C0);
+				centerX, this.volumeBottom - 10, 0xC0C0C0);
 	}
 
 	@Override
