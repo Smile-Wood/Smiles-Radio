@@ -1148,9 +1148,50 @@ true           # 打乱顺序，所有玩家顺序一致
 
 实测四种配置组合均正确；并用真实 .ogg 验证**按配置路径转码成功**。
 
+#### Y. 第十五轮：Linux 兼容性审计（在 WSL 里实测）
+
+用 WSL2 Ubuntu 做了实际验证（静态审计 + Linux 语义下的行为测试）。
+
+##### 发现并修复的两个真实缺陷
+
+| # | 缺陷 | 后果 | 修复 |
+|---|---|---|---|
+| 1 | **配置里的 `\\` 路径在 Linux 上失效** | Windows 上配好再上传到 Linux 服务器，`audio\\song.mp3` 会去找一个名叫 `audio\song.mp3` 的单层文件 → 永远"频道没有可用音频"，而目录里明明有文件 | 新增 `normalizeSeparators()`，把 `\\` 统一成 `/`。覆盖音频路径、图标路径、txt 条目 |
+| 2 | **UTF-8 BOM 让 txt 首行开关失效** | Windows 记事本"另存为 UTF-8"会写 BOM，首行变成 `"\uFEFFfalse"`；`trim()` 不去 U+FEFF → 开关静默失效 | 新增 `stripBom()` |
+
+第 2 条特别隐蔽：BOM 是不可见字符，服主会困惑"我明明写了 true 怎么没打乱"。
+
+##### WSL 实测结果
+
+```
+=== 反斜杠路径（Linux 语义）===
+修复前: audio\song.mp3 -> exists=False
+修复后: audio\song.mp3 -> exists=True
+        sub\b.mp3     -> exists=True
+=== txt 解析 ===
+t_bom        打乱=true   条目=1   ← BOM 下开关正确生效
+t_backslash  打乱=false  条目=1
+t_crlf       打乱=true   条目=1   ← CRLF 正常
+```
+
+##### 审计通过项（无需改动）
+
+| 项 | 结论 |
+|---|---|
+| 资源路径大小写 | 11 个资源文件，**0 个大小写冲突**，代码引用 0 处缺失 |
+| 传给 ffmpeg 的路径 | 全部由 `getConfigDir()` 派生，**均为绝对路径**，不受 cwd 影响 |
+| `ffmpeg` 可执行名 | 用裸名走 PATH；另有 `ffmpeg` 配置项可指定绝对路径 |
+| CRLF / LF 行尾 | `readAllLines` + `trim()` 双向兼容 |
+| 文件内容编码 | 所有读写显式 `StandardCharsets.UTF_8` |
+| `RandomAccessFile` / `Path` / `ProcessBuilder` | 均为跨平台 API |
+
+> **已知限制**（非本项目可控）：中文**文件名**的解析依赖 JVM 的
+> `sun.jnu.encoding`。Linux 默认 UTF-8 正常；Windows 中文版若为 GBK
+> 且存档路径含中文，属于 JVM 层面问题。
+
 ### 当前构建状态
 
-- **`build/libs/radio-smile-1.0.0.jar`，约 326 KB**
+- **`build/libs/radio-smile-1.0.0.jar`，约 327 KB**
 - `gradlew clean build` → BUILD SUCCESSFUL
 - **git 已初始化**（单条初始提交，含本轮全部修复）
 

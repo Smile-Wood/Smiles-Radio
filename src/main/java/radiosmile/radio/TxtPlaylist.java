@@ -160,6 +160,7 @@ public final class TxtPlaylist {
 			SmileSRadio.LOGGER.warn("读取 txt 播放列表失败 {}", txt, e);
 			return null;
 		}
+		lines = stripBom(lines);
 
 		boolean random = false;
 		// <b>播放顺序 = txt 行从上到下</b>（用户明确要求）。
@@ -264,6 +265,35 @@ public final class TxtPlaylist {
 	}
 
 	/**
+	 * 去掉文件开头可能存在的 <b>UTF-8 BOM</b>（U+FEFF）。
+	 *
+	 * <h2>为什么必须处理</h2>
+	 * Windows 的记事本、以及不少编辑器在"另存为 UTF-8"时会写入 BOM（EF BB BF）。
+	 * Java 的 {@code Files.readAllLines(UTF_8)} <b>不会</b>自动剥离它，
+	 * 于是第一行会变成 {@code "﻿false"}。
+	 *
+	 * <p>而 {@code String.trim()} 只去掉 {@code <= U+0020} 的字符，
+	 * <b>U+FEFF 不在其中</b>——结果就是第一行的开关<b>静默失效</b>，
+	 * 被当成一个普通条目忽略掉。服主会困惑"我明明写了 true 怎么没打乱"，
+	 * 而这个不可见字符在编辑器里根本看不出来。
+	 *
+	 * <p>这既是跨平台问题（Windows 写、Linux 读），也是本模块独有的风险：
+	 * 第一行有特殊语义，BOM 恰好落在它头上。
+	 */
+	private static List<String> stripBom(List<String> lines) {
+		if (lines == null || lines.isEmpty()) {
+			return lines;
+		}
+		String first = lines.get(0);
+		if (first != null && !first.isEmpty() && first.charAt(0) == '\uFEFF') {
+			List<String> fixed = new ArrayList<>(lines);
+			fixed.set(0, first.substring(1));
+			return fixed;
+		}
+		return lines;
+	}
+
+	/**
 	 * 解析第一行的「打乱顺序」开关。
 	 *
 	 * <p>接受 {@code true}/{@code false}、{@code 1}/{@code 0}（大小写不敏感）。
@@ -329,20 +359,23 @@ public final class TxtPlaylist {
 			}
 			return local;
 		}
-		// 本地路径：先相对 txt 所在目录，再相对 audioDir
-		Path direct = txt.getParent() == null ? null : txt.getParent().resolve(line);
+		// 本地路径：先相对 txt 所在目录，再相对 audioDir。
+		// 反斜杠统一换成 /：服主可能在 Windows 上写 txt、再上传到 Linux 服务器，
+		// 而 Linux 上 \ 是合法文件名字符、不是分隔符（详见 RadioStationRegistry）。
+		String normalized = line.replace('\\', '/');
+		Path direct = txt.getParent() == null ? null : txt.getParent().resolve(normalized);
 		if (direct != null && Files.isRegularFile(direct)) {
 			return direct.normalize();
 		}
 		if (audioDir != null) {
-			Path inAudio = audioDir.resolve(line);
+			Path inAudio = audioDir.resolve(normalized);
 			if (Files.isRegularFile(inAudio)) {
 				return inAudio.normalize();
 			}
 		}
 		// 绝对路径兜底
 		try {
-			Path absolute = Path.of(line);
+			Path absolute = Path.of(normalized);
 			if (Files.isRegularFile(absolute)) {
 				return absolute.normalize();
 			}

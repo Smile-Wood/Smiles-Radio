@@ -642,11 +642,33 @@ public final class RadioStationRegistry {
 		if (isExamplePath(station.file())) {
 			return null;
 		}
-		Path direct = baseDir.resolve(station.file()).normalize();
+		String relative = normalizeSeparators(station.file());
+		Path direct = baseDir.resolve(relative).normalize();
 		if (Files.isRegularFile(direct) || Files.isDirectory(direct)) {
 			return direct;
 		}
-		return audioDir().resolve(station.file()).normalize();
+		return audioDir().resolve(relative).normalize();
+	}
+
+	/**
+	 * 把配置里的路径统一成当前平台的分隔符。
+	 *
+	 * <h2>为什么必须做这一步</h2>
+	 * 服主常在 Windows 上配好文件、再上传到 Linux 服务器运行。
+	 * Windows 的 resource pack / 配置里习惯写 {@code audio\song.mp3}，
+	 * 而 <b>Linux 上反斜杠是合法的文件名字符，不是分隔符</b>——
+	 * 于是 {@code Path.resolve("audio\\song.mp3")} 会去找一个名叫
+	 * {@code audio\song.mp3} 的单层文件，永远找不到。
+	 *
+	 * <p>症状极其隐晦：日志只说"频道没有可用音频"，服主看着目录里明明有文件。
+	 * 反过来（Linux 的 {@code /} 用在 Windows 上）Java 本来就能正确处理，
+	 * 所以只需要把 {@code \} 换成 {@code /}。
+	 *
+	 * <p>注意：<b>不处理 URL</b>（网络地址里不会出现反斜杠作为分隔符），
+	 * 调用方已先排除 {@code isStreaming()}。
+	 */
+	private static String normalizeSeparators(String path) {
+		return path == null ? null : path.replace('\\', '/');
 	}
 
 	/**
@@ -697,11 +719,13 @@ public final class RadioStationRegistry {
 		if (isExamplePath(station.icon())) {
 			return null;
 		}
-		Path inIcons = iconDir().resolve(station.icon()).normalize();
+		// 与音频路径同理：Windows 写的 \ 在 Linux 上不是分隔符（见 normalizeSeparators）
+		String icon = normalizeSeparators(station.icon());
+		Path inIcons = iconDir().resolve(icon).normalize();
 		if (Files.isRegularFile(inIcons)) {
 			return inIcons;
 		}
-		Path direct = baseDir.resolve(station.icon()).normalize();
+		Path direct = baseDir.resolve(icon).normalize();
 		return Files.isRegularFile(direct) ? direct : inIcons;
 	}
 
