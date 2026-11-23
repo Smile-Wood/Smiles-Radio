@@ -41,7 +41,18 @@ import radiosmile.SmileSRadio;
  * 从而保证所有客户端用同一个基准计算播放偏移。
  */
 public final class RadioStationRegistry {
-	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+	/**
+	 * 配置文件写出用的 Gson。
+	 *
+	 * <p><b>必须关闭 HTML 转义</b>（{@code disableHtmlEscaping}）：默认实现会把
+	 * {@code =}、{@code <}、{@code >}、{@code &} 转成 {@code =} 之类的转义序列，
+	 * 于是配置文件里出现 {@code mode=block} 这种东西——
+	 * 人能读但完全没法一眼看懂，而这正是我们写"说明"字段要避免的。
+	 */
+	private static final Gson GSON = new GsonBuilder()
+			.setPrettyPrinting()
+			.disableHtmlEscaping()
+			.create();
 	private static final String INDEX_NAME = "stations.json";
 	private static final String CACHE_MANIFEST = "manifest.json";
 	/** 示例配置文件名：永远不被加载，仅作为格式参考；文件名不以 .json 结尾以外无特殊含义。 */
@@ -275,22 +286,79 @@ public final class RadioStationRegistry {
 	 */
 	private static void writeDefaultIndex(Path index) {
 		JsonObject root = new JsonObject();
+
+		// 配置说明：写进文件本身，服主打开就能看懂，不必回来翻文档。
+		root.addProperty("_说明_播放模式", "mode 可选值见下面的示例条目；"
+				+ "单曲循环=block/false/0，列表循环=sequence/loop/true/1，随机播放=random");
+		root.addProperty("_说明_rate", "rate 是列表右侧显示的频率/档位，例如 FM90.7；不填显示 NETWORK");
+		root.addProperty("_说明_txt", "file 也可以指向一个 .txt（每行一个本地文件或网络地址，"
+				+ "第一行写 sequence 或 random 控制播放顺序）");
+		root.addProperty("_说明_示例", "id 为 " + EXAMPLE_ID + " 的条目只是示范，不会被加载；"
+				+ "把 id 改成别的名字即生效");
+
 		JsonArray arr = new JsonArray();
-		arr.add(sampleStation(EXAMPLE_ID, "示例：单个音频（把 id 改成别的名字即可生效）",
-				EXAMPLE_ASSETS_DIR + "/sample.png", EXAMPLE_ASSETS_DIR + "/sample.mp3", "block"));
-		arr.add(sampleStation(EXAMPLE_ID, "示例：文件夹顺序播放 1,2,3...（id 改成别的名字即可生效）",
-				EXAMPLE_ASSETS_DIR + "/playlist.png", EXAMPLE_ASSETS_DIR + "/myfolder", "sequence"));
-		arr.add(sampleStation(EXAMPLE_ID, "示例：文件夹随机播放（id 改成别的名字即可生效）",
-				EXAMPLE_ASSETS_DIR + "/playlist.png", EXAMPLE_ASSETS_DIR + "/myfolder2", "random"));
-		arr.add(sampleStation(EXAMPLE_ID, "示例：网络电台（id 改成别的名字即可生效）",
-				EXAMPLE_ASSETS_DIR + "/webradio.png", "https://example.com/stream.mp3", "block"));
+		arr.add(sampleStation(EXAMPLE_ID,
+				"示例1：单个音频｜单曲循环（mode=block，也可写 false / 0）",
+				EXAMPLE_ASSETS_DIR + "/sample.png", EXAMPLE_ASSETS_DIR + "/sample.mp3",
+				"block"));
+		arr.add(sampleStation(EXAMPLE_ID,
+				"示例2：文件夹列表循环，按文件名 1,2,3…（mode=sequence，也可写 loop / true / 1）",
+				EXAMPLE_ASSETS_DIR + "/playlist.png", EXAMPLE_ASSETS_DIR + "/myfolder",
+				"sequence"));
+		arr.add(sampleStation(EXAMPLE_ID,
+				"示例3：文件夹随机播放，固定 seed 保证所有玩家顺序一致（mode=random）",
+				EXAMPLE_ASSETS_DIR + "/playlist.png", EXAMPLE_ASSETS_DIR + "/myfolder2",
+				"random"));
+		arr.add(sampleStation(EXAMPLE_ID,
+				"示例4：txt 重定向播放列表，可混写本地文件与网络地址（file 指向 .txt）",
+				EXAMPLE_ASSETS_DIR + "/playlist.png", EXAMPLE_ASSETS_DIR + "/mylist.txt",
+				"sequence"));
+		arr.add(sampleStation(EXAMPLE_ID,
+				"示例5：网络直播流（file 直接写 http 地址，不能写进 txt）",
+				EXAMPLE_ASSETS_DIR + "/webradio.png", "https://example.com/stream.mp3",
+				"block"));
 		root.add("stations", arr);
+
 		try {
 			Files.writeString(index, GSON.toJson(root), StandardCharsets.UTF_8);
 			SmileSRadio.LOGGER.info("已自动创建电台配置 {}，其中 id 为 {} 的条目不会被加载",
 					index, EXAMPLE_ID);
+			// 顺手生成一份 txt 播放列表示例，让"示例4"能直接参考格式
+			writeSampleTxt();
 		} catch (IOException e) {
 			SmileSRadio.LOGGER.error("写入电台配置失败", e);
+		}
+	}
+
+	/**
+	 * 生成 {@code example/mylist.txt} 示例文件（txt 重定向播放列表的格式参考）。
+	 *
+	 * <p>放在 {@code example/} 目录下：与示例图片/音频同处一地，
+	 * 且该目录被哈希校验与加载流程整体排除，不会产生"文件不存在"的警告。
+	 */
+	private static void writeSampleTxt() {
+		Path exampleDir = baseDir.resolve(EXAMPLE_ASSETS_DIR);
+		try {
+			Files.createDirectories(exampleDir);
+			Path txt = exampleDir.resolve("mylist.txt");
+			if (Files.exists(txt)) {
+				return;
+			}
+			String content = String.join("\n",
+					"# txt 重定向播放列表示例",
+					"# 第一行写播放模式：sequence（列表循环，按下面从上到下）或 random（随机）",
+					"# 留空则默认 sequence；这一行不是模式时会被当成普通条目",
+					"sequence",
+					"",
+					"# 之后每行一个来源，可以是本地文件（相对 audio/ 目录）……",
+					"sample.mp3",
+					"# ……也可以直接写网络地址（会下载到本地缓存后再转成 MP3 播放）",
+					"# https://example.com/song.mp3",
+					"",
+					"# 空行与 # 开头的行会被忽略");
+			Files.writeString(txt, content, StandardCharsets.UTF_8);
+		} catch (IOException e) {
+			SmileSRadio.LOGGER.debug("写入示例 txt 失败", e);
 		}
 	}
 

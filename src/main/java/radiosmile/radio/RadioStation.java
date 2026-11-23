@@ -1,5 +1,7 @@
 package radiosmile.radio;
 
+import java.util.Arrays;
+
 import com.google.gson.JsonObject;
 
 /**
@@ -52,19 +54,65 @@ public record RadioStation(String id, String name, String icon, String file, Str
 		return this.rate.trim();
 	}
 
-	/** 是否为顺序播放列表。 */
+	/**
+	 * 是否为顺序播放列表（列表循环）。
+	 *
+	 * <h2>mode 字段接受的写法</h2>
+	 * 为了让服主不必记住固定单词，下面几组写法都等价：
+	 * <table border="1">
+	 *   <tr><th>语义</th><th>可用写法</th></tr>
+	 *   <tr><td><b>单曲循环</b></td>
+	 *       <td>{@code block} / {@code single} / {@code false} / {@code 0}</td></tr>
+	 *   <tr><td><b>列表循环</b>（顺序播放整条列表，播完从头）</td>
+	 *       <td>{@code sequence} / {@code order} / {@code loop} / {@code true} / {@code 1}</td></tr>
+	 *   <tr><td><b>随机播放</b>（固定 seed 打乱，多客户端一致）</td>
+	 *       <td>{@code random} / {@code shuffle}</td></tr>
+	 * </table>
+	 *
+	 * <p><b>关于布尔/数字写法的取舍</b>：{@code true}/{@code 1} 映射到「列表循环」而不是
+	 * 「随机」，因为读 {@code true} 时最自然的理解是"要按列表循环播放"，
+	 * 而不是"随机乱序"。真正的随机必须写 {@code random}——这是<b>不可猜</b>的语义，
+	 * 用布尔值表达会让配置变得含糊，所以刻意不提供。
+	 */
 	public boolean isSequence() {
-		return "sequence".equalsIgnoreCase(this.mode);
+		return matches("sequence", "order", "loop", "true", "1");
 	}
 
 	/** 是否为随机播放列表。 */
 	public boolean isRandom() {
-		return "random".equalsIgnoreCase(this.mode);
+		return matches("random", "shuffle");
+	}
+
+	/** 是否为单曲循环（mode 未写、或显式写成 block/single/false/0）。 */
+	public boolean isBlock() {
+		return matches("block", "single", "false", "0");
 	}
 
 	/** 是否为播放列表模式（顺序或随机）。 */
 	public boolean isPlaylist() {
 		return isSequence() || isRandom();
+	}
+
+	/**
+	 * mode 是否命中给定的任一同义写法（大小写不敏感，忽略首尾空白）。
+	 *
+	 * <p><b>空值要按"未配置"处理</b>：{@code mode: ""} 与不写 {@code mode} 字段
+	 * 在语义上应当一致（都表示"用默认行为"）。早期只判 {@code null}，
+	 * 于是写成空串时会落到"未识别"分支，与"缺省"的行为不一致——
+	 * 而服主把值删空是很常见的操作。
+	 */
+	private boolean matches(String... aliases) {
+		String normalized = this.mode == null ? "" : this.mode.trim();
+		if (normalized.isEmpty()) {
+			// 未配置 / 写空：等同于默认的 block（单曲循环）
+			return Arrays.stream(aliases).anyMatch(a -> a.equalsIgnoreCase("block"));
+		}
+		for (String alias : aliases) {
+			if (alias.equalsIgnoreCase(normalized)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	public JsonObject toJson() {

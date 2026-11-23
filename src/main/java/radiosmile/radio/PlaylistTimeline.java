@@ -118,12 +118,33 @@ public final class PlaylistTimeline {
 		int dropped = 0;
 		for (Path file : files) {
 			Path actual = streamFileOf(file);
+			// <b>时间轴只接受 MP3</b>：不可播的曲目必须在这里剔除，而不是留给运行时跳过。
+			//
+			// 早期这里无条件 add，把"能不能播"全交给 PlaylistAudioSource 判断。
+			// 一旦有曲目是未转码的 .m4s/.ogg，会同时踩两个坑：
+			//   1. {@link AudioDuration} 只认 MP3 帧 → 时长 -1 → 兜底成 1ms
+			//      → <b>后面所有曲目的起点全部错位</b>（这正是"时序完全乱"的成因）；
+			//   2. 运行时 openTrack() 拒绝非 MP3 → advance() 反复跳曲，
+			//      与时间轴算出的"第几首"彻底脱节。
+			// 剔除后时间轴里每一首都是真实可播、且时长可信的，定位才有意义。
+			if (!isMp3(actual)) {
+				SmileSRadio.LOGGER.warn(
+						"播放列表曲目缺少 MP3 转码产物，已从时间轴剔除（否则会导致时序错乱）：{}",
+						file.getFileName());
+				dropped++;
+				continue;
+			}
 			Path identity = canonical(actual);
 			if (!seen.add(identity)) {
 				dropped++;
 				continue;
 			}
 			tracks.add(new Track(actual, durationOf(actual), sizeOf(actual)));
+		}
+		if (tracks.isEmpty()) {
+			SmileSRadio.LOGGER.error("播放列表没有任何可播曲目（全部缺少 MP3 转码产物）：{}",
+					tracks.size());
+			return null;
 		}
 		if (dropped > 0) {
 			SmileSRadio.LOGGER.debug("播放列表去重：{} 个源文件指向同一份音频，已合并", dropped);
@@ -133,6 +154,13 @@ public final class PlaylistTimeline {
 		SmileSRadio.LOGGER.debug("播放列表：{} 首，每轮 {} ms，随机={} 冷却={} 首",
 				tracks.size(), timeline.roundTotalMillis, random, timeline.cooldownSize());
 		return timeline;
+	}
+
+	/** 是否为 MP3（时间轴唯一接受的格式）。 */
+	private static boolean isMp3(Path file) {
+		return file != null && file.getFileName() != null
+				&& file.getFileName().toString().toLowerCase(java.util.Locale.ROOT)
+						.endsWith(".mp3");
 	}
 
 	/** 规范化为用于判重的绝对路径。 */
@@ -190,11 +218,20 @@ public final class PlaylistTimeline {
 		return baked != null ? baked : source;
 	}
 
-	/** 取播放时长；取不到返回 0，由构造时的下限兜底。 */
+	/**
+	 * 取播放时长。
+	 *
+	 * <p>走到这里的文件<b>必然已是 MP3</b>（{@link #of} 已剔除其它格式），
+	 * 因此 {@link AudioDuration} 一定能扫出帧。真扫不出来（文件损坏/被截断）
+	 * 说明这个文件本身有问题，仍然返回 0 让构造时的下限兜底，
+	 * 但会明确报错——而不是像早期那样把整条时间轴悄悄算错。
+	 */
 	private static long durationOf(Path actual) {
 		long millis = AudioDuration.millis(actual);
-		if (millis <= 0 && Files.isRegularFile(actual)) {
-			SmileSRadio.LOGGER.warn("无法解析时长，播放列表将按 1ms 处理：{}", actual.getFileName());
+		if (millis <= 0) {
+			SmileSRadio.LOGGER.error(
+					"MP3 时长解析失败（文件可能损坏或被截断），该曲在时间轴上按最小值处理：{}",
+					actual.getFileName());
 		}
 		return millis;
 	}

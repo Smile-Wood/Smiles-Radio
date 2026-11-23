@@ -213,7 +213,11 @@ public final class TxtPlaylist {
 			// 这里只看"本地有没有这个文件"，真正的有效性校验推迟到播放时（那里有 TTL 缓存）。
 			Path cached = RemoteAudioCache.cachedFileIfValid(line, false);
 			if (cached != null) {
-				entries.add(cached);
+				// <b>优先用转码产物</b>：时间轴要求 MP3 才能算出正确时长。
+				// 若转码还没完成，这里照样加入（原始 .m4s），
+				// 由 PlaylistTimeline 负责剔除——这样"未转码"不会污染时间轴。
+				Path baked = AudioTranscoder.mp3For(cached);
+				entries.add(baked != null ? baked : cached);
 			} else {
 				pendingUrls.add(line);
 				// 触发后台下载（幂等；同一 URL 不会重复排队）

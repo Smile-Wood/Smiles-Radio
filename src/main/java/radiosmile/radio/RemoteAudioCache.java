@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.HexFormat;
+import java.util.List;
 
 import radiosmile.SmileSRadio;
 
@@ -141,7 +142,17 @@ public final class RemoteAudioCache {
 						// 真正下载（带校验：若期间已被其它路径下好就直接复用）
 						Path local = localFileFor(url);
 						if (local != null) {
-							SmileSRadio.LOGGER.info("网络音频后台下载完成：{}", url);
+							SmileSRadio.LOGGER.info("网络音频后台下载完成：{}", local.getFileName());
+							// <b>下载完必须立刻转码</b>，这是修复"时序完全乱"的关键一步。
+							//
+							// 时间轴只接受 MP3（见 PlaylistTimeline.of）：若这里不转，
+							// 后续 resolveTracks() 拿到的仍是 .m4s/.flac 原文件，
+							// 会被时间轴剔除或算不出时长 —— 表现为整条列表定位错乱。
+							//
+							// 早期这里是"下载完成 → 清缓存"，指望下一轮预热去转码；
+							// 但预热只在 load()/reload 时跑一次，下载完成后没有任何东西
+							// 再触发它，于是那个文件永远停在"已下载、未转码"的状态。
+							AudioTranscoder.preheat(List.of(local));
 							// 完成后清 txt 解析缓存，让下次解析把它并入可播列表
 							radiosmile.radio.TxtPlaylist.clearCache();
 						}
