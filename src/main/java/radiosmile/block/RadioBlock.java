@@ -92,10 +92,91 @@ public class RadioBlock extends BaseEntityBlock {
 				: super.updateShape(state, direction, neighborState, level, pos, neighborPos);
 	}
 
-	/** 无碰撞箱：实体可直接穿过，也不会产生方块阴影。 */
+	/**
+	 * 选择框的基准包围盒（朝 north / -Z 时）。
+	 *
+	 * <p>取模型主箱体的真实几何：{@code x=3..13, y=0..6, z=7..9}。
+	 *
+	 * <p><b>不加天线</b>（用户明确要求）：天线是绕 Z 轴 -45° 伸出去的细长条，
+	 * 环绕后的范围可达 y≈11.6/16（超出方块顶面）。把它的包围盒并进来，
+	 * 选择框会变成一个"连天线一起框住"的大盒子，与模型观感不符。
+	 */
+	private static final double BODY_X0 = 3.0 / 16.0;
+	private static final double BODY_X1 = 13.0 / 16.0;
+	private static final double BODY_Y0 = 0.0;
+	private static final double BODY_Y1 = 6.0 / 16.0;
+	private static final double BODY_Z0 = 7.0 / 16.0;
+	private static final double BODY_Z1 = 9.0 / 16.0;
+
+	/**
+	 * 按朝向旋转后的机身选择框。
+	 *
+	 * <h2>这是"选择框"，不是"实体碰撞箱"</h2>
+	 * 两者在 1.20.1 是<b>独立</b>的：
+	 * <ul>
+	 *   <li>{@link #getShape}：<b>选择框</b>——鼠标指上去的轮廓、射线命中范围；</li>
+	 *   <li>{@code getCollisionShape}：<b>实体碰撞</b>——玩家/生物/掉落物能否穿过。</li>
+	 * </ul>
+	 * 本方块按设计<b>仍然无实体碰撞</b>（与火把同类，玩家可穿过），
+	 * 所以只调选择框，不碰碰撞箱。
+	 *
+	 * <h2>为什么按 {@code 180 - toYRot()} 旋转</h2>
+	 * 与渲染层 {@code RadioBlockEntityRenderer} 用的角度<b>完全一致</b>。
+	 * 若两处角度不同，就会出现"看得见的地方点不到、看不见的地方能点到"。
+	 *
+	 * <h2>为什么手写旋转而不是找现成 API</h2>
+	 * 1.20.1 的 {@code Shapes} 没有公开的旋转方法
+	 * （只有 {@code box/or/join/getFaceShape} 等），
+	 * {@code VoxelShape} 上也只暴露了 {@code move}。
+	 * 由于这里的旋转都是绕 Y 轴 90° 的整数倍，直接对 {@code x/z} 做换轴即可，
+	 * 逻辑简单且没有额外依赖。
+	 */
+	private static VoxelShape selectionShapeFor(BlockState state) {
+		Direction facing = state.hasProperty(FACING) ? state.getValue(FACING) : Direction.NORTH;
+		double x0 = BODY_X0, x1 = BODY_X1, z0 = BODY_Z0, z1 = BODY_Z1;
+		// 换算成"绕 Y 轴顺时针 90° 的次数"，与 blockstate 的 y 角一致
+		int quarter = java.lang.Math.floorMod(
+				Math.round((180.0F - facing.toYRot()) / 90.0F), 4);
+		for (int i = 0; i < quarter; i++) {
+			// 绕 Y 轴顺时针 90°： (x, z) -> (z, 1 - x)
+			// 用 min/max 重排，保证仍是 (min, max) 形式
+			double nx0 = z0, nx1 = z1;
+			double nz0 = 1.0 - x1, nz1 = 1.0 - x0;
+			x0 = nx0;
+			x1 = nx1;
+			z0 = nz0;
+			z1 = nz1;
+		}
+		return Shapes.box(x0, BODY_Y0, z0, x1, BODY_Y1, z1);
+	}
+
+	/**
+	 * 选择框（射线目标框 / 视距内的高亮轮廓）。
+	 *
+	 * <p>默认实现回落到整格，会让轮廓比模型大出一圈。这里返回与机身一致的形状。
+	 */
 	@SuppressWarnings("deprecation")
 	@Override
-	public VoxelShape getCollisionShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+	public VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos,
+			CollisionContext context) {
+		return selectionShapeFor(state);
+	}
+
+	/**
+	 * <b>实体碰撞箱：保持为空</b>（不恢复"可站立"）。
+	 *
+	 * <p>必须显式写出来。因为 {@code BlockBehaviour} 的默认实现是
+	 * {@code state.getShape(...)}——也就是我们上面刚覆盖的选择框。
+	 * 若不覆盖，玩家和生物就会撞在这个薄片机身上、走不过去，
+	 * 甚至能站在天线旁边"悬空"。
+	 *
+	 * <p>本方块与火把同类：<b>可穿过、不产生方块阴影</b>。
+	 * 用户要求调的只是<b>选择框</b>（点选轮廓），不是实体碰撞。
+	 */
+	@SuppressWarnings("deprecation")
+	@Override
+	public VoxelShape getCollisionShape(BlockState state, BlockGetter level, BlockPos pos,
+			CollisionContext context) {
 		return Shapes.empty();
 	}
 
