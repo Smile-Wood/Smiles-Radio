@@ -328,6 +328,36 @@ public final class AudioSubscription {
 		return this.priming || now >= this.nextSendAt;
 	}
 
+	/**
+	 * 心跳发送间隔（毫秒）。
+	 *
+	 * <p>取 <b>1000ms</b>：远小于客户端判超时的 8 秒（{@code STALL_TIMEOUT_MILLIS}），
+	 * 留足 8 倍余量；又远大于正常块间隔（约 250ms），
+	 * 所以<b>正常播放时这条路径根本不会触发</b>（真实音频块会不断刷新它）。
+	 *
+	 * <p>它只在"配速把下一次发送推到很远的未来"时兜底——
+	 * 典型场景是换曲瞬间没有可读数据，而 {@code nextSendAt} 还在未来。
+	 */
+	private static final long HEARTBEAT_INTERVAL_MILLIS = 1000L;
+
+	/** 上次真正发出任何包（音频块或心跳）的时刻。 */
+	private volatile long lastSendAt = System.currentTimeMillis();
+
+	/**
+	 * 是否该发心跳空包了。
+	 *
+	 * <p>判据刻意只看「距上次发包多久」，<b>不看配速</b>：
+	 * 心跳的目的就是覆盖"配速还没到、但客户端已经等太久"的窗口。
+	 */
+	public boolean isHeartbeatDue(long now) {
+		return now - this.lastSendAt >= HEARTBEAT_INTERVAL_MILLIS;
+	}
+
+	/** 记录一次发包（音频块或心跳），用于心跳判定。 */
+	public void markHeartbeatSent(long now) {
+		this.lastSendAt = now;
+	}
+
 
 	/**
 	 * 记一次发送并安排下一次。
@@ -344,6 +374,8 @@ public final class AudioSubscription {
 	 * （逐帧累加 {@code 1152/sampleRate}），与码率换算严格自洽（实测误差 0.5%）。
 	 */
 	public void markSent(long now, int bytes, byte[] data) {
+		// 正常发包也算"活着"，同步刷新心跳计时
+		this.lastSendAt = now;
 		long intervalMs = radiosmile.radio.AudioDurationEstimator.estimateMillis(data, this.bytesPerSecond);
 		intervalMs = Math.max(20L, Math.min(1000L, intervalMs));
 

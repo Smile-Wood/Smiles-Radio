@@ -350,8 +350,25 @@ public final class ClientAudioPlayer {
 			PcmSink.INSTANCE.start();
 			SmileSRadio.LOGGER.info("开始播放 {} @{}", stationId, pos);
 		}
+		// <b>心跳空包：只刷新"服务端还活着"，绝不能喂给解码器。</b>
+		//
+		// 服务端在换曲/轮转/上游短暂卡顿时会发空载荷的音频块（见
+		// AudioStreamManager.sendHeartbeat）。它存在的原因：客户端判断
+		// "流僵住/该不该响底噪"看的是 {@code lastChunkAt}，若服务端一言不发，
+		// 换首歌就会被误判成超时 → 点 NOSIGNAL + 响底噪。
+		//
+		// <p>这里<b>必须早于 feed() 返回</b>：空数组喂给 JLayer 的管道没有意义，
+		// 而且 <b>trackIndex 变化已在上面处理过</b>（重建解码器、flush 声卡），
+		// 所以心跳仍能正确同步"换曲"这件事，只是不产生音频。
+		//
+		// <b>不要在这里 clearClientFaultOnResume</b>：空包不代表"数据恢复"，
+		// 它只代表"服务端还活着"。真正恢复要等真实音频块到达（下面那条路径）。
 		stream.chunks++;
 		stream.lastChunkAt = System.currentTimeMillis();
+		if (data == null || data.length == 0) {
+			// 心跳：刷新时间戳后立即返回，不触碰解码器
+			return;
+		}
 		// <b>不在这里清底噪</b>。
 		//
 		// 早期把「收到一块数据」当成「网络已恢复」就清掉底噪，

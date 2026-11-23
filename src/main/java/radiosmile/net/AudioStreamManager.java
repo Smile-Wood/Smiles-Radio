@@ -394,6 +394,18 @@ public final class AudioStreamManager {
 				continue;
 			}
 			if (!sub.isDue(now)) {
+				// <b>还没到发送节拍，但可能已经很久没发过任何东西了。</b>
+				//
+				// 这是换曲场景下很容易漏掉的一条：{@code isDue()} 由配速锚点决定，
+				// 换曲/轮转时锚点可能被推到较远的未来，于是这里一路 {@code continue}，
+				// 客户端那边长时间收不到包 → 误判超时 → 点 NOSIGNAL + 响底噪。
+				//
+				// 因此补一条<b>与配速无关</b>的心跳路径：只要距上次发包超过
+				// {@link #HEARTBEAT_INTERVAL_MILLIS}，就发一个空包维持连接。
+				// 它不参与配速（不调 markSent），所以不会影响正常音频的节奏。
+				if (sub.isHeartbeatDue(now) && !sub.source().isFinished()) {
+					sendHeartbeat(sub);
+				}
 				continue;
 			}
 			try {
@@ -504,6 +516,34 @@ public final class AudioStreamManager {
 		// 因此这里绝不会因为等网络而卡住服务器 tick。
 		AudioSubscription.Chunk chunk = sub.pollChunk();
 		if (chunk == null || chunk.data().length == 0) {
+			// <b>没有数据时要发「心跳空包」，不能一言不发。</b>
+			//
+			// <h2>为什么必须发</h2>
+			// 换曲、播放列表轮转、上游短暂卡顿时，读线程会有<b>几百毫秒</b>拿不到数据。
+			// 早期这里直接 return，客户端那边就是"服务端没消息"——
+			// 而客户端判断「流僵住」和「要不要响底噪」都看 {@code lastChunkAt}，
+			// 于是：按时长积累到 8 秒 → 判超时 → <b>点亮 NOSIGNAL + 响底噪</b>，
+			// 可实际上服务一切正常，只是中间换了一首歌。
+			//
+			// <p>用户的原话是「要么中间做到无缝，要么就发空包（让客户端知道服务还活着）」。
+			// 做到无缝需要客户端预解码下一首并拼接 PCM，改动面大且容易在换曲处
+			// 产生爆音；<b>发空包是更稳的方案</b>：它精确表达了"我还活着，只是这段没数据"。
+			//
+			// <h2>空包不会污染音频</h2>
+			// 客户端收到空数组时<b>只刷新心跳、不喂解码器</b>（见 ClientAudioPlayer.handleChunk），
+			// 所以不会在 MP3 流里插入垃圾字节。
+			//
+			// <h2>为什么不需要限流</h2>
+			// 本方法由推送线程按 {@code isDue()} 的节奏调用（约每 250ms 一次），
+			// 天然不会刷屏；空包只有十几个字节。
+			//
+			// <h2>但不能无限发</h2>
+			// 若上游真的死了（{@code source.isFinished()}），读线程会退出，
+			// 这时继续发空包只会让客户端以为"一切正常"而永远不报故障。
+			// 因此只在<b>流还没结束</b>时发；真结束时不发，让客户端按既有逻辑判超时。
+			if (!sub.source().isFinished()) {
+				sendHeartbeat(sub);
+			}
 			return;
 		}
 		byte[] data = chunk.data();
@@ -560,6 +600,57 @@ public final class AudioStreamManager {
 		});
 
 		sub.markSent(now, data.length, data);
+	}
+
+	/**
+	 * 发送一个<b>心跳空包</b>：复用音频块通道，但载荷长度为 0。
+	 *
+	 * <p>它唯一的作用是告诉客户端「服务端还活着，只是这段没有音频数据」。
+	 * 客户端收到后<b>只刷新心跳时间、不喂解码器</b>，因此不会污染 MP3 字节流。
+	 *
+	 * <p><b>为什么复用 S2C_AUDIO_CHUNK 而不是新开一个通道</b>：
+	 * 客户端对这个通道的处理已经包含"切台/换曲/会话变化"的完整判定逻辑，
+	 * 空包走同一条路能顺带把这些状态同步过去（例如换曲时的 trackIndex 变化
+	 * 会让客户端重建解码器——正是我们想要的）。
+	 *
+	 * <p>字段顺序必须与正常音频块<b>完全一致</b>，否则客户端读取会错位：
+	 * pos / stationId / trackIndex / sessionId / formatId / data。
+	 */
+	private static void sendHeartbeat(AudioSubscription sub) {
+		ServerPlayer target = sub.player();
+		if (target == null || target.hasDisconnected()) {
+			return;
+		}
+		// <b>立刻记时间</b>，否则推送线程每 5ms 转一圈就会判定"又该发心跳了"，
+		// 变成每 5ms 一个空包刷屏。
+		sub.markHeartbeatSent(System.currentTimeMillis());
+		String stationId = sub.station().id();
+		BlockPos targetPos = sub.pos();
+		radiosmile.radio.AudioFormat format = sub.source().format();
+		int trackIndex = sub.trackIndex();
+		int sessionId = sub.sessionId();
+		var server = target.getServer();
+		if (server == null) {
+			return;
+		}
+		server.execute(() -> {
+			try {
+				if (!ServerPlayNetworking.canSend(target, RadioNetworking.S2C_AUDIO_CHUNK)) {
+					return;
+				}
+				FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
+				buf.writeBlockPos(targetPos);
+				buf.writeUtf(stationId);
+				buf.writeVarInt(trackIndex);
+				buf.writeVarInt(sessionId);
+				buf.writeVarInt(format.id());
+				// 空载荷：客户端据此识别为心跳
+				buf.writeByteArray(new byte[0]);
+				ServerPlayNetworking.send(target, RadioNetworking.S2C_AUDIO_CHUNK, buf);
+			} catch (Throwable t) {
+				SmileSRadio.LOGGER.error("[心跳] 空包发送异常", t);
+			}
+		});
 	}
 
 	public static void sendStatus(ServerPlayer player, BlockPos pos, int status) {

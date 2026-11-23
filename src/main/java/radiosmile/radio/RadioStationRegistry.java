@@ -205,8 +205,9 @@ public final class RadioStationRegistry {
 		// 旧位置（存档内 serverconfig）→ 新位置，只在"新位置还没有配置"时搬
 		migrateFromWorldIfNeeded(worldRoot);
 
-		// 配置重载：清掉 txt 解析缓存，保证 txt 内容变更立即生效
+		// 配置重载：清掉各层缓存，保证内容变更立即生效
 		TxtPlaylist.clearCache();
+		clearIconCache();
 
 		List<RadioStation> all = readIndex();
 		// <b>加载时即校验</b>：把"配置了但放不出来"的频道挑出来。
@@ -843,17 +844,139 @@ public final class RadioStationRegistry {
 		}
 	}
 
-	/** 读取图标字节（用于网络下发给客户端）。 */
+	/**
+	 * 图标下发时的目标边长（像素）。
+	 *
+	 * <p>界面上图标只按 <b>16×16</b> 绘制（见 {@code RadioScreen} 的 {@code blit}）。
+	 * 取 <b>32</b> 而不是 16：留 2 倍余量，避免不同 GUI 缩放/高 DPI 下糊掉，
+	 * 而体积仍然只有 500×500 原图的 1/244。
+	 */
+	private static final int ICON_TARGET_PX = 32;
+
+	/** 图标缩略图缓存：源文件路径 + 修改时间 -> 缩略图字节（避免每次请求都重新缩放）。 */
+	private static final Map<String, byte[]> ICON_CACHE = new java.util.HashMap<>();
+
+	/**
+	 * 读取并<b>自动降分辨率</b>后的图标字节（用于网络下发给客户端）。
+	 *
+	 * <h2>为什么要降</h2>
+	 * 服主常直接放 <b>500×500</b> 甚至更大的 PNG，而界面只画 16×16——
+	 * 一张 500×500 的图约 36KB，缩到 32×32 后通常只有 <b>1~2KB</b>，
+	 * 省下 <b>95%+</b> 的带宽。图标是每个玩家打开界面就会请求的，
+	 * 频道多时这笔开销很实在。
+	 *
+	 * <h2>为什么不在这里引入图像库</h2>
+	 * 用 JDK 自带的 {@code ImageIO}（{@code javax.imageio}）就够了，
+	 * 不额外增加依赖——这是服务端代码，多引一个库就多一份兼容负担。
+	 *
+	 * <h2>失败时就发原图</h2>
+	 * 若缩放失败（格式罕见、ImageIO 不支持），<b>退回原始字节</b>而不是返回空：
+	 * 图标显示不出来比多传几十 KB 严重得多。
+	 *
+	 * @return PNG 字节（已缩放）；无图标返回空数组
+	 */
 	public static byte[] readIconBytes(RadioStation station) {
 		Path icon = resolveIcon(station);
 		if (icon == null || !Files.isRegularFile(icon)) {
 			return new byte[0];
 		}
+		// 缓存键含修改时间：图标被替换后自动失效，不需要额外清理逻辑
+		String key;
 		try {
-			return Files.readAllBytes(icon);
+			key = icon.toAbsolutePath() + "|" + Files.getLastModifiedTime(icon).toMillis();
+		} catch (IOException e) {
+			key = icon.toAbsolutePath().toString();
+		}
+		synchronized (ICON_CACHE) {
+			byte[] hit = ICON_CACHE.get(key);
+			if (hit != null) {
+				return hit;
+			}
+		}
+		byte[] result;
+		try {
+			byte[] original = Files.readAllBytes(icon);
+			result = downscaleIcon(original);
+			if (result == null) {
+				// 缩放失败：退回原图，别让图标直接消失
+				result = original;
+			}
 		} catch (IOException e) {
 			SmileSRadio.LOGGER.warn("读取图标失败 {}", icon, e);
 			return new byte[0];
+		}
+		synchronized (ICON_CACHE) {
+			ICON_CACHE.put(key, result);
+		}
+		return result;
+	}
+
+	/**
+	 * 把图标缩放成 {@link #ICON_TARGET_PX} 见方，输出 PNG 字节。
+	 *
+	 * <p>保持宽高比：非正方形的图会按长边缩放到目标尺寸，短边等比缩小
+	 * （图标显示是 16×16 拉伸，等比缩放能保留原始比例、视觉更自然）。
+	 *
+	 * @return 缩放后的 PNG；缩放失败返回 {@code null}（调用方退回原图）
+	 */
+	private static byte[] downscaleIcon(byte[] original) {
+		// <b>专用服务器可能没有图形环境</b>：先确保 AWT 处于 headless 模式，
+		// 否则 ImageIO/Graphics2D 在某些 JDK 上会抛 HeadlessException。
+		// 只在第一次调用时设置（重复设置无害，但日志会更干净）。
+		if (!java.awt.GraphicsEnvironment.isHeadless()) {
+			try {
+				System.setProperty("java.awt.headless", "true");
+			} catch (Throwable ignored) {
+				// 安全策略不允许改属性时忽略，走下面的兜底
+			}
+		}
+		try {
+			java.awt.image.BufferedImage src =
+					javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(original));
+			if (src == null) {
+				return null;
+			}
+			int w = src.getWidth();
+			int h = src.getHeight();
+			// 已经足够小就不动它（避免把小图放大、反而变糊）
+			if (w <= ICON_TARGET_PX && h <= ICON_TARGET_PX) {
+				return original;
+			}
+			double scale = (double) ICON_TARGET_PX / Math.max(w, h);
+			int nw = Math.max(1, (int) Math.round(w * scale));
+			int nh = Math.max(1, (int) Math.round(h * scale));
+
+			java.awt.image.BufferedImage dst = new java.awt.image.BufferedImage(
+					nw, nh, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+			java.awt.Graphics2D g = dst.createGraphics();
+			try {
+				// <b>必须开高质量插值</b>：默认的最近邻缩小会产生锯齿/摩尔纹，
+				// 图标这种小图尤其明显。
+				g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
+						java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+				g.setRenderingHint(java.awt.RenderingHints.KEY_RENDERING,
+						java.awt.RenderingHints.VALUE_RENDER_QUALITY);
+				g.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
+						java.awt.RenderingHints.VALUE_ANTIALIAS_ON);
+				g.drawImage(src, 0, 0, nw, nh, null);
+			} finally {
+				g.dispose();
+			}
+			java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+			javax.imageio.ImageIO.write(dst, "png", out);
+			return out.toByteArray();
+		} catch (Throwable t) {
+			// 无图形环境（headless 服务器）等异常：交给调用方退回原图。
+			// 注意专用服务器确实可能没有图形环境，所以这条路径必须能兜住。
+			SmileSRadio.LOGGER.debug("图标缩放失败（将发送原图）", t);
+			return null;
+		}
+	}
+
+	/** 清空图标缓存（配置重载时调用）。 */
+	public static void clearIconCache() {
+		synchronized (ICON_CACHE) {
+			ICON_CACHE.clear();
 		}
 	}
 
