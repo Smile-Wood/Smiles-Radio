@@ -365,21 +365,25 @@ public class RadioScreen extends Screen {
 
 			// <b>右侧的频率/档位</b>（{@code rate}，未配置时显示 NETWORK）。
 			//
-			// 先算出它的宽度，再决定名字能用多少横向空间——否则长频道名会
-			// 直接盖住右侧的 rate，两者都读不清。
+			// 布局要点：给 rate 一个<b>固定右边界</b>，并且必须让开滚动条。
+			// 早期写成 listRight - 8，而滚动条区间是 [listRight-5, listRight]，
+			// 于是短文案（如 NETWORK）的右端正好压在滚动条下面，看起来像"没显示"。
 			String rate = station.displayRate();
 			int rateWidth = this.font.width(rate);
-			int rateRight = this.listRight - 8;
+			// 右边界 = 列表右边界 - 滚动条宽度 - 内边距
+			int rateRight = this.listRight - SCROLLBAR_WIDTH - 4;
 			int rateX = rateRight - rateWidth;
 
 			String name = station.name() == null || station.name().isBlank() ? station.id() : station.name();
-			// 名字区右边界要留出 rate 的空间（再留 6px 间隙）
-			int nameMaxRight = rateX - 6;
+			// 名字区右边界要留出 rate 的空间（再留 8px 间隙）
+			int nameMaxRight = rateX - 8;
 			int nameBudget = Math.max(0, nameMaxRight - nameX);
 			graphics.drawString(this.font, this.font.plainSubstrByWidth(name, nameBudget),
 					nameX, textY, selected ? 0xFFFFFFFF : 0xFFE6E6E6, false);
 
-			// rate 用稍暗的颜色：它是辅助信息，不该和频道名抢注意力
+			// rate 用稍暗的颜色：它是辅助信息，不该和频道名抢注意力。
+			// 若名字预算被压到 0（行太窄），说明列表本身容不下两栏，
+			// 此时仍然画 rate——它比名字更重要（用户明确要求看到它）。
 			graphics.drawString(this.font, rate, rateX, textY,
 					selected ? 0xFFC8F0C8 : 0xFF9FB8A8, false);
 		}

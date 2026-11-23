@@ -743,6 +743,15 @@ public final class ClientAudioPlayer {
 				// 期间有更新的故障状态：清除作废，保留新状态。
 				return;
 			}
+			// <b>先记录"屏幕上已无故障"这个事实</b>。
+			//
+			// 这一步漏掉过一次，代价是<b>每来一个音频块就重复清一次、重复打一条日志</b>：
+			// 因为 {@code faultShown} 是上面那道"要不要排队"的唯一门，
+			// 不清它就永远是 true，于是每块都 execute 一次，
+			// 日志里出现「音频已恢复」每 0.25 秒一条（实测 119 条/分钟）。
+			// 同时 {@code markLocalFault} 内部又会调 {@code noteFaultShown}，
+			// 两者原本应当是同一件事，容易在这个函数里被写成"只走一边"。
+			faultShown = false;
 			radiosmile.client.radio.ClientRadioNetwork.markLocalFault(
 					snapshot, radiosmile.net.AudioStatus.OK);
 			// <b>本次故障的「结束」日志</b>：只在死亡→存活的那一次跳变打印。

@@ -215,7 +215,12 @@ public final class ClientRadioNetwork {
 			// <b>方块记着的频道已经不在配置里了</b>（重载后失效 / 一直被写坏）：
 			// 同样按"未知频道"报警。这条覆盖了"客户端没收到 UNKNOWN_STATION 状态包"
 			// 的情况（例如重载时玩家正好不在线、或状态包在途丢失）。
-			if (!stationId.isBlank()
+			//
+			// <b>但列表未加载时绝不能判"未知"</b>：那会把所有频道都误判成未知，
+			// 于是每 0.5 秒点亮一次、收到音频又清掉 —— 表现正是"NOSIGNAL 一直闪"。
+			// 进服时已主动请求列表（见 AudioLifecycleHooks），这里只做保守兜底。
+			if (radiosmile.client.radio.ClientRadioData.isLoaded()
+					&& !stationId.isBlank()
 					&& radiosmile.client.radio.ClientRadioData.findStation(stationId) == null) {
 				return radiosmile.net.AudioStatus.UNKNOWN_STATION;
 			}

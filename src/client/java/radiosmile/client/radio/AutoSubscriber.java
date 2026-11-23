@@ -262,7 +262,15 @@ public final class AutoSubscriber implements ClientModInitializer {
 			//   2) 配置有效、但<b>已配置过却被重载搞坏</b>的频道——从客户端看就是"未知频道"，
 			//      因为服务端已把它从下发列表里摘掉了（见 RadioStationRegistry#isPlayable）。
 			// 这两种情况都没有"信号"可言，所以不受 isStreamingStation 限制。
-			boolean unknownStation = ClientRadioData.findStation(entry.getValue()) == null;
+			// <b>列表还没到就不能判"未知"</b>——这是"文字闪烁"的根因所在。
+			//
+			// 早期列表只在打开 GUI 时才有，于是不碰界面的玩家这里永远为空，
+			// 所有频道都会被判成未知 → 每 0.5 秒点亮一次 → 数据到了又清 → 闪。
+			// 现在进服会主动请求列表（见 AudioLifecycleHooks），
+			// 并且这里再加一道保险：<b>未加载时不作任何未知判定</b>。
+			boolean stationListKnown = ClientRadioData.isLoaded();
+			boolean unknownStation = stationListKnown
+					&& ClientRadioData.findStation(entry.getValue()) == null;
 			if (unknownStation) {
 				// 未知频道：直接点亮 + 持续噪音（不再等 8 秒超时窗口，它注定不会好）
 				ClientRadioNetwork.markLocalFault(entry.getKey(),

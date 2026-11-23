@@ -72,6 +72,31 @@ public class RadioBlock extends BaseEntityBlock {
 		return new RadioBlockEntity(pos, state);
 	}
 
+	/**
+	 * 该物品是否允许触发收音机界面。
+	 *
+	 * <h2>允许的两种</h2>
+	 * <ol>
+	 *   <li><b>空手</b>：最常见的"我要调台"手势，必须永远有效。</li>
+	 *   <li><b>拿着收音机物品</b>：视为"我要操作这台机器"。
+	 *       注意这会<b>阻止</b>把收音机叠放到已有的收音机上（服务端返回 SUCCESS 吃掉交互），
+	 *       这是有意的取舍：拿着同款物品对着收音机连点的场景里，
+	 *       想调台的远比想叠放的多，而且叠放在无碰撞箱的方块上本来就少见。</li>
+	 * </ol>
+	 *
+	 * <p>其它任何物品（方块、工具、食物、桶……）一律<b>不</b>触发界面，
+	 * 让交互"穿透"回原版行为。
+	 *
+	 * @param held 该手所持物品堆（空手时是 {@link net.minecraft.world.item.ItemStack#EMPTY}）
+	 */
+	private static boolean isInteractionItem(net.minecraft.world.item.ItemStack held) {
+		if (held == null || held.isEmpty()) {
+			// 空手：始终允许
+			return true;
+		}
+		return held.is(radiosmile.registry.ModItems.RADIO);
+	}
+
 	/** 只有下方是完整实心面才算有支撑，与火把一致。 */
 	public static boolean hasSupport(LevelReader level, BlockPos pos) {
 		return Block.canSupportCenter(level, pos.below(), Direction.UP);
@@ -102,18 +127,49 @@ public class RadioBlock extends BaseEntityBlock {
 	/**
 	 * 右键交互。
 	 *
+	 * <h2>只有<b>空手</b>或<b>拿着收音机</b>时才打开界面</h2>
+	 * 用户要求：手持其它物品右键时<b>不应触发</b>本方块的交互。
+	 *
+	 * <p>为什么这个细节重要：收音机是<b>无碰撞箱</b>、只有一个薄片造型的方块
+	 * （与火把同类）。玩家常常在它周围不小心右键——比如拿着方块想放在旁边、
+	 * 拿着镐子想挖别的东西——若每次都被强行弹出选台界面，会非常打断操作，
+	 * 而且界面会盖住画面、必须手动关掉。让其它物品"穿透"过去（返回
+	 * {@link InteractionResult#PASS}）才是正确的交互手感。
+	 *
+	 * <h2>为什么用 PASS 而不是 FAIL</h2>
+	 * {@code PASS} 表示"本方块不处理这次交互，交回给物品/后续逻辑"，
+	 * 于是手持方块时会正常放置、手持食物时会正常吃、手持工具时正常作用于别的目标。
+	 * 若返回 {@code FAIL} 会把整个交互吞掉，反而更糟。
+	 *
+	 * <h2>为什么服务端也要一起判定</h2>
+	 * {@code use} 两端都会跑。若只在客户端判空手、服务端仍返回 SUCCESS，
+	 * 会出现"客户端以为没交互、服务端以为交互了"的幽灵摆动（手臂动画与音效错位）。
+	 * 因此这里把判定放在 {@code level.isClientSide} 分支<b>之前</b>，两端一致。
+	 *
 	 * <p><b>GUI 只在客户端打开</b>：{@link #use} 会在服务端与客户端分别执行，
 	 * 若在服务端调用任何界面代码，专用服务器会直接崩溃（客户端类在服务端不存在）。
-	 * 因此这里用 {@code level.isClientSide()} 严格隔离；服务端只返回 {@link InteractionResult#PASS}，
-	 * 不参与任何界面逻辑。
 	 */
 	@SuppressWarnings("deprecation")
 	@Override
 	public InteractionResult use(BlockState state, Level level, BlockPos pos, Player player,
 			InteractionHand hand, BlockHitResult hit) {
-		// 服务端绝不做界面相关处理
-		if (!level.isClientSide) {
+		// <b>先判定"手上拿的是什么"——这段两端都必须执行</b>（见方法注释）
+		if (!isInteractionItem(player.getItemInHand(hand))) {
+			// 手持其它物品（方块、工具、食物……）：
+			// <b>交回给原版</b>，于是拿方块右键能正常放置、拿食物能吃、拿工具正常作用。
+			// 这正是"不要拦截放置方块"的实现方式。
 			return InteractionResult.PASS;
+		}
+
+		// 服务端：<b>必须返回 SUCCESS（而不是 PASS）来"吃掉"这次交互</b>。
+		//
+		// 若这里返回 PASS，服务端会继续走 {@code ItemStack#useOn}——
+		// 玩家手里拿着收音机物品、右键收音机侧面时，服务端就会真的去<b>放置一个收音机</b>，
+		// 而客户端此时已经弹出了选台界面。表现是"打开界面后旁边凭空多了个方块"，
+		// 且只在服务端发生、客户端不同步，极难排查。
+		// 返回 SUCCESS 表示"已处理，别再往下传"，界面本身仍只在客户端打开。
+		if (!level.isClientSide) {
+			return InteractionResult.SUCCESS;
 		}
 
 		RadioClientBridge.ScreenOpener opener = RadioClientBridge.openScreen;

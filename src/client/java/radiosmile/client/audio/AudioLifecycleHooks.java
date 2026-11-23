@@ -37,6 +37,15 @@ public class AudioLifecycleHooks implements ClientModInitializer {
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
 			SmileSRadio.LOGGER.info("已连接服务器，清空本地音频流表（将重新订阅）");
 			ClientAudioPlayer.stopAll();
+			// <b>进服就拉一次电台列表</b>（本轮新增，修复"文字闪烁"的关键）。
+			//
+			// 早期列表只在<b>打开 GUI</b> 时才请求。这带来一个隐蔽的连锁故障：
+			// 不打开界面的玩家，客户端 {@code ClientRadioData.stations()} 始终为空，
+			// 于是"方块记的频道是否存在于配置里"这个判断对<b>所有</b>频道都返回 false，
+			// 被误判成"未知频道" → 每 0.5 秒点亮一次故障 → 收到数据又清除 → 反复闪。
+			//
+			// 所以进服必须主动取一次列表：它同时也是 rate/图标能显示的前提。
+			radiosmile.client.radio.ClientRadioNetwork.requestStations();
 		});
 	}
 }
