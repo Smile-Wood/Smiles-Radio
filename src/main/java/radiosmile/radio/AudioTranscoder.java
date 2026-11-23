@@ -265,7 +265,7 @@ public final class AudioTranscoder {
 		}
 		try {
 			ProcessBuilder pb = new ProcessBuilder(
-					"ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+					ffmpegCommand(), "-y", "-hide_banner", "-loglevel", "error",
 					"-i", source.toString(),
 					"-vn",
 					"-c:a", "libmp3lame", "-b:a", BITRATE,
@@ -295,13 +295,51 @@ public final class AudioTranscoder {
 	/** 探测 ffmpeg 是否可用。 */
 	public static boolean ffmpegAvailable() {
 		try {
-			Process p = new ProcessBuilder("ffmpeg", "-version")
+			Process p = new ProcessBuilder(ffmpegCommand(), "-version")
 					.redirectErrorStream(true).start();
 			p.getInputStream().readAllBytes();
 			return p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0;
 		} catch (Exception e) {
 			return false;
 		}
+	}
+
+	/**
+	 * ffmpeg 可执行文件路径（{@code null} / 空 = 用 PATH 里的 {@code ffmpeg}）。
+	 *
+	 * <p>由 {@code stations.json} 顶层的 {@code ffmpeg} 字段设置，见
+	 * {@link RadioStationRegistry#setFfmpegPath(String)}。
+	 * 供 {@link #ffmpegCommand()} 与 {@link #runFfmpeg} 共用——
+	 * <b>两处必须走同一个函数</b>，否则会出现"探测说可用、转码却找不到"
+	 * 这种自相矛盾的状态。
+	 */
+	private static volatile String configuredFfmpegPath;
+
+	/**
+	 * 设置 ffmpeg 路径。
+	 *
+	 * @param path 绝对路径（如 {@code C:\tools\ffmpeg\bin\ffmpeg.exe}），
+	 *             或裸命令名（如 {@code ffmpeg}）；空白视为"用默认值"
+	 */
+	public static void setFfmpegPath(String path) {
+		configuredFfmpegPath = (path == null || path.isBlank()) ? null : path.trim();
+	}
+
+	/** 当前生效的 ffmpeg 命令（用于日志展示与诊断）。 */
+	public static String currentFfmpegPath() {
+		String configured = configuredFfmpegPath;
+		return configured != null ? configured : "ffmpeg";
+	}
+
+	/**
+	 * 组装实际要执行的 ffmpeg 命令。
+	 *
+	 * <p>未配置时回退到 PATH 里的 {@code ffmpeg}——这是绝大多数服主的用法，
+	 * 不该强迫他们写路径。
+	 */
+	private static String ffmpegCommand() {
+		String configured = configuredFfmpegPath;
+		return configured != null ? configured : "ffmpeg";
 	}
 
 	/** 已就绪的转码产物数量（用于日志）。 */

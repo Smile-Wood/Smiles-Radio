@@ -245,6 +245,19 @@ public final class RadioStationRegistry {
 		}
 		try (Reader reader = Files.newBufferedReader(index, StandardCharsets.UTF_8)) {
 			JsonElement root = JsonParser.parseReader(reader);
+
+			// <b>顶层非频道字段：ffmpeg 可执行文件路径</b>（频道列表之外，用户要求）。
+			//
+			// 用途：某些服务器上 ffmpeg 不在 PATH 里（自建容器、精简系统、
+			// 多版本共存需要指定某个特定构建），或根本没有安装名就叫 ffmpeg 的程序。
+			// 允许在这里写绝对路径，转码预热就会用它。
+			//
+			// 只在"配置文件由对象构成"时读取（老格式是裸数组，没有地方放顶层字段），
+			// 读不到/为空都表示"用 PATH 里的 ffmpeg"，不影响既有部署。
+			if (root.isJsonObject()) {
+				readTopLevelFfmpeg(root.getAsJsonObject());
+			}
+
 			JsonArray arr = root.isJsonObject()
 					? root.getAsJsonObject().getAsJsonArray("stations")
 					: root.getAsJsonArray();
@@ -274,6 +287,49 @@ public final class RadioStationRegistry {
 	}
 
 	/**
+	 * 读取配置顶层的 {@code ffmpeg} 字段并应用。
+	 *
+	 * <p>处理三种情况，且都必须有明确日志——转码失败是"猜不出来"的故障：
+	 * <ul>
+	 *   <li>字段缺失 / 空串 → 用 PATH 里的 ffmpeg（默认行为，不打扰）；</li>
+	 *   <li>字段指向的文件存在 → 应用，并记一行 INFO；</li>
+	 *   <li>字段指向的文件<b>不存在</b> → 打 WARN 并说明"回退到默认，
+	 *       若 PATH 里也没有则转码会失败"，而不是悄悄忽略。</li>
+	 * </ul>
+	 */
+	private static void readTopLevelFfmpeg(JsonObject root) {
+		if (!root.has("ffmpeg") || root.get("ffmpeg").isJsonNull()) {
+			AudioTranscoder.setFfmpegPath(null);
+			return;
+		}
+		String configured;
+		try {
+			configured = root.get("ffmpeg").getAsString();
+		} catch (Exception e) {
+			SmileSRadio.LOGGER.warn("配置项 ffmpeg 不是字符串，已忽略：{}", root.get("ffmpeg"));
+			AudioTranscoder.setFfmpegPath(null);
+			return;
+		}
+		if (configured == null || configured.isBlank()) {
+			AudioTranscoder.setFfmpegPath(null);
+			return;
+		}
+		configured = configured.trim();
+		// 含路径分隔符才当文件校验；裸命令名（如 "ffmpeg"）交给系统去 PATH 找
+		boolean looksLikePath = configured.contains("/") || configured.contains("\\");
+		if (looksLikePath && !Files.isRegularFile(Path.of(configured))) {
+			SmileSRadio.LOGGER.warn(
+					"配置的 ffmpeg 路径不存在：{} —— 将回退到 PATH 里的 ffmpeg，"
+							+ "若那里也没有则无法转码（非 MP3 频道会被拒绝播放）",
+					configured);
+			AudioTranscoder.setFfmpegPath(null);
+			return;
+		}
+		AudioTranscoder.setFfmpegPath(configured);
+		SmileSRadio.LOGGER.info("已按配置指定 ffmpeg：{}", configured);
+	}
+
+	/**
 	 * 自动创建配置文件 {@code stations.json}，并在其中放入示例条目。
 	 *
 	 * <p>示例条目的 {@code id} 使用保留值 {@link #EXAMPLE_ID}（即 {@code example}）。
@@ -286,6 +342,13 @@ public final class RadioStationRegistry {
 	 */
 	private static void writeDefaultIndex(Path index) {
 		JsonObject root = new JsonObject();
+
+		// <b>顶层：ffmpeg 可执行文件路径</b>（频道列表之外，用户要求）。
+		// 空串 = 用系统 PATH 里的 ffmpeg，绝大多数情况保持默认即可。
+		root.addProperty("ffmpeg", "");
+		root.addProperty("_说明_ffmpeg", "ffmpeg 可执行文件的完整路径。留空则使用系统 PATH 里的 ffmpeg；"
+				+ "仅当服务器上 ffmpeg 不在 PATH、或需要指定某个特定版本时才填"
+				+ "（例如 C:\\tools\\ffmpeg\\bin\\ffmpeg.exe 或 /usr/local/bin/ffmpeg）");
 
 		// 配置说明：写进文件本身，服主打开就能看懂，不必回来翻文档。
 		root.addProperty("_说明_播放模式", "mode 可选值见下面的示例条目；"

@@ -1123,9 +1123,34 @@ true           # 打乱顺序，所有玩家顺序一致
 
 > 用户措辞：文档里叫「**打乱顺序**」，不叫"随机播放/列表播放"。
 
+#### X. 第十四轮：ffmpeg 路径可配置
+
+`stations.json` **顶层**（频道列表之外）新增 `ffmpeg` 字段：
+
+```json
+{
+  "ffmpeg": "C:\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+  "stations": [ ... ]
+}
+```
+
+用于 ffmpeg 不在 PATH 的服务器（自建容器、精简系统、多版本共存需指定某一份构建）。
+
+| 配置值 | 行为 |
+|---|---|
+| 字段缺失 / 空串 | 用 PATH 里的 `ffmpeg`（默认，不打扰既有部署） |
+| 有效路径 | 采用，日志确认「已按配置指定 ffmpeg」 |
+| 路径不存在 | WARN 并回退 PATH，**明确说明**若 PATH 也没有则无法转码 |
+
+> 关键实现约束：探测（`ffmpegAvailable`）与实际转码（`runFfmpeg`）**必须走同一个
+> `ffmpegCommand()`**。否则会出现"探测说可用、转码却找不到"这种自相矛盾的状态——
+> 正是 HANDOVER 第十二节那个「一个语义两处实现」的老毛病。
+
+实测四种配置组合均正确；并用真实 .ogg 验证**按配置路径转码成功**。
+
 ### 当前构建状态
 
-- **`build/libs/radio-smile-1.0.0.jar`，约 325 KB**
+- **`build/libs/radio-smile-1.0.0.jar`，约 326 KB**
 - `gradlew clean build` → BUILD SUCCESSFUL
 - **git 已初始化**（单条初始提交，含本轮全部修复）
 
