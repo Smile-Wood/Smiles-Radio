@@ -163,14 +163,17 @@ public final class TxtPlaylist {
 		lines = stripBom(lines);
 
 		boolean random = false;
-		// <b>播放顺序 = txt 行从上到下</b>（用户明确要求）。
+		// <b>播放顺序 = txt 行从上到下，严格保持书写顺序。</b>
 		//
 		// 未下载完成的网络条目属于<b>挂起（pending）</b>状态：
-		// 它们不在可播列表里，播放到那一行时<b>直接跳到下一首</b>。
-		// 后台预热线程会持续下载，下完清缓存后自然并入可播集合。
+		// 它们<b>不进入</b>可播列表，所以"播放到那一行就自动跳过"是天然成立的，
+		// 播放层不需要任何额外判断。后台下载完成后它们会自己并入可播列表。
+		//
+		// <b>不要在这里做任何"分桶/排序"</b>：曾经实现过「本地 > 已缓存网络 >
+		// 未缓存网络」的三级优先级，但那会打乱按行顺序——用户明确要求
+		// "顺序播放就是按 txt 行从上到下"，混播（本地+网络交替）时尤其不能乱。
+		// 挂起跳过本身已经解决了"未缓存条目不卡住播放"的问题，不需要再排序。
 		List<Path> entries = new ArrayList<>();
-		// 挂起条目：已识别但还没缓存好，交给后台下载
-		List<String> pendingUrls = new ArrayList<>();
 		boolean firstContentLine = true;
 
 		for (String raw : lines) {
@@ -225,8 +228,9 @@ public final class TxtPlaylist {
 				Path baked = AudioTranscoder.mp3For(cached);
 				entries.add(baked != null ? baked : cached);
 			} else {
-				pendingUrls.add(line);
-				// 触发后台下载（幂等；同一 URL 不会重复排队）
+				// <b>挂起</b>：不加入 entries（因此播放时会被跳过），
+				// 只把它排进后台下载队列。下载完成后下次解析自然命中缓存。
+				// 重复请求是幂等的（同一 URL 不会重复排队）。
 				RemoteAudioCache.requestDownload(line);
 				SmileSRadio.LOGGER.info("网络音频尚未缓存，挂起并转入后台下载：{}", line);
 			}
