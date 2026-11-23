@@ -170,6 +170,20 @@ public final class PcmSink {
 		volatile boolean primed;
 
 		/**
+		 * <b>稳态深度基线</b>（帧数）：用于判断"缓冲是不是正在变薄"。
+		 *
+		 * <p>为什么需要它：直播流的水位恒定在起播水位（约 300ms），
+		 * 用"相对配置目标"判断会永久误报（HANDOVER 第八节 C 的 v1 死因）。
+		 * 改成"相对自己的稳态"后，正常直播流不会报警，
+		 * 只有真正掉下去（丢包 / 上游卡 / 切台后接不上）才报。
+		 *
+		 * <p>更新规则见 {@link PcmSink#isBufferThinning()}：
+		 * 变厚立即跟随、变薄缓慢下移，于是"持续变薄"最终会被接受为新稳态，
+		 * 只留下"突然变薄"这一个报警信号。
+		 */
+		int steadyFrames;
+
+		/**
 		 * 这个缓冲里是否<b>只有效果音</b>、没有真实节目数据。
 		 *
 		 * <p>丢包/换台空窗时我们会为归属方块挂一个空块承载噪声。
@@ -664,6 +678,23 @@ public final class PcmSink {
 				nowSilent = true;
 				this.tuningNoiseBlock = -1L;
 				this.streamFlowing = false;
+				// <b>底噪锚点与增益必须一起清</b>。
+				//
+				// 早期这里只清 {@code tuningNoiseBlock}，漏了网络底噪这一层，于是：
+				// 拆掉收音机时若「STREAMS 已经是空的」（服务端先停了推送、客户端才拆方块），
+				// {@code stopInternal} 会走 {@code else} 分支到这里，
+				// 而 {@code networkNoiseBlock} 与 {@code networkNoise} 的增益<b>原封不动</b> →
+				// 方块都拆了，底噪还在响（用户实测「拆掉方块会有噪音」）。
+				//
+				// 语义上这也很明确：<b>一个音源都没有了</b>，
+				// 就没有"哪台机器的链路坏了"这回事，故障提示失去了报警对象。
+				this.networkNoiseBlock = -1L;
+				this.networkNoise.reset();
+				this.faultReported = false;
+				this.consecutiveUnderruns = 0;
+				this.weakNoiseHeld = false;
+				this.healthyBlocks = 0;
+				this.failingNow = false;
 			}
 		}
 		if (nowSilent) {
@@ -1304,7 +1335,18 @@ public final class PcmSink {
 		}
 
 		// 抖动缓冲是否已经回到健康水平（用来撤销「弱底噪」）。
-		boolean healthy = !this.isJitterBufferThinned();
+		//
+		// <b>这里合并了两个判据</b>：
+		//   1) {@link #isJitterBufferThinned()}：已到危险线（目标的两成以下）——兜底；
+		//   2) {@link #isBufferThinning()}：相对<b>自己的稳态</b>正在变薄——新增的"提前预警"。
+		//
+		// 用户要求"缓冲层薄的时候也响底噪（含刚切台、断网恢复）"，
+		// 而这正是 (2) 覆盖的场景：切台/恢复后缓冲还没攒回来，
+		// 相对刚才的稳态明显变薄，于是发出轻微的嘶声提示"信号还不稳"。
+		//
+		// 只用 (1) 是不够的：它的阈值是"目标的两成"，正常播放时基本不会触发，
+		// 导致"缓冲明显变薄但还没到底"这段最该提示的区间完全静音。
+		boolean healthy = !this.isJitterBufferThinned() && !this.isBufferThinning();
 		if (healthy) {
 			this.healthyBlocks++;
 		} else {
@@ -1410,9 +1452,122 @@ public final class PcmSink {
 	private static final int HEALTHY_RESTORE_BLOCKS = 25;
 
 	/**
-	 * 抖动缓冲是否「被吃薄」（相对目标的剩余比例过低）。
+	 * <b>缓冲层是否正在「变薄」</b>——本轮新增的底噪依据。
+	 *
+	 * <h2>为什么不能再用「相对目标水位」判断</h2>
+	 * HANDOVER 第八节 C 记过 v1 的死因：用「剩余深度 / 目标 bufferMillis」当判据，
+	 * 但<b>直播流的产出与消费是实时 1:1</b>，缓冲会永远停在起播那一刻的水位
+	 * （约 300ms），而目标是 1000ms —— 于是比例恒为 0.3，
+	 * 底噪被永久拉在 40% 强度上，「突然出现且不消失」。
+	 *
+	 * <h2>现在的判据：相对<b>自己的稳态</b>变薄</h2>
+	 * 每个音源记一个「稳态深度」基线（缓慢跟随实际水位，见 {@code steadyFrames}）。
+	 * 判据是<b>当前深度相对稳态明显下降</b>，而不是相对配置目标。
+	 * 这样：
+	 * <ul>
+	 *   <li>直播流稳态 300ms → 基线也是 300ms → 正常时不报警；</li>
+	 *   <li>忽然掉到 120ms（上游卡、丢包、切台后没接上）→ 相对基线掉 60% → 报警；</li>
+	 *   <li>本地文件稳态接近目标 → 同样只在真的被吃薄时才报警。</li>
+	 * </ul>
+	 * 「相对于自己」正是"网络在变差"的定义，与绝对水位无关。
 	 *
 	 * <p>多音源时取最薄的那一路：只要有一台快断了，链路整体就不健康。
+	 */
+	private boolean isBufferThinning() {
+		int target = this.jitterTargetFrames();
+		if (target <= 0) {
+			return false;
+		}
+		int thinnestRatio = Integer.MAX_VALUE;
+		boolean any = false;
+		synchronized (this.lock) {
+			for (SourceBuffer buffer : this.sources.values()) {
+				if (!buffer.primed) {
+					continue;
+				}
+				any = true;
+				int depth = buffer.length / OUT_CHANNELS;
+				// 稳态基线：只做"缓慢上升 + 缓慢下降"，避免被瞬时抖动带走
+				if (depth > buffer.steadyFrames) {
+					// 变厚：立即跟随（水位抬升是事实，不该延迟）
+					buffer.steadyFrames = depth;
+				} else {
+					// 变薄：缓慢下移。
+					//
+					// <b>衰减必须比"真实下降"慢得多</b>，否则基线会把下降"吸收"掉、
+					// 永远不报警（实测：1/256 的半衰期 3.5 秒，比一次真实掉水还快）。
+					// 取 1/1024（半衰期约 14 秒）：真实丢包/卡顿造成的下降是秒级的，
+					// 基线十几秒才跟到，因此能被稳定检出；而切台/重连这种
+					// "永久换了一个水位"的情形，十几秒后也会被接受为新稳态，不会永久响。
+					buffer.steadyFrames -= Math.max(1, buffer.steadyFrames / 1024);
+				}
+				if (buffer.steadyFrames < BUFFER_STEADY_MIN_FRAMES) {
+					// 基线还没建立（刚起播、缓冲太浅）：不判断，交给起播专档
+					continue;
+				}
+				// 千分比，避免浮点运算（混音线程每 20ms 调用一次）
+				thinnestRatio = Math.min(thinnestRatio,
+						(int) ((long) depth * 1000L / Math.max(1, buffer.steadyFrames)));
+			}
+		}
+		if (!any || thinnestRatio == Integer.MAX_VALUE) {
+			// 没有已预热的音源：这属于「起播/断流」，由别的档位处理
+			return false;
+		}
+		// <b>两道判据取"或"</b>：
+		//   1) 相对自己的稳态明显变薄（突然掉水，最典型的"网络在变差"）；
+		//   2) 绝对深度已经低于起播门槛（一层薄薄的缓冲，随时会断）。
+		//
+		// 只保留 (1) 会漏掉"水位本来就一路很低"的情况——那种缓冲确实薄、
+		// 听感随时会断，正是用户要求提示的场景。
+		// 只保留 (2) 又会重蹈 HANDOVER 第八节 C 的 v1：直播流稳态 300ms
+		// 恰好贴着起播门槛，于是永久报警。
+		// 两者取或，并用 (1) 的"稳态基线"作为主要信号，(2) 只在
+		// <b>明显低于</b>门槛（70%）时才生效——留出足够余量，
+		// 避免直播流正常抖动（±25%）时底噪一直在响。
+		boolean relativelyThin = thinnestRatio < BUFFER_THIN_PERMILLE;
+		boolean absolutelyThin = thinnestRatio != Integer.MAX_VALUE
+				&& this.thinnestLiveFrames() < this.startupTargetFrames() * 7L / 10L;
+		return relativelyThin || absolutelyThin;
+	}
+
+	/** 当前各已预热音源里最薄的深度（帧）；无音源返回 {@link Integer#MAX_VALUE}。 */
+	private int thinnestLiveFrames() {
+		int thinnest = Integer.MAX_VALUE;
+		synchronized (this.lock) {
+			for (SourceBuffer buffer : this.sources.values()) {
+				if (!buffer.primed) {
+					continue;
+				}
+				thinnest = Math.min(thinnest, buffer.length / OUT_CHANNELS);
+			}
+		}
+		return thinnest;
+	}
+
+	/**
+	 * 判定「相对稳态变薄」的阈值（千分比）。
+	 *
+	 * <p>取 <b>550‰</b>（即掉到稳态的 55% 以下）：正常网络抖动很少超过 30%，
+	 * 而真正的吃紧（丢包、上游卡顿、切台后接不上）通常直接掉到一半以下。
+	 * 太高会误报（底噪一直在响），太低则失去"提前预警"的意义。
+	 */
+	private static final int BUFFER_THIN_PERMILLE = 550;
+
+	/**
+	 * 允许建立「稳态基线」的最小帧数（约 100ms）。
+	 *
+	 * <p>低于这个深度时基线没有统计意义（刚起播、缓冲才几十毫秒），
+	 * 必须排除，否则"起播瞬间"会被当成"缓冲变薄"报警。
+	 */
+	private static final int BUFFER_STEADY_MIN_FRAMES = OUT_RATE / 10;
+
+	/**
+	 * 抖动缓冲是否「被吃薄」（相对配置目标的剩余比例过低）。
+	 *
+	 * <p><b>注意</b>：这个判据只用于"已经很危险"的兜底（目标的两成以下）。
+	 * "缓冲在变薄"这种<b>趋势</b>判断请用 {@link #isBufferThinning()}
+	 * ——后者不会因为直播流稳态偏低而永久误报。
 	 */
 	private boolean isJitterBufferThinned() {
 		int target = this.jitterTargetFrames();

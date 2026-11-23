@@ -269,7 +269,10 @@ public final class AutoSubscriber implements ClientModInitializer {
 			// 现在进服会主动请求列表（见 AudioLifecycleHooks），
 			// 并且这里再加一道保险：<b>未加载时不作任何未知判定</b>。
 			boolean stationListKnown = ClientRadioData.isLoaded();
-			boolean unknownStation = stationListKnown
+			// 同样要求方块实体还在（理由见下面 stale 处的说明）
+			boolean blockPresent = client.level != null
+					&& client.level.getBlockEntity(entry.getKey()) instanceof RadioBlockEntity;
+			boolean unknownStation = stationListKnown && blockPresent
 					&& ClientRadioData.findStation(entry.getValue()) == null;
 			if (unknownStation) {
 				// 未知频道：直接点亮 + 持续噪音（不再等 8 秒超时窗口，它注定不会好）
@@ -280,7 +283,17 @@ public final class AutoSubscriber implements ClientModInitializer {
 				}
 				continue;
 			}
-			if (stale && isStreamingStation(entry.getValue())) {
+			// <b>方块已经不在了就不要报警</b>：拆方块的那几个 tick 里，
+			// 服务端会先停推送（stale 变 true），而客户端的区块里方块实体可能还没移除，
+			// 于是这里会误判成"链路故障"并点亮故障音——玩家体验就是
+			// 「拆掉收音机反而响了一下底噪」。
+			//
+			// 判据用"方块实体是否还在"，而不是等退订扫描：两者之间有一两 tick 的窗口，
+			// 足够让一次假故障冒出来。
+			boolean blockStillPresent = client.level != null
+					&& client.level.getBlockEntity(entry.getKey())
+							instanceof RadioBlockEntity;
+			if (stale && blockStillPresent && isStreamingStation(entry.getValue())) {
 				ClientRadioNetwork.markLocalFault(entry.getKey(),
 						radiosmile.net.AudioStatus.TIMEOUT);
 				// 本地判定为故障：告诉混音器"这是明确故障，不必等本流出过声就可以响"。

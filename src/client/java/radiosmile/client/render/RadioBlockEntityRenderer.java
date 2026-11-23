@@ -220,11 +220,6 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	public void render(RadioBlockEntity be, float partialTick, PoseStack pose,
 			MultiBufferSource buffers, int packedLight, int packedOverlay) {
 		int fault = be.getClientFaultStatus();
-		if (fault == AudioStatus.OK) {
-			// 正常播放：完全不额外绘制，方块保持原有光照外观
-			return;
-		}
-
 		BlockState state = be.getBlockState();
 		Direction facing = state.hasProperty(RadioBlock.FACING)
 				? state.getValue(RadioBlock.FACING)
@@ -243,6 +238,23 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 		// 正面朝 <b>-Z</b>：overlay 要稍微向观察者一侧（-Z）浮出，
 		// 才能压住方块表面而不被它遮挡。
 		float z = FRONT_Z - Z_EPSILON;
+
+		// <b>正常播放时：液晶屏显示该频道的 rate（频率/档位）</b>（用户要求）。
+		//
+		// 早期 {@code fault == OK} 时整个渲染器直接 return，屏幕保持贴图自带的空白绿色——
+		// 于是一台正在正常播放的收音机，液晶屏上是空的。现在把频道配置里的 {@code rate}
+		// 写上去（如 {@code FM90.7}），让玩家一眼看到"在放哪个台"。
+		//
+		// 注意：<b>仍然不绘制液晶屏底色</b>，黑字写在贴图原本的绿屏上。
+		// 正常时不画红灯（根本没有故障，不该亮告警灯）。
+		if (fault == AudioStatus.OK) {
+			String rate = currentRate(be);
+			if (rate != null && !rate.isBlank()) {
+				drawLcdText(pose, buffers, rate, z, packedLight, LCD_TEXT_COLOR);
+			}
+			pose.popPose();
+			return;
+		}
 
 		// 1) 红灯（POWER 指示灯）：<b>最大亮度</b> + <b>快闪</b>。
 		//
@@ -265,6 +277,38 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 		drawFaultText(pose, buffers, z, packedLight);
 
 		pose.popPose();
+	}
+
+	/**
+	 * 取该方块当前频道的 {@code rate}（屏幕要显示的内容）。
+	 *
+	 * <h2>数据来源与线程</h2>
+	 * 方块实体只存 <b>频道 id</b>；显示文案来自服务端下发的频道列表
+	 * （{@code RadioStation#displayRate()}，未配置时是 {@code NETWORK}）。
+	 *
+	 * <p>渲染在<b>渲染线程</b>执行，而 {@code ClientRadioData.stations()}
+	 * 是一个 volatile 不可变列表引用（写入时整体替换，见 {@code acceptStations}），
+	 * 因此这里读取是安全的、不需要额外同步。
+	 *
+	 * @return 要显示的文案；方块无频道或列表里还没有该频道时返回 {@code null}
+	 */
+	private static String currentRate(RadioBlockEntity be) {
+		if (be == null) {
+			return null;
+		}
+		String stationId = be.getStation();
+		if (stationId == null || stationId.isBlank()) {
+			// 没有选台：屏幕上什么都不写（保持贴图自带的空白绿屏）
+			return null;
+		}
+		radiosmile.radio.RadioStation station =
+				radiosmile.client.radio.ClientRadioData.findStation(stationId);
+		if (station == null) {
+			// 频道不在本地列表里（列表还没到 / 已失效）：不显示，
+			// 这种情况的故障提示由 fault != OK 的分支负责（显示 NOSIGNAL）。
+			return null;
+		}
+		return station.displayRate();
 	}
 
 	/**
@@ -441,18 +485,32 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	 */
 	private void drawFaultText(PoseStack pose, MultiBufferSource buffers,
 			float z, int packedLight) {
-		if (this.font == null) {
-			return;
-		}
 		// <b>固定文案 NOSIGNAL</b>，不再按状态码拼 {@code ERRnnn}。
 		//
 		// 早期屏幕上是 ERR403/404/408 这类设备式故障码，出发点（真实设备观感）没错，
 		// 但用户实测后明确要求：玩家只需要知道「没信号」，不需要懂错误码。
 		// 具体原因仍可在日志里查到，屏幕上保持最简。
-		String text = FAULT_TEXT;
+		drawLcdText(pose, buffers, FAULT_TEXT, z, packedLight, LCD_TEXT_COLOR);
+	}
+
+	/**
+	 * 在液晶屏绿区里写一行字（水平垂直居中，按实际宽度自适应缩放）。
+	 *
+	 * <p>抽成通用方法，让「故障时的 NOSIGNAL」与「正常时的 rate」共用同一套
+	 * 定位/缩放/变换逻辑——历史教训：这两类文字曾经各写一份，结果一份修好了、
+	 * 另一份还留着同样的镜像/倒置 bug。
+	 *
+	 * @param text  要写的文字（空/null 直接返回）
+	 * @param color 文字颜色（{@code 0xAARRGGBB}）
+	 */
+	private void drawLcdText(PoseStack pose, MultiBufferSource buffers, String text,
+			float z, int packedLight, int color) {
+		if (this.font == null || text == null || text.isBlank()) {
+			return;
+		}
 		// 基准字号。
 		//
-		// 关键约束：{@code NOSIGNAL} 是 <b>8 个字符</b>，比原来的 {@code ERR408}（6 个）更宽。
+		// 关键约束：屏上文案最长的是 {@code NOSIGNAL}（8 字符）。
 		// 按原版默认字体的字形宽度逐字累加（含 1px 字距）实测为 <b>50px</b>：
 		// N/O/S/G/A 各 6、L 5、I 2，共 43px + 7×1px 字距。
 		// 液晶屏绿区换算到方块约 0.3516 格，留 0.02 边距后可用 0.3316 格，
@@ -460,14 +518,27 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 		//
 		// 不能用 0.009（那是原来 ERR408 的值）：50 × 0.009 = 0.45 格，
 		// 会超出屏幕 28%，被下方回缩逻辑硬压下去，字反而变小且不稳定。
-		float scale = 0.0065F;
+		//
+		// 较短的文案（如 {@code FM90.7}）若也用同一字号会显得偏小，
+		// 所以下面按宽度做了"放大到刚好铺满"的处理（见 fitScale），
+		// 但设了上限，避免两三个字符被放大得比屏幕还高。
 		float maxWidthBlocks = Math.abs(pxToX(LCD_PX_X0) - pxToX(LCD_PX_X1)) - 0.02F;
-		float maxWidthPx = maxWidthBlocks / scale;
-
 		int textWidth = this.font.width(text);
-		if (textWidth > maxWidthPx && textWidth > 0) {
-			scale *= maxWidthPx / textWidth;
+
+		// <b>按宽度自适应</b>：先按"刚好铺满绿区"求出理想字号，
+		// 再用上下限夹住。这样短文案（FM90.7）不会缩成蚂蚁，
+		// 长文案（NOSIGNAL）也不会溢出。
+		float scale = 0.0065F;
+		if (textWidth > 0) {
+			scale = maxWidthBlocks / textWidth;
 		}
+		// 下限：保持 0.0065（再小就糊成一团，8 字符的 NOSIGNAL 会落在这一档）
+		scale = Math.max(0.0065F, scale);
+		// 上限：不能超过 0.013，否则 2~3 个字符会撑满整个屏幕高度、像广告牌。
+		// 同时受"屏幕高度"约束——lineHeight(9) 乘 scale 不能超过绿区高度。
+		float maxByHeight = (Math.abs(pxToY(LCD_PX_Y0) - pxToY(LCD_PX_Y1)) * 0.8F)
+				/ Math.max(1, this.font.lineHeight);
+		scale = Math.min(scale, Math.max(0.0065F, Math.min(0.013F, maxByHeight)));
 
 		// 在液晶屏（含边框矩形）内水平、垂直居中。
 		// 宽度按文字自身实际宽度算，避免依赖固定字符数。
@@ -492,7 +563,7 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 		// 它参与深度测试（会被前方的方块正常遮挡），但用深度偏移压制与
 		// 承载面同深度的 z-fighting。早期用 SEE_THROUGH（不测深度）会
 		// 让文字穿过整块方块显示，正是「背面文字也能看见」的原因之一。
-		this.font.drawInBatch(text, -halfWidth, topY, LCD_TEXT_COLOR,
+		this.font.drawInBatch(text, -halfWidth, topY, color,
 				false, pose.last().pose(), buffers,
 				Font.DisplayMode.POLYGON_OFFSET, 0, packedLight);
 
@@ -500,12 +571,19 @@ public class RadioBlockEntityRenderer implements BlockEntityRenderer<RadioBlockE
 	}
 
 	/**
-	 * 正常播放时直接跳过渲染，省掉每帧调用开销；
-	 * 故障时按常规距离剔除即可。
+	 * 是否需要每帧渲染。
+	 *
+	 * <h2>现在<b>始终返回 true</b></h2>
+	 * 早期这里 {@code return fault != OK}，理由是"正常播放时这个渲染器不出图，省掉开销"。
+	 * 但本轮起<b>正常播放也要画</b>——液晶屏上要显示该频道的 {@code rate}（频率/档位）。
+	 * 若仍在这里剔除，正常播放时就永远看不到频率。
+	 *
+	 * <p>开销很小：一次 {@code getClientFaultStatus()}（volatile 读）+ 一张小字条，
+	 * 且方块本身有视锥/LOD 剔除兜底。
 	 */
 	@Override
 	public boolean shouldRender(RadioBlockEntity be, Vec3 cameraPos) {
-		return be.getClientFaultStatus() != AudioStatus.OK;
+		return true;
 	}
 
 	/** 本渲染器的实际绘制范围就是方块本身，不需要按「离屏也绘制」处理。 */
