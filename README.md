@@ -25,7 +25,6 @@ an error when the signal dies.
 | Fault display | Red light blinking + LCD showing `NOSIGNAL` |
 | Normal display | LCD shows the station frequency (e.g. `FM90.7`) |
 | Sound effects | Tuning noise on station change, static on a bad network link |
-| Loudness balancing | Every track is normalised to **-16 LUFS** (EBU R128, two-pass linear gain) while it is transcoded, so a quiet rip and a loud master sit at the same level |
 
 ---
 
@@ -58,7 +57,6 @@ an error when the signal dies.
 ```json
 {
   "ffmpeg": "",
-  "normalize": true,
   "stations": [
     {
       "id": "tiehen",
@@ -93,7 +91,6 @@ an error when the signal dies.
 | Field | Description |
 |---|---|
 | `ffmpeg` | Path to the ffmpeg executable. **Leave empty to use ffmpeg from `PATH`**; only set it when ffmpeg is not on `PATH` or you need a specific build (e.g. `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` or `/usr/local/bin/ffmpeg`) |
-| `normalize` | Loudness balancing, **default `true`**. Every source (MP3 included) is re-encoded once to -16 LUFS with a constant gain. Set it to `false` to keep original files untouched and accept the per-track volume differences |
 
 #### Station fields
 
@@ -256,8 +253,6 @@ Both `<station>` and `<track>` are tab-completable: station ids come from `stati
 - Track changes in a playlist are not gapless: the decoder is rebuilt, leaving a very short gap
 - HLS / HE-AAC streams are not supported
 - Live streams **cannot** go into a txt playlist (no duration, so they cannot join the sync timeline)
-- Loudness balancing re-encodes every source into `cache/baked/`, MP3 included. The first start after enabling it rebuilds the cache (each file is decoded twice) and the folder grows to roughly one 128 kbps copy of the library; `"normalize": false` avoids both
-- Balancing needs ffmpeg. Without it, MP3 stations still play (untouched), non-MP3 stations are refused as before
 
 ---
 

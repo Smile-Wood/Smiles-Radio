@@ -243,14 +243,15 @@ public final class AudioStreamManager {
 	 * @param trackIndex   播放列表序号（单文件为 0）
 	 */
 	private static AudioSource openTrack(Path original, long offsetMillis, int trackIndex) throws IOException {
-		// mp3For() 用「文件头 + 大小」做哈希（quickHash），对 20MB 文件也只是几毫秒，
-		// 因此这里对 MP3 源同样查一次——均衡后的产物就靠它命中。
+		// 已经是 MP3（转码产物，或频道本身就配了 .mp3）就不必再查：
+		// mp3For() 内部要算一次整文件 SHA-256，对 20MB 文件是主线程上几十毫秒的浪费。
 		Path playable = original;
-		// 优先用转码产物（<b>MP3 源也一样</b>）：响度均衡在转码时完成，
-		// 直接推原始文件就绕过了均衡。产物缺失时再退回原文件。
-		Path bakedMp3 = radiosmile.radio.AudioTranscoder.mp3For(original);
-		if (bakedMp3 != null) {
-			playable = bakedMp3;
+		if (!isMp3(original)) {
+			// 优先用转码产物：启动时已按哈希预热，正常情况这里一定能命中。
+			Path bakedMp3 = radiosmile.radio.AudioTranscoder.mp3For(original);
+			if (bakedMp3 != null) {
+				playable = bakedMp3;
+			}
 		}
 		if (isMp3(playable)) {
 			return new radiosmile.radio.FileAudioSource(playable, offsetMillis, true, trackIndex);

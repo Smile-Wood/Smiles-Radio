@@ -35,35 +35,6 @@ public final class AudioTranscoder {
 	private static final String BITRATE = "128k";
 
 	/**
-	 * 响度均衡目标（EBU R128）：-16 LUFS、真峰值 -1.5 dBTP、响度范围 11 LU。
-	 *
-	 * <p>-16 LUFS 是流媒体/播客的通用目标：比广播的 -23 响，又留出足够峰值余量，
-	 * 不会因为逐首音量差而出现「这首要拧大、下首又炸」。
-	 */
-	private static final String LOUDNORM_TARGET = "I=-16:TP=-1.5:LRA=11";
-
-	/**
-	 * 转码配置版本号。
-	 *
-	 * <p><b>改动 ffmpeg 参数（滤波器、码率、均衡目标）时必须改它</b>——
-	 * 它参与缓存键，否则老产物会被继续复用，改动等于没生效。
-	 */
-	private static final String PROFILE = "n1";
-
-	/** 是否启用响度均衡（{@code stations.json} 顶层 {@code normalize}，默认开启）。 */
-	private static volatile boolean normalizeEnabled = true;
-
-	/** 设置是否启用响度均衡。关闭后 MP3 源不再转码，纯 MP3 曲库保持原文件。 */
-	public static void setNormalizeEnabled(boolean enabled) {
-		normalizeEnabled = enabled;
-	}
-
-	/** 当前是否启用响度均衡。 */
-	public static boolean normalizeEnabled() {
-		return normalizeEnabled;
-	}
-
-	/**
 	 * 可转码的源文件扩展名——<b>这是全模组唯一的「什么算音频」白名单</b>。
 	 *
 	 * <h2>为什么定义在这里</h2>
@@ -158,9 +129,7 @@ public final class AudioTranscoder {
 		if (hash.isEmpty()) {
 			return null;
 		}
-		// 配置版本进文件名：参数一改，旧产物自然不再被命中（无需额外失效逻辑）。
-		String profile = normalizeEnabled ? "-" + PROFILE : "";
-		return base + "-" + hash.substring(0, 12) + profile + ".mp3";
+		return base + "-" + hash.substring(0, 12) + ".mp3";
 	}
 
 	/**
@@ -202,9 +171,8 @@ public final class AudioTranscoder {
 		if (source == null || !Files.isRegularFile(source)) {
 			return false;
 		}
-		// 响度均衡开启时 MP3 也要过一遍：原始 MP3 直接推流就没有均衡。
-		// 关闭均衡时才回到「MP3 无需转码」的老行为。
-		if (!normalizeEnabled && isMp3(source)) {
+		// 本身就是 MP3：直接按帧定位即可，无需转码
+		if (isMp3(source)) {
 			return false;
 		}
 		Path dir = bakedDir();
@@ -252,8 +220,7 @@ public final class AudioTranscoder {
 		}
 
 		List<Path> pending = new ArrayList<>(sources);
-		SmileSRadio.LOGGER.info("转码预热：{} 个文件（响度均衡={}），后台开始",
-				pending.size(), normalizeEnabled ? "开" : "关");
+		SmileSRadio.LOGGER.info("转码预热：{} 个文件，后台开始", pending.size());
 
 		Thread worker = new Thread(() -> {
 			long totalStart = System.currentTimeMillis();
@@ -286,21 +253,10 @@ public final class AudioTranscoder {
 	}
 
 	/**
-	 * 调用外部 ffmpeg 转码，并做<b>响度均衡</b>。
+	 * 调用外部 ffmpeg 转码。
 	 *
-	 * <h2>为什么在转码时做</h2>
-	 * 不同来源的音乐响度差得很远（老 CD 抓轨 -18 LUFS、流媒体母带 -9 LUFS），
-	 * 直接混在一个播放列表里就会出现「这首听不清、下首炸耳朵」。
-	 * 服务器反正要把每个文件过一遍 ffmpeg，顺手做一次 EBU R128 均衡是<b>零额外工作</b>：
-	 * 所有人拿到的都是同一响度的音频，客户端不需要任何增益处理。
-	 *
-	 * <h2>为什么是两遍</h2>
-	 * {@code loudnorm} 单遍是<b>动态</b>压缩：边分析边调增益，音乐会有明显的抽吸感。
-	 * 两遍法先用 {@code -f null} 只分析、拿到整首的积分响度，再以 {@code linear=true}
-	 * 施加<b>一个恒定的增益</b>——只改音量、不动动态，这是音乐该用的做法。
-	 *
-	 * <p>代价是每个文件解码两次（第一遍不编码，很快）。任何一遍失败都会逐级退回：
-	 * 两遍 → 单遍动态均衡 → 原样转码，绝不因为均衡失败而让文件放不出来。
+	 * <p>用外部进程而非内嵌编码器：MP3 编码器体积大、许可证也需单独考虑；
+	 * ffmpeg 是服主侧常见工具，缺失时自动降级，不影响基本可用性。
 	 */
 	private static boolean runFfmpeg(Path source, Path target) {
 		String key = target.toString();
@@ -308,156 +264,31 @@ public final class AudioTranscoder {
 			return false;
 		}
 		try {
-			if (normalizeEnabled) {
-				String measured = measureLoudness(source);
-				if (measured != null && encode(source, target, loudnormFilter(measured))) {
-					return true;
-				}
-				SmileSRadio.LOGGER.debug("[转码] 两遍响度均衡失败，退回单遍：{}", source.getFileName());
-				if (encode(source, target, loudnormFilter(null))) {
-					return true;
-				}
-				SmileSRadio.LOGGER.warn(
-						"[转码] 响度均衡不可用（ffmpeg 版本过旧？），改为普通转码：{}",
-						source.getFileName());
-			}
-			return encode(source, target, null);
-		} finally {
-			IN_PROGRESS.remove(key);
-		}
-	}
-
-	/** 组装 loudnorm 滤波器；带测量值时用线性增益（两遍法），否则用单遍动态模式。 */
-	private static String loudnormFilter(String measured) {
-		if (measured == null || measured.isEmpty()) {
-			return "loudnorm=" + LOUDNORM_TARGET;
-		}
-		return "loudnorm=" + LOUDNORM_TARGET + ":" + measured + ":linear=true";
-	}
-
-	/**
-	 * 第一遍：只分析整首的响度，不产生输出。
-	 *
-	 * <p>{@code print_format=json} 让 ffmpeg 把测量结果以 JSON 打到 stderr，
-	 * 这里用正则取出五个字段。取不到（老版本、静音文件返回 {@code -inf}）
-	 * 就返回 {@code null}，由调用方退回单遍模式。
-	 *
-	 * @return 形如 {@code measured_I=-23.4:...} 的参数串；不可用时为 {@code null}
-	 */
-	private static String measureLoudness(Path source) {
-		List<String> args = new ArrayList<>();
-		args.add("-nostats");
-		args.add("-loglevel");
-		args.add("info");
-		args.add("-i");
-		args.add(source.toString());
-		args.add("-vn");
-		args.add("-af");
-		args.add("loudnorm=" + LOUDNORM_TARGET + ":print_format=json");
-		args.add("-f");
-		args.add("null");
-		args.add("-");
-		RunResult result = runProcess(args, null);
-		if (!result.ok()) {
-			return null;
-		}
-		String i = jsonNumber(result.output(), "input_i");
-		String tp = jsonNumber(result.output(), "input_tp");
-		String lra = jsonNumber(result.output(), "input_lra");
-		String thresh = jsonNumber(result.output(), "input_thresh");
-		String offset = jsonNumber(result.output(), "target_offset");
-		if (i == null || tp == null || lra == null || thresh == null || offset == null) {
-			return null;
-		}
-		return "measured_I=" + i + ":measured_TP=" + tp + ":measured_LRA=" + lra
-				+ ":measured_thresh=" + thresh + ":offset=" + offset;
-	}
-
-	/** 从 ffmpeg 的 JSON 输出里取一个<b>数值</b>字段；缺失或非数值返回 {@code null}。 */
-	private static String jsonNumber(String json, String field) {
-		if (json == null || json.isEmpty()) {
-			return null;
-		}
-		java.util.regex.Matcher matcher = java.util.regex.Pattern
-				.compile("\"" + java.util.regex.Pattern.quote(field) + "\"\\s*:\\s*\"([^\"]*)\"")
-				.matcher(json);
-		if (!matcher.find()) {
-			return null;
-		}
-		String value = matcher.group(1).trim();
-		try {
-			Double.parseDouble(value);
-			return value;
-		} catch (NumberFormatException e) {
-			// "-inf"、"nan" 之类：静音或异常文件，不要拿去当参数
-			return null;
-		}
-	}
-
-	/**
-	 * 第二/三遍：把源文件编码成 MP3。
-	 *
-	 * @param filter 音频滤波器链；{@code null} 表示不做均衡（兜底路径）
-	 */
-	private static boolean encode(Path source, Path target, String filter) {
-		List<String> args = new ArrayList<>();
-		args.add("-nostats");
-		args.add("-loglevel");
-		args.add("error");
-		args.add("-i");
-		args.add(source.toString());
-		args.add("-vn");
-		if (filter != null) {
-			args.add("-af");
-			args.add(filter);
-		}
-		args.add("-c:a");
-		args.add("libmp3lame");
-		args.add("-b:a");
-		args.add(BITRATE);
-		args.add(target.toString());
-		return runProcess(args, target).ok();
-	}
-
-	/** 一次 ffmpeg 调用的结果。输出文本是响度测量要读的（ffmpeg 把 JSON 打到 stderr）。 */
-	private record RunResult(boolean ok, String output) {
-	}
-
-	/**
-	 * 执行一次 ffmpeg。
-	 *
-	 * @param args   不含可执行文件与 {@code -y}/{@code -hide_banner} 的参数
-	 * @param target 期望产物；为 {@code null} 表示不校验产物（测量模式）
-	 */
-	private static RunResult runProcess(List<String> args, Path target) {
-		List<String> command = new ArrayList<>();
-		command.add(ffmpegCommand());
-		command.add("-y");
-		command.add("-hide_banner");
-		command.addAll(args);
-		try {
-			ProcessBuilder pb = new ProcessBuilder(command);
+			ProcessBuilder pb = new ProcessBuilder(
+					ffmpegCommand(), "-y", "-hide_banner", "-loglevel", "error",
+					"-i", source.toString(),
+					"-vn",
+					"-c:a", "libmp3lame", "-b:a", BITRATE,
+					target.toString());
 			pb.redirectErrorStream(true);
 			Process process = pb.start();
-			// 必须消费输出：管道写满会让 ffmpeg 阻塞，表现为"转码卡住"
-			String output = new String(process.getInputStream().readAllBytes(),
-					java.nio.charset.StandardCharsets.UTF_8);
-			if (!process.waitFor(600, TimeUnit.SECONDS)) {
+			// 消费输出，避免管道写满导致进程阻塞
+			process.getInputStream().readAllBytes();
+			boolean finished = process.waitFor(300, TimeUnit.SECONDS);
+			if (!finished) {
 				process.destroyForcibly();
-				SmileSRadio.LOGGER.warn("[转码] ffmpeg 超时，已终止：{}", target);
-				return new RunResult(false, output);
+				return false;
 			}
-			boolean ok = process.exitValue() == 0;
-			if (ok && target != null) {
-				ok = Files.isRegularFile(target) && Files.size(target) > 1024;
-			}
-			return new RunResult(ok, output);
+			return process.exitValue() == 0 && Files.isRegularFile(target)
+					&& Files.size(target) > 1024;
 		} catch (IOException e) {
 			SmileSRadio.LOGGER.info("ffmpeg 不可用：{}", e.getMessage());
-			return new RunResult(false, "");
+			return false;
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
-			return new RunResult(false, "");
+			return false;
+		} finally {
+			IN_PROGRESS.remove(key);
 		}
 	}
 
