@@ -311,11 +311,11 @@ public final class ClientAudioPlayer {
 		boolean streamRestarted = stream != null && stream.sessionId >= 0
 				&& stream.sessionId != sessionId;
 		if (stationChanged || trackChanged || streamRestarted) {
+			// 只记「断线重连」——那是真的异常，值得留痕。
+			// 换台/换曲不记：播放列表每几分钟一首，日志里刷这种正常事件没有价值。
 			if (streamRestarted) {
 				SmileSRadio.LOGGER.info("网络流断线重连（会话 {} -> {}），重建解码器 @{}",
 						stream.sessionId, sessionId, pos);
-			} else {
-				SmileSRadio.LOGGER.info("切台 {} -> {} @{}", stream.stationId, stationId, pos);
 			}
 			stream.close();
 			STREAMS.remove(key);
@@ -359,7 +359,6 @@ public final class ClientAudioPlayer {
 			// 注册方块世界坐标，混音器据此做距离衰减
 			PcmSink.INSTANCE.setSourcePosition(key, pos);
 			PcmSink.INSTANCE.start();
-			SmileSRadio.LOGGER.info("开始播放 {} @{}", stationId, pos);
 		}
 		// <b>心跳空包：只刷新"服务端还活着"，绝不能喂给解码器。</b>
 		//

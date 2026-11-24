@@ -572,16 +572,6 @@ public final class AudioStreamManager {
 			return;
 		}
 		byte[] data = chunk.data();
-		// 前几块打日志：确认发出的是有效 MP3 数据（帧头校验）
-		if (sub.totalBytesSent() < 16384) {
-			// 只认 MP3 的两种合法开头：ID3 标签、或帧同步字 0xFF 0xEx。
-			// 早期这里还把 'OggS' 算作合法帧头，于是推错格式时日志会显示"帧头=true"，
-			// 恰好把问题掩盖掉了——校验条件本身就不该给不该存在的格式留位置。
-			boolean mp3Sync = (data[0] & 0xFF) == 0xFF
-					|| (data.length > 3 && data[0] == 'I' && data[1] == 'D' && data[2] == '3');
-			SmileSRadio.LOGGER.info("[发送] {} {} 字节 首字节=0x{} 帧头={}",
-					sub.station().id(), data.length, Integer.toHexString(data[0] & 0xFF), mp3Sync);
-		}
 
 		// 发包必须回到服务端主线程：Minecraft 的网络层不是线程安全的，
 		// 从自建线程直接 send 会被丢弃或引发并发问题（现象：订阅成功但没有声音）。
