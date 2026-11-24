@@ -1,1187 +1,1209 @@
-# Smile's Radio Mod — 项目交接总结
+# Smile's Radio Mod - Handover Notes
 
-> 最近更新：2026-11-23 21:00（**第十五轮**完成；含第十三轮配速根因修复）
-> 项目路径：`C:\Projects\Smile's Radio mod`
-> 构建产物：`build/libs/radio-smile-1.0.0.jar`（约 **327 KB**，BUILD SUCCESSFUL）
-> 版本控制：已初始化 git，**每轮修复一个提交**
-> 使用说明：面向服主/玩家的完整文档见 [README.md](README.md)（本文件是开发交接）
+**English** | [简体中文](HANDOVER.zh-CN.md)
 
-## 阅读指引（新会话从这里开始）
+> Last updated: 2026-11-23 21:00 (**Round 15** complete; includes the Round 13 pacing root-cause fix)
+> Project path: `C:\Projects\Smile's Radio mod`
+> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **327 KB**, BUILD SUCCESSFUL)
+> Version control: git initialised, **one commit per round of fixes**
+> User guide: the full documentation for server owners/players is in [README.md](README.md) (this file is the developer handover)
 
-| 你想做什么 | 先读 |
+## Reading Guide (start here in a new session)
+
+| What you want to do | Read first |
 |---|---|
-| 了解项目是什么、怎么配 | [README.md](README.md) |
-| 快速上手改代码 | 本文「十、快速恢复工作的方法」 |
-| **动手前必读** | 「七、关键技术坑」+「十二、给下一个会话的提醒」 |
-| 查某个 bug 的历史根因 | 「八、当前状态」按轮次排列（**A~Y 共 15 轮**，越靠后越新） |
-| 查配置在哪、目录结构 | 本文「三、配置文件」或 README |
+| Learn what the project is and how to configure it | [README.md](README.md) |
+| Get up to speed on changing code quickly | Section 10 in this document (resuming work quickly) |
+| **Must read before touching code** | "7. Critical Pitfalls" + section 12 (reminders for the next session) |
+| Look up the historical root cause of a bug | Section 8 (Current State), ordered by round (**15 rounds, A to Y**; later is newer) |
+| Find where config lives, directory structure | Section 3 in this document, or the README |
 
-> ⚠️ **最容易踩的坑**：这套代码里**多数严重 bug 都是"一个函数/字段承担两种语义"**
-> （见十二节表格，已出现 **7 次**，其中第七次导致整条播放列表时序错乱）。
-> 改任何函数前先问：**它被几个语义不同的地方调用？**
+> ⚠️ **The easiest pitfall to fall into**: in this codebase **most serious bugs come from "one function/field carrying two meanings"**
+> (see the table in section 12; it has already happened **7 times**, and the seventh broke the timeline of a whole playlist).
+> Before changing any function, ask: **how many callers with different semantics does it have?**
 
 ---
 
-## 一、项目概况
+## 1. Project Overview
 
-Fabric 1.20.1 模组，添加可播放广播的「收音机」方块。支持服务端配置的电台列表、
-玩家自定义网络电台、多人同步播放、空间化音效。
+A Fabric 1.20.1 mod that adds a "radio" block which plays broadcasts. It supports a server-configured
+station list, player-defined internet stations, synchronised playback for multiple players, and spatialized audio.
 
-| 项 | 值 |
+| Item | Value |
 |---|---|
 | mod id | `radio-smile` |
-| 方块/物品 id | `radio-smile:radio` |
+| block/item id | `radio-smile:radio` |
 | Minecraft | 1.20.1 |
 | Fabric Loader | 0.20.1 |
 | Fabric API | 0.92.12+1.20.1 |
-| Gradle | 9.8.2（曾被误升级到 9.9.1，已还原） |
-| 前置库 | smile_libbox 1.0.26+1.20.1（mavenLocal） |
-| 可选依赖 | ModMenu 7.2.2 |
-| 内置依赖 | JLayer 1.0.1（MP3 解码，已 include 进 jar） |
-| 外部依赖 | **ffmpeg**（可选，用于 OGG→MP3 转码预热） |
+| Gradle | 9.8.2 (was once upgraded to 9.9.1 by mistake; reverted) |
+| Prerequisite library | smile_libbox 1.0.26+1.20.1 (mavenLocal) |
+| Optional dependency | ModMenu 7.2.2 |
+| Bundled dependency | JLayer 1.0.1 (MP3 decoding, included in the jar) |
+| External dependency | **ffmpeg** (optional, used to transcode OGG to MP3 during prewarm) |
 
 ---
 
-## 二、方块特性
+## 2. Block Behaviour
 
-`RadioBlock` 继承 `BaseEntityBlock`，构造特性仿原版火把：
+`RadioBlock` extends `BaseEntityBlock`, and its construction follows the vanilla torch:
 
-- `.noCollission()` — 无碰撞箱，不产生方块阴影
-- `.noOcclusion()` — 不遮挡光照（放在草方块上不会使其变泥土）
-- `.pushReaction(PushReaction.DESTROY)` — 活塞推动直接破坏
-- `canSurvive` / `updateShape` — 需下方完整实心面支撑，失去支撑掉落
-- 沙子落在上方会变成掉落物（因无完整碰撞面，与火把一致）
+- `.noCollission()` - no collision box, casts no block shadow
+- `.noOcclusion()` - does not block light (placing it on grass does not turn the grass into dirt)
+- `.pushReaction(PushReaction.DESTROY)` - pistons break it instead of pushing it
+- `canSurvive` / `updateShape` - requires a full solid face below for support; drops when it loses support
+- Sand falling on top of it becomes an item drop (no full collision face, same as a torch)
 - `SoundType.STONE`
-- 水平朝向状态 `facing`（north/east/south/west），放置时朝向玩家
+- Horizontal facing state `facing` (north/east/south/west); faces the player when placed
 
-`RadioBlockEntity` 存 NBT：
-- `station`（当前频道 id）
-- `volume`（0.0~1.0，本方块独立音量）
+`RadioBlockEntity` stores in NBT:
+- `station` (current station id)
+- `volume` (0.0~1.0, volume for this block alone)
 
 ---
 
-## 三、配置文件（服务端）
+## 3. Configuration (server side)
 
-> **路径已迁移**（第十轮）：旧 `<存档>/serverconfig/radio-smile/` → 新 **`<游戏根目录>/config/radio-smile/`**
-> 旧位置会自动迁移（见 T 节）。迁移原因：旧路径按存档隔离，换存档就要重配几十 MB 音频。
+> **Path has moved** (round 10): old `<save>/serverconfig/radio-smile/` -> new **`<game directory>/config/radio-smile/`**
+> The old location is migrated automatically (see section T). Reason for the move: the old path was isolated per save, so switching saves meant reconfiguring tens of MB of audio.
 
 ```
 config/radio-smile/
-├── stations.json        电台列表（+ 顶层 ffmpeg 路径）
-├── audio/               原始音频 / 文件夹播放列表 / .txt 重定向列表
-├── icons/               电台图标
-└── cache/               可安全删除，自动重建
-    ├── manifest.json    音频哈希清单（quickHash：前64KB+大小）
-    ├── baked/           转码后的 MP3（ffmpeg 产物，启动时预热）
-    └── remote/          网络音频缓存 + .proof 校验包
+├── stations.json        station list (+ top-level ffmpeg path)
+├── audio/               source audio / folder playlists / .txt redirect lists
+├── icons/               station icons
+└── cache/               safe to delete, rebuilt automatically
+    ├── manifest.json    audio hash manifest (quickHash: first 64KB + size)
+    ├── baked/           transcoded MP3s (ffmpeg output, prewarmed on startup)
+    └── remote/          internet audio cache + .proof checksum bundles
 ```
 
-### stations.json 格式
+### stations.json format
 
 ```json
 {
   "ffmpeg": "",
   "stations": [
-    { "id": "tiehen", "name": "铁痕电台 #02", "icon": "fm907.png",
+    { "id": "tiehen", "name": "Tiehen Radio #02", "icon": "fm907.png",
       "file": "qtfm_tiehen.ogg", "mode": "block", "rate": "FM105.7" }
   ]
 }
 ```
 
-**顶层字段**（频道列表之外）：
+**Top-level fields** (outside the station list):
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `ffmpeg` | ffmpeg 可执行文件路径。留空 = 用 PATH 里的 `ffmpeg`（X 节） |
+| `ffmpeg` | Path to the ffmpeg executable. Empty = use `ffmpeg` from PATH (section X) |
 
-**频道字段**：
+**Station fields**:
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `id` | 唯一标识。**`example` 为保留值，该 id 的条目不加载** |
-| `name` | 显示名称 |
-| `icon` | 图标文件名（放 icons/） |
-| `file` | 单文件 / 文件夹 / **`.txt` 重定向列表** / `http(s)` 直播流 |
-| `mode` | `block`/`single`/`false`/`0`=单曲循环；`sequence`/`order`/`loop`/`true`/`1`=列表循环；`random`/`shuffle`=打乱（第十二轮放宽） |
-| `rate` | 液晶屏与列表右侧显示的频率/档位（如 `FM90.7`）。不填显示 `NETWORK`（第六轮新增） |
-| `seed` | 可选，打乱模式用。不填则按 id 派生（保证多客户端一致） |
+| `id` | Unique identifier. **`example` is reserved; the entry with that id is not loaded** |
+| `name` | Display name |
+| `icon` | Icon file name (place it in icons/) |
+| `file` | Single file / folder / **`.txt` redirect list** / `http(s)` live stream |
+| `mode` | `block`/`single`/`false`/`0` = repeat one track; `sequence`/`order`/`loop`/`true`/`1` = loop the list; `random`/`shuffle` = shuffle (relaxed in round 12) |
+| `rate` | Frequency/preset shown on the LCD and at the right of the list (e.g. `FM90.7`). If omitted, `NETWORK` is shown (added in round 6) |
+| `seed` | Optional, used by shuffle mode. If omitted it is derived from the id (so every client agrees) |
 
-**首次启动自动生成**示范条目（id=example，不加载），带 `_说明_*` 字段解释各配置项。
-服主改掉 id 即启用。
+**A sample entry is generated automatically on first start** (id=example, not loaded), with `_note_*` fields explaining
+each option. The server owner only has to change the id to enable it.
 
-**配置校验**（第六轮）：音频不可用的频道会**从列表中隐藏**，但玩家方块上记着它时
-仍显示 `NOSIGNAL` + 底噪——详见 P 节。
+**Config validation** (round 6): stations whose audio is unavailable are **hidden from the list**, but if a player's
+block still records one it shows `NOSIGNAL` plus the noise floor - see section P.
 
-### txt 重定向播放列表（第十轮）
+### txt redirect playlists (round 10)
 
-`file` 指向 `.txt`/`.list`/`.m3u`/`.m3u8` 即可混合本地与网络来源：
+Point `file` at a `.txt`/`.list`/`.m3u`/`.m3u8` file to mix local and internet sources:
 
 ```text
-false                 # 第一行：打乱顺序开关（true/false，可省略）
+false                 # first line: shuffle switch (true/false, may be omitted)
 song_a.mp3
 folder/song_b.ogg
 https://example.com/song.mp3
 ```
 
-- **播放顺序 = 文件里从上到下**
-- 网络地址会下载到 `cache/remote/`、转 MP3 后参与播放（见 T/U 节）
-- 直播流（无 `Content-Length`）会被**自动注释掉**并注明原因
+- **Playback order = top to bottom in the file**
+- Internet addresses are downloaded to `cache/remote/`, transcoded to MP3, then played (see sections T/U)
+- Live streams (no `Content-Length`) are **commented out automatically**, with the reason noted
 
 ---
 
-## 四、GUI
+## 4. GUI
 
-`RadioScreen`（客户端）：
+`RadioScreen` (client):
 
-| 区域 | 内容 |
+| Region | Content |
 |---|---|
-| 顶部 | 搜索框 |
-| 中间 | 可滚动电台列表（含图标、选中高亮） |
-| 右侧 | 音量滑块（**5% 一档**，第十三轮） |
-| 底部 | 退出 / 扫描 / 确认 |
+| Top | Search box |
+| Middle | Scrollable station list (with icons, selected entry highlighted) |
+| Right | Volume slider (**5% per step**, round 13) |
+| Bottom | Exit / Scan / Confirm |
 
-交互：
-- 单击选中，**再次点击已选中项 = 取消选择**（空置）
-- 滚轮切换选中，↑↓ 方向键切换，Enter 确认
-- 确认后自动关闭界面，并开始拉流
-- 进入界面时默认高亮该方块自己的频道（无频道则空置）
+Interaction:
+- Single click selects; **clicking the selected entry again deselects it** (leaves it empty)
+- The mouse wheel moves the selection, the up/down arrow keys move it, Enter confirms
+- After confirming, the screen closes automatically and streaming starts
+- When the screen opens, the block's own station is highlighted by default (nothing highlighted if it has none)
 
-### ModMenu 配置界面
+### ModMenu config screen
 
-基于 smile_libbox 的 `ConfigSpec`，数值项用 `page.number()`（boxOnly 纯输入框）：
+Built on smile_libbox's `ConfigSpec`; numeric options use `page.number()` (boxOnly, a plain input box):
 
-| 配置项 | 默认 | 说明 |
+| Option | Default | Description |
 |---|---|---|
-| `enableStreaming` | true | 是否接收音频流 |
-| `maxBandwidthKbps` | 64 | 带宽期望 |
-| `maxChunkBytes` | 8192 | 单块上限 |
-| `bufferMillis` | 1000 | 缓冲时长 |
-| `showNetworkStats` | false | 显示网络状态 |
+| `enableStreaming` | true | Whether to receive the audio stream |
+| `maxBandwidthKbps` | 64 | Desired bandwidth |
+| `maxChunkBytes` | 8192 | Maximum size of a single chunk |
+| `bufferMillis` | 1000 | Buffer duration |
+| `showNetworkStats` | false | Show network status |
 
-保存到 `run/config/radio-smile-client.json`。
+Saved to `run/config/radio-smile-client.json`.
 
 ---
 
-## 五、网络协议
+## 5. Network Protocol
 
-`RadioNetworking` 定义的通道：
+Channels defined by `RadioNetworking`:
 
-**C2S（客户端→服务端）**
-| 通道 | 载荷 |
+**C2S (client to server)**
+| Channel | Payload |
 |---|---|
-| `c2s_request_stations` | 空 |
+| `c2s_request_stations` | empty |
 | `c2s_select_station` | stationId + BlockPos |
 | `c2s_request_icon` | stationId |
 | `c2s_audio_subscribe` | BlockPos + stationId + bwKbps + maxChunk |
 | `c2s_audio_unsubscribe` | BlockPos |
 | `c2s_set_volume` | BlockPos + volume |
 
-**S2C（服务端→客户端）**
-| 通道 | 载荷 |
+**S2C (server to client)**
+| Channel | Payload |
 |---|---|
-| `s2c_stations` | epoch + JSON 列表 |
+| `s2c_stations` | epoch + JSON list |
 | `s2c_select_ack` | stationId + hash + epoch + volume + formatId + skipMillis |
 | `s2c_icon` | stationId + byte[] |
 | `s2c_audio_chunk` | BlockPos + stationId + trackIndex + formatId + byte[] |
 | `s2c_audio_status` | BlockPos + statusCode |
 
-`AudioStatus`：0=OK, 1=UNKNOWN_STATION, 2=NO_AUDIO, 3=TOO_FAR, 4=UNSUPPORTED, 5=STOPPED
+`AudioStatus`: 0=OK, 1=UNKNOWN_STATION, 2=NO_AUDIO, 3=TOO_FAR, 4=UNSUPPORTED, 5=STOPPED
 
 ---
 
-## 六、音频架构
+## 6. Audio Architecture
 
-### 数据流
+### Data flow
 
 ```
-服务端                                   客户端
+Server                                   Client
 ─────────────────────────────────────────────────────
 FileAudioSource  ──┐
-  (本地音频/MP3)    │
-                   ├→ AudioSubscription ──网络──→ ClientAudioPlayer
-StreamAudioSource ─┘   (读线程+配速)              (AudioIngest 线程)
-  (网络流+ICY剥离)                                        │
+  (local audio/MP3) │
+                   ├→ AudioSubscription ──network──→ ClientAudioPlayer
+StreamAudioSource ─┘   (reader thread+pacing)        (AudioIngest thread)
+  (network stream+ICY strip)                             │
                                                           ↓
                                               Mp3StreamDecoder (JLayer)
-                                              OggDecoder (原版 OggAudioStream)
+                                              OggDecoder (vanilla OggAudioStream)
                                                           │
                                                           ↓ PCM
-                                                   PcmSink（混音器）
+                                                   PcmSink (mixer)
                                                           │
                                                           ↓
                                               SourceDataLine 48kHz/2ch/16bit
 ```
 
-### 服务端核心类
+### Server-side core classes
 
-| 类 | 职责 |
+| Class | Responsibility |
 |---|---|
-| `RadioStationRegistry` | 配置加载、`isPlayable` 校验、quickHash 缓存校验、**预热转码**（同一趟遍历）、旧位置自动迁移 |
-| `AudioTranscoder` | 按 quickHash 预热转 MP3（128kbps）；**ffmpeg 路径可配置**（X 节） |
-| `AudioSource` | 音频源接口（read/durationMillis/format/skipMillis/positionMillis/seekTo/totalBytes） |
-| `FileAudioSource` | 本地文件，MP3 可按帧定位 |
-| `StreamAudioSource` | 网络直播流代理，含 ICY 元数据剥离；**不重连**（O 节） |
-| `RemoteAudioCache` | 网络音频下载、`.proof` 校验包、断链时沿用缓存（T/U 节） |
-| `TxtPlaylist` | txt 重定向列表解析、打乱开关、BOM/分隔符容错 |
-| `PlaylistTimeline` | 按轮播放时间轴；**只接受 MP3**（V 节） |
-| `AudioSubscription` | 订阅状态 + 读线程 + **闭环配速**（锚点按真实时长累加，W 节） |
-| `AudioStreamManager` | 订阅管理、推送线程（与游戏 tick 解耦）、发包回主线程 |
+| `RadioStationRegistry` | Config loading, `isPlayable` validation, quickHash cache validation, **prewarm transcoding** (in the same pass), automatic migration from the old location |
+| `AudioTranscoder` | Prewarms to MP3 by quickHash (128kbps); **the ffmpeg path is configurable** (section X) |
+| `AudioSource` | Audio source interface (read/durationMillis/format/skipMillis/positionMillis/seekTo/totalBytes) |
+| `FileAudioSource` | Local file; MP3 can be seeked by frame |
+| `StreamAudioSource` | Proxy for internet live streams, including ICY metadata stripping; **does not reconnect** (section O) |
+| `RemoteAudioCache` | Internet audio download, `.proof` checksum bundles, falls back to the cache when the link drops (sections T/U) |
+| `TxtPlaylist` | Parsing of txt redirect lists, shuffle switch, tolerance for BOM/separators |
+| `PlaylistTimeline` | Round-based playback timeline; **accepts MP3 only** (section V) |
+| `AudioSubscription` | Subscription state + reader thread + **closed-loop pacing** (the anchor accumulates over real duration, section W) |
+| `AudioStreamManager` | Subscription management, push thread (decoupled from the game tick), sending packets back on the main thread |
 
-### 客户端核心类
+### Client-side core classes
 
-| 类 | 职责 |
+| Class | Responsibility |
 |---|---|
-| `ClientAudioPlayer` | 按方块维护播放流，AudioIngest 线程消费 |
-| `Mp3StreamDecoder` | JLayer 流式 MP3 解码（**唯一的解码路径**；OggDecoder 已删除） |
-| `PcmSink` | **单一声卡混音器**，固定 48kHz/2ch，设备常驻；含调台噪、网络底噪、抖动缓冲 |
-| `TuningNoise` / `NetworkNoise` | 两个效果音发生器（换台噪声 / 弱网嘶声） |
-| `RadioBlockEntityRenderer` | 液晶屏显示 rate/NOSIGNAL、红灯闪烁（G/J 节） |
-| `AutoSubscriber` | 每 10 tick 扫描半径 52 格，自动订阅/退订；**不再做网络重连**（O 节） |
-| `BgmSuppressor` | 播放时抑制原版 BGM |
-| `AudioLifecycleHooks` | 断开连接时释放声卡 |
-| `VanillaVolumeTracker` | 主线程跟踪 BLOCKS + MASTER 音量 |
+| `ClientAudioPlayer` | Maintains a playback stream per block, consumed by the AudioIngest thread |
+| `Mp3StreamDecoder` | Streaming MP3 decoding with JLayer (**the only decode path**; OggDecoder has been deleted) |
+| `PcmSink` | **Single sound-card mixer**, fixed 48kHz/2ch, device kept open; includes tuning noise, network noise floor, jitter buffer |
+| `TuningNoise` / `NetworkNoise` | Two effect-sound generators (station-change noise / weak-network hiss) |
+| `RadioBlockEntityRenderer` | LCD showing rate/NOSIGNAL, blinking red light (sections G/J) |
+| `AutoSubscriber` | Scans a 52-block radius every 10 ticks, subscribes/unsubscribes automatically; **no longer performs network reconnects** (section O) |
+| `BgmSuppressor` | Suppresses the vanilla BGM while playing |
+| `AudioLifecycleHooks` | Releases the sound card when the connection drops |
+| `VanillaVolumeTracker` | Tracks BLOCKS + MASTER volume on the main thread |
 
-### 音量与空间化
+### Volume and spatialization
 
-最终增益链：
+Final gain chain:
 ```
-方块独立音量 × 原版BLOCKS × 原版MASTER × 距离衰减 × 左右声像
+per-block volume × vanilla BLOCKS × vanilla MASTER × distance attenuation × left/right pan
 ```
 
-空间化处理：
-1. 立体声下混为**单声道点声源**
-2. **距离衰减**：≤4格满音量，4~48格线性衰减，≥48格静音
-3. **恒功率声像**：按方位角映射回左右声道（总功率恒为 1）
+Spatialization:
+1. Stereo is downmixed to a **mono point source**
+2. **Distance attenuation**: full volume at 4 blocks or less, linear falloff from 4 to 48 blocks, silent at 48 blocks and beyond
+3. **Constant-power panning**: mapped back to the left/right channels by azimuth (total power is always 1)
 
-**可听范围 48 格**（类似唱片机）。
+**Audible range is 48 blocks** (similar to a jukebox).
 
 ---
 
-## 七、关键技术坑（务必遵守）
+## 7. Critical Pitfalls (must be followed)
 
-按重要性排序，这些都是实际踩过的：
+Ordered by importance; every one of these was actually hit:
 
-### 1. OGG 已从模组中彻底移除（不要加回来）
-Vorbis 的 MDCT 重叠相加依赖前序页连续状态，页序号跳变会报
-`Failed to read Ogg file`。**任何"从中间开始解 OGG"的方案都不可行**。
+### 1. OGG was removed from the mod entirely (do not add it back)
+Vorbis MDCT overlap-add depends on continuous state from the preceding pages, and a jump in page sequence raises
+`Failed to read Ogg file`. **Any scheme that "starts decoding OGG from the middle" is unworkable.**
 
-更关键的是第二条：客户端摄入队列是**断头丢弃**策略
-（`ClientAudioPlayer.enqueue` 满了就 `poll()` 掉最旧的），
-而 OGG **丢任意一块就永久失步**；MP3 帧自包含、JLayer 能向后重新搜到同步字。
+The second point matters even more: the client ingest queue uses a **drop-from-the-head** policy
+(`ClientAudioPlayer.enqueue` calls `poll()` to discard the oldest entry when full),
+and with OGG **losing any single chunk means permanent loss of sync**; MP3 frames are self-contained, so JLayer can
+rescan forward for the sync word.
 
-→ 因此模组内**不再存在任何 OGG 解码路径**（2026-11-23 移除）：
-`OggDuration` / `OggHeader` / `OggDecoder` 三个类已删除，
-`AudioFormat` 只剩 `MP3` / `UNKNOWN`，`AudioDuration` 只做 MP3 逐帧扫描。
+-> So there is **no OGG decode path left anywhere in the mod** (removed 2026-11-23):
+the three classes `OggDuration` / `OggHeader` / `OggDecoder` have been deleted,
+`AudioFormat` has only `MP3` / `UNKNOWN`, and `AudioDuration` only does a frame-by-frame MP3 scan.
 
-**但这不代表服主不能用 .ogg**：所有源文件在预热阶段经 ffmpeg 转成 MP3 后再推流。
-「能不能用」的唯一标准是 **ffmpeg 能否转码**，与扩展名无关
-（白名单见 `AudioTranscoder.SOURCE_EXTENSIONS`，14 种格式，单文件与目录两条路径共用）。
+**This does not mean server owners cannot use .ogg**: every source file is transcoded to MP3 by ffmpeg in the prewarm
+stage before it is streamed. The only criterion for "can I use it" is **whether ffmpeg can transcode it**, regardless
+of extension (the whitelist is in `AudioTranscoder.SOURCE_EXTENSIONS`, 14 formats, shared by both the single-file and
+folder paths).
 
-### 2. MP3 帧可从任意位置解码
-这是网络电台一直正常的原因。实测从第 50 帧开始可连续解出 100 帧。
+### 2. MP3 frames can be decoded from any position
+This is why internet radio has always worked. Measured: starting at frame 50, 100 frames decode in a row.
 
-### 3. 格式必须由服务端下发
-客户端早期靠猜首块字节判格式，转码/seek 后首块不在文件头，**必然误判**。
+### 3. The format must be sent by the server
+Early clients guessed the format from the first chunk's bytes; after transcoding/seeking the first chunk is not at the
+file header, so **a wrong guess is guaranteed**.
 
-### 4. JLayer 的缓冲区是复用的
-`SampleBuffer.getBuffer()` 返回内部缓冲，下一帧解码会覆盖它。
-**必须复制**后再交给混音器，否则音频顺序彻底错乱。
+### 4. JLayer's buffer is reused
+`SampleBuffer.getBuffer()` returns the internal buffer, and decoding the next frame overwrites it.
+**You must copy it** before handing it to the mixer, otherwise the audio order is completely scrambled.
 
-### 5. 严禁播放中途 seek
-seek 会**直接丢弃**偏差对应的全部音频（实测一次丢 13 秒）。
-正确做法：订阅时定位一次，之后**纯顺序播放**，绝不中途跳转。
+### 5. Never seek during playback
+Seeking **discards outright** all audio corresponding to the offset (measured: 13 seconds lost in one go).
+The correct approach: position once at subscription time, then **play strictly sequentially**, never jump mid-way.
 
-### 6. 文件读写必须线程安全
-`FileAudioSource.read()` 与 `seekTo()` 必须都 `synchronized`，
-否则读线程与主线程争抢文件指针，导致没声音或噪声。
+### 6. File I/O must be thread-safe
+Both `FileAudioSource.read()` and `seekTo()` must be `synchronized`,
+otherwise the reader thread and the main thread fight over the file pointer, resulting in no sound or noise.
 
-### 7. 缓冲溢出不能腰斩
-`compact(len/2)` 会把音频从中间切断导致错乱。
-必须**按整帧边界丢弃队首**。
+### 7. Buffer overflow must not be cut in half
+`compact(len/2)` cuts the audio off in the middle and scrambles it.
+You must **drop from the head on whole-frame boundaries**.
 
-### 8. MP3 时长必须自己解析
-JDK / 原版都没有可用的 MP3 时长解析，会导致定位逻辑整段失效。
-`AudioDuration` 逐帧扫描解决（误差 <50ms，1343万字节用时 48ms）。
+### 8. MP3 duration must be parsed by us
+Neither the JDK nor vanilla provides usable MP3 duration parsing, which makes the whole positioning logic fail.
+`AudioDuration` solves it with a frame-by-frame scan (error <50ms, 48ms for 13.43 million bytes).
 
-### 9. 声像右向量方向
-`right = (-forwardZ, forwardX)`。写成 `(forwardZ, -forwardX)` 会左右颠倒。
-（MC 中 +X=东、+Z=南，yaw=0 面朝南，此时西在右手边）
+### 9. Pan right vector direction
+`right = (-forwardZ, forwardX)`. Writing it as `(forwardZ, -forwardX)` flips left and right.
+(In MC +X = east, +Z = south, yaw=0 faces south, and west is then on your right-hand side)
 
-### 10. 发包必须回主线程
-`ServerPlayNetworking.send()` 在自建线程调用会被丢弃。
-必须 `server.execute(() -> {...})`。
+### 10. Packets must be sent back on the main thread
+`ServerPlayNetworking.send()` called from a thread of your own making is dropped.
+You must use `server.execute(() -> {...})`.
 
-### 11. 混音器锁范围要小
-锁内做全部混音会与 GUI 线程、解码线程争抢，导致声卡断供。
-锁只包数据拷贝与混合，平滑放锁外。
+### 11. Keep the mixer lock scope small
+Doing all the mixing inside the lock fights with the GUI thread and the decode thread and starves the sound card.
+The lock should cover only the data copy and the mix; leave the smoothing outside the lock.
 
-### 12. 贴图目录必须是 textures/block/
-原版 `blocks.json` 图集只扫 `block/` 和 `item/`，复数 `blocks/` 永远进不了图集。
+### 12. The texture directory must be textures/block/
+The vanilla `blocks.json` atlas only scans `block/` and `item/`; the plural `blocks/` never makes it into the atlas.
 
-### 13. 一个函数不要承担两种语义（本轮反复踩坑的元凶）
-本项目三次重大故障都源于此，详见 **第十二节**。改动任何函数前先确认：
-**它是不是被语义不同的地方共用？** 是就拆入口，不要在函数里加 if。
+### 13. One function must not carry two meanings (the culprit behind this round's repeated pitfalls)
+Three major outages in this project all came from this; see **section 12**. Before changing any function, confirm:
+**is it shared by callers with different semantics?** If so, split the entry points; do not add ifs inside the function.
 
-### 14. 效果音不要进音源缓冲区
-尝试过 premix，连踩三坑（reserve 衰减误判、any 误判、+= 累加导致音量增长）。
-详见 **第八节 B**。效果音走独立叠加层，但**复用主链的增益/声像函数**。
+### 14. Effect sounds must not go into the audio source buffer
+We tried premix and hit three pitfalls in a row (reserve fade misjudged, `any` misjudged, `+=` accumulation causing
+volume growth). See **section 8 B**. Effect sounds use a separate overlay layer, but **reuse the main chain's gain/pan
+functions**.
 
 ---
 
-## 八、当前状态
+## 8. Current State
 
-### 第一轮已验证通过
-- ✅ 构建成功，jar 约 303 KB（最新）
-- ✅ 方块注册、物品、创造标签页
-- ✅ 配置加载、哈希校验、示例配置自动生成
-- ✅ 自然序播放列表、固定 seed 随机
-- ✅ 网络电台（MP3 流）播放
-- ✅ 本地音频转码预热
-- ✅ 左右声道方位正确（已数值验证）
-- ✅ 音量受控（方块独立音量）
-- ✅ 空选后停止播放
-- ✅ 拆方块停止播放
-- ✅ BGM 抑制
-- ✅ 自动重订阅（按实际播放状态判断）
+### Round 1 verified passing
+- ✅ Build succeeds, jar is about 303 KB (latest)
+- ✅ Block registration, item, creative tab
+- ✅ Config loading, hash validation, sample config generated automatically
+- ✅ Natural-order playlist, fixed-seed shuffle
+- ✅ Internet station (MP3 stream) playback
+- ✅ Local audio transcode prewarm
+- ✅ Left/right channel orientation correct (verified numerically)
+- ✅ Volume under control (per-block volume)
+- ✅ Playback stops after deselecting
+- ✅ Playback stops when the block is broken
+- ✅ BGM suppression
+- ✅ Automatic resubscription (judged by the actual playback state)
 
-### 本轮修复（2026-11-23）
-三处用户实测反馈的问题，根因都已定位并用真实音频数据复现验证：
+### Fixes this round (2026-11-23)
+Three problems the user hit in real testing; all root causes were located and reproduced with real audio data:
 
-| 现象 | 根因 | 修复 |
+| Symptom | Root cause | Fix |
 |---|---|---|
-| 加载频道时「突然来声音 → 沉寂数秒 → 才进入主推流」 | `AudioSubscription.markSent()` 用 `source.positionMillis()`（读线程**预读**位置）当配速锚点。读线程在首包前已把队列灌到 64KB≈4 秒，锚点被直接推到 4263ms，首包后 4 秒不再发包 | 锚点改为 `sentBytesFromStart` 换算的「已发送毫秒」，首包回推 `streamStartAt`；另修 `updateBitrateEstimate` 用预读速度覆盖码率（16000→106666 B/s）的缺陷（`bitrateFixed`） |
-| 声音朝向/声像自动切换有延迟 | 设备缓冲用 `bufferMillis`（1000ms）抗抖动，声卡里积压的是「已乘好 pan」的音频，pan 一进设备就改不了 | 设备缓冲固定 150ms；抖动缓冲下移到混音**前**的 `SourceBuffer`（`primed` 攒够才出声）；`SMOOTH` 0.39→0.55。声像延迟 1.05s → 约 0.22s |
-| 播放列表播到末尾不重头/不继续随机 | `openSource()` 永远只取 `tracks.get(0)`；EOF 时只会 `reopen()`（在同一文件内重定位） | 新增 `PlaylistTimeline`（整条列表拼成连续时间轴，`(now-epoch)%总时长` 定位曲目+偏移）与 `PlaylistAudioSource`（EOF 自动接下一首、末尾回 0）；`trackIndex` 真实下发 |
+| When a station loads: "sound suddenly appears -> silence for a few seconds -> the main stream finally starts" | `AudioSubscription.markSent()` used `source.positionMillis()` (the reader thread's **read-ahead** position) as the pacing anchor. Before the first packet the reader thread had already filled the queue to 64KB, about 4 seconds, pushing the anchor straight to 4263ms, so nothing more was sent for 4 seconds after the first packet | The anchor now uses "milliseconds sent" derived from `sentBytesFromStart`, and the first packet backdates `streamStartAt`; also fixed `updateBitrateEstimate` overwriting the bitrate with the read-ahead rate (16000 -> 106666 B/s) (`bitrateFixed`) |
+| Delay when the sound direction/pan switches automatically | The device buffer used `bufferMillis` (1000ms) for jitter resistance, so the sound card held audio that already had its pan applied; once audio is in the device the pan cannot be changed | Device buffer pinned to 150ms; the jitter buffer moved down into `SourceBuffer` **before** the mix (output starts only once `primed` has accumulated enough); `SMOOTH` 0.39 -> 0.55. Pan latency 1.05s -> about 0.22s |
+| The playlist does not restart, or stops shuffling, at the end | `openSource()` always took `tracks.get(0)`; at EOF it only called `reopen()` (repositioning inside the same file) | Added `PlaylistTimeline` (the whole list is joined into one continuous timeline; `(now-epoch)%total duration` locates the track and offset) and `PlaylistAudioSource` (EOF moves on to the next track, wraps to 0 at the end); `trackIndex` is now genuinely sent |
 
-补充修复（评审中发现）：
-- **trackIndex 提前约 4 秒**：队列积压导致「发包时才读当前序号」比字节流早一个队列深度，
-  客户端提前重建解码器 + flush 声卡 → 换曲约 1 秒静音。改为入队时冻结序号（`Chunk` 记录）。
-- `PlaylistAudioSource.skipMillis()` 转发内层值（降级路径才不失同步）。
-- `PlaylistTimeline` 加缓存（键含文件大小/修改时间），避免每次订阅在主线程整文件扫时长。
-- 落后重锚改锚到本包末尾（`now+interval`），不再多塞一块。
-- `PcmSink` 的 `stop()/releaseDevice()` 清空音源移入锁内，统一持锁纪律。
+Additional fixes (found during review):
+- **trackIndex was about 4 seconds early**: queue backlog meant "reading the current index at send time" ran one queue
+  depth ahead of the byte stream, so the client rebuilt its decoder and flushed the sound card early -> about 1 second
+  of silence at the track change. Fixed by freezing the index at enqueue time (recorded in `Chunk`).
+- `PlaylistAudioSource.skipMillis()` forwards the inner value (so the fallback path stays in sync).
+- `PlaylistTimeline` caches results (key includes file size/modification time) to avoid scanning the whole file for its
+  duration on the main thread on every subscription.
+- Re-anchoring when behind now anchors to the end of the current packet (`now+interval`) instead of adding one more chunk.
+- In `PcmSink`, clearing the audio sources in `stop()/releaseDevice()` moved inside the lock, for consistent locking discipline.
 
-### OGG 链路彻底移除（用户决定，2026-11-23）
-起因：tiehen 报 `Failed to read Ogg file 21` 完全放不出声。
+### OGG path removed entirely (user decision, 2026-11-23)
+Origin: tiehen reported `Failed to read Ogg file 21` and produced no sound at all.
 
-排查中发现一个**重构回归**：`AudioStreamManager.openTrack()` 里查
-`AudioTranscoder.mp3For()` 的代码被误删，导致单文件频道直接把原始 OGG 推给客户端。
-先修回归，随后用户进一步决定「既然这条链路根本不可能可靠，干脆彻底删掉」——判断正确。
+During the investigation a **refactoring regression** turned up: the code in
+`AudioStreamManager.openTrack()` that looked up
+`AudioTranscoder.mp3For()` had been deleted by mistake, so single-file stations pushed the raw OGG to the client.
+The regression was fixed first; the user then decided that, since this path could never be reliable, it should be
+removed outright - the right call.
 
-删除与改动：
-- 删 `OggDuration.java` / `OggHeader.java` / `client/audio/OggDecoder.java`
-- `AudioFormat` 枚举只剩 `MP3(0)` / `UNKNOWN(1)`；`.ogg/.oga` → `UNKNOWN`
-- `AudioDuration` 只做 MP3 逐帧扫描；`AudioDurationEstimator` 删 `estimateOgg`
-- 客户端 `ClientAudioPlayer` 只建 `Mp3StreamDecoder`；新增 `looksLikeOgg()` 按字节魔数
-  主动拦截并点名原因（否则 OGG 数据喂给 JLayer 表现为「完全没声音且无任何提示」）
+Removals and changes:
+- Deleted `OggDuration.java` / `OggHeader.java` / `client/audio/OggDecoder.java`
+- The `AudioFormat` enum is down to `MP3(0)` / `UNKNOWN(1)`; `.ogg/.oga` -> `UNKNOWN`
+- `AudioDuration` only does frame-by-frame MP3 scanning; `estimateOgg` removed from `AudioDurationEstimator`
+- The client `ClientAudioPlayer` only creates `Mp3StreamDecoder`; a new `looksLikeOgg()` checks the byte magic,
+  rejects the data explicitly and names the reason (otherwise OGG data fed to JLayer shows up as "no sound at all and no message whatsoever")
 
-**改为「不静默降级」**（关键设计变更）：
-- 转码产物缺失 → `openTrack()` 返回 null → 发 `NO_AUDIO` 拒绝播放，**不再**退回推原始文件
-- 网络流不是 MP3 → `openSource()` ERROR 拒绝（网络流原样透传、不转码，
-  填 .ogg 地址本来就不该被支持）
-- 理由：静默降级产出的是「看起来能响、实则不同步且随时崩」的音频，比明确失败难查得多
+**Switched to "no silent fallback"** (key design change):
+- Transcode output missing -> `openTrack()` returns null -> sends `NO_AUDIO` and refuses to play; it **no longer**
+  falls back to pushing the original file
+- Internet stream is not MP3 -> `openSource()` refuses with ERROR (internet streams pass through untouched and are not
+  transcoded; an .ogg URL was never supposed to be supported anyway)
+- Rationale: silent fallback produces audio that "seems to play but is in fact out of sync and crashes at any moment",
+  which is far harder to diagnose than an explicit failure
 
-**切网络电台延迟优化**（用户反馈「切换到网络电台会有些许延迟」）：
-实测上游握手要 **1013ms**，而这段阻塞原本发生在**服务端主线程**
-（\`subscribe()\` 由 \`server.execute()\` 调度，构造函数里同步建连）——不只慢，还卡住整个世界。
-两处修复：
-- \`StreamAudioSource\` 改为**异步建连**：构造函数立即返回（实测 1013ms → 10ms），
-  建连期间 \`read()\` 返回**空数组**表示「暂无数据」。
-  配套修了读线程：原来把「空数组」也当 EOF，会让订阅在建连完成前就作废
-  （这也是「有时干脆没声」的来源）。
-- 抖动缓冲增加**起播门槛** \`startupTargetFrames()\`（约 300ms），与稳态目标
-  （\`bufferMillis\`，默认 1000ms）分离：先出声，再补到稳态。稳态抗抖能力不变。
-  首音延迟 1000ms → 300ms。
+**Latency fix for switching to an internet station** (user feedback: "switching to an internet station has a slight delay"):
+The upstream handshake measures **1013ms**, and this block used to happen on the **server main thread**
+(`subscribe()` is scheduled by `server.execute()`, and the constructor opened the connection synchronously) - not only
+slow, it also stalled the whole world. Two fixes:
+- `StreamAudioSource` now connects **asynchronously**: the constructor returns immediately (measured 1013ms -> 10ms),
+  and while the connection is being made `read()` returns an **empty array** meaning "no data yet".
+  The reader thread was fixed to match: it used to treat the empty array as EOF too, which invalidated the subscription
+  before the connection had finished (this was also the source of "sometimes there is simply no sound").
+- The jitter buffer gained a **start threshold** `startupTargetFrames()` (about 300ms), separate from the steady-state
+  target (`bufferMillis`, default 1000ms): make sound first, then fill up to steady state. Steady-state jitter
+  resistance is unchanged. First-sound latency 1000ms -> 300ms.
 
-**两个掩盖类音效**（用户要求）：
-- \`TuningNoise\`「调台噪」：换台/换曲/重载/关闭最后一台时播放约 220ms 的调谐噪声，
-  盖住流重连的跳变。**在混音器里合成**而非播原版音效——
-  原版音效走 OpenAL，与本模组的 \`SourceDataLine\` 是两条独立时钟，盖不准。
-  声音设计：白噪 → 低通 → 高通 → 5ms 淡入 + 平方衰减包络（纯白噪像爆音）。
-- \`NetworkNoise\`「网络差底噪」：由**抖动缓冲剩余深度**驱动的轻微嘶声。
-  用「缓冲变薄（即将出事）」而非「已经卡了」作信号，玩家能提前察觉。
-  带迟滞：起音 1 块(~20ms)、落音 34 块(~680ms)，避免阈值附近「噗噗」抖。
-  **正常播放时完全静音**——它是故障提示，不是效果音。
+**Two masking effect sounds** (user request):
+- `TuningNoise`, the "tuning noise": on a station change / track change / reload / closing the last station it plays
+  about 220ms of tuning noise, covering the jump when the stream reconnects. It is **synthesised in the mixer** rather
+  than played as a vanilla sound - vanilla sounds go through OpenAL and run on a clock independent of this mod's
+  `SourceDataLine`, so they cannot mask accurately.
+  Sound design: white noise -> low-pass -> high-pass -> 5ms fade-in + squared decay envelope (pure white noise sounds like a pop).
+- `NetworkNoise`, the "bad-network noise floor": a faint hiss driven by the **remaining jitter buffer depth**.
+  The signal is "the buffer is thinning (trouble is coming)" rather than "it has already stalled", so players can notice
+  in advance. It has hysteresis: attack 1 chunk (~20ms), release 34 chunks (~680ms), avoiding "pop-pop" flapping around
+  the threshold. **Completely silent during normal playback** - it is a fault indicator, not an effect sound.
 
-**播放列表改为「按轮播放」**（用户要求）：
-- 每轮是曲池的一个排列，**全部播完后生成新一轮**；随机模式每轮重新洗牌，
-  顺序模式每轮仍自然序（等价于原来的循环）
-- **跨轮冷却**：随机模式生成新轮时避开上一轮**最后 5 首**，两轮交界不会「刚播完又播」。
-  曲池太小（`g ≤ n/3`）时自动收窄——「5 首不够的排除在外」
-- **不内存泄漏**：轮顺序是 `(seed, 轮次)` 的**纯函数**，需要时现算；
-  只有最近 4 轮进小 LRU。实测访问 20 万轮，堆仅增 63 KB
-- 关键实现约束（踩坑记录）：冷却修正只在「新轮前 g 位」与「`[g, n-g)`」间交换，
-  且要求 `n ≥ 3g`。早期用 `g ≤ (n-1)/2`，n=10 时伙伴区只有 2 个槽位，
-  40 轮里撞出 19 次重复；同时伙伴槽位**不能重复使用**，否则交换会把自己换回去
+**Playlist switched to "round-based playback"** (user request):
+- Each round is a permutation of the track pool, and **a new round is generated once the whole round has played**;
+  shuffle mode reshuffles every round, sequential mode keeps natural order every round (equivalent to the old loop)
+- **Cross-round cooldown**: when shuffle mode generates a new round it avoids the **last 5 tracks** of the previous
+  round, so the boundary between two rounds does not "play a track again right after it finished".
+  With a small pool (`g ≤ n/3`) the window narrows automatically - "the ones that do not fit are left out"
+- **No memory leak**: the round order is a **pure function** of `(seed, round)` and is computed on demand;
+  only the last 4 rounds go into a small LRU. Measured: visiting 200,000 rounds grew the heap by only 63 KB
+- Key implementation constraint (pitfall log): the cooldown correction only swaps between "the first g positions of the
+  new round" and "`[g, n-g)`", and requires `n ≥ 3g`. An earlier version used `g ≤ (n-1)/2`, which left only 2 partner
+  slots when n=10 and produced 19 repeats over 40 rounds; also, partner slots **must not be reused**, otherwise a swap
+  puts the track straight back
 
-**「ffmpeg 能转码即可用」**（用户提出的原则，已落实）：
-- `AudioTranscoder.SOURCE_EXTENSIONS`（14 种）是全模组唯一白名单
-- `RadioPlaylist` 直接引用它，不再自存一份
-- 修复了「单文件频道能放 .flac，放进目录就静默消失」的不一致
+**"If ffmpeg can transcode it, it is usable"** (a principle proposed by the user, now implemented):
+- `AudioTranscoder.SOURCE_EXTENSIONS` (14 formats) is the single whitelist for the whole mod
+- `RadioPlaylist` references it directly and no longer keeps its own copy
+- Fixed the inconsistency where "a single-file station can play .flac, but put the file in a folder and it silently disappears"
 
-### 第二轮修复（同日，用户连续实测反馈）
+### Round 2 fixes (same day, from the user's continuous testing)
 
-这一轮几乎全部围绕**「效果音」与「重连」**两条线，踩坑记录如下——
-**这些都是已经修好并验证过的，但很容易被后续改动破坏，务必先读完再动手**。
+This round was almost entirely about two threads, **"effect sounds"** and **"reconnecting"**. The pitfall log is below -
+**all of these are already fixed and verified, but they are easily broken by later changes, so read through before touching anything**.
 
-#### A. 网络电台断线重连（用户反馈：断网崩溃 / 恢复极慢 / 声音「卡回」）
+#### A. Internet station reconnect (user feedback: crash on network loss / extremely slow recovery / sound "snaps back")
 
-日志真相：4 秒内 **57 次订阅、44 次建连**，而**会话号始终是 1**——
-说明每次都是全新实例，重连机制根本没机会工作。三个 bug 互相放大：
+What the log showed: **57 subscriptions and 44 connections within 4 seconds**, while the **session id stayed at 1** -
+meaning every attempt was a brand-new instance and the reconnect mechanism never had a chance to work.
+Three bugs amplified each other:
 
-| # | 缺陷 | 修复 |
+| # | Defect | Fix |
 |---|---|---|
-| 1 | 客户端超时判定 **2.5 秒** < 建连 1 秒 + 缓冲，必然误判 | `STALL_TIMEOUT_MILLIS` → **8 秒** |
-| 2 | 服务端 `subscribe()` **无条件先退订**，杀掉正在建连的实例 | 改为**幂等**：同频道同方块复用现有订阅 |
-| 3 | 客户端**无退避**，每 0.5 秒重发订阅 | `RESUBSCRIBE_INTERVAL_MS = 6 秒` |
+| 1 | The client timeout of **2.5 seconds** was less than 1 second of connect + buffer, so it was bound to misfire | `STALL_TIMEOUT_MILLIS` -> **8 seconds** |
+| 2 | Server `subscribe()` **unsubscribed unconditionally first**, killing the instance that was still connecting | Made **idempotent**: the same station on the same block reuses the existing subscription |
+| 3 | The client had **no backoff** and resent the subscription every 0.5 seconds | `RESUBSCRIBE_INTERVAL_MS = 6 seconds` |
 
-配套：`StreamAudioSource` 加 **`sessionId`**（每次成功连接递增，随音频块下发）。
-客户端发现会话号变化即**重建解码器**——因为重连后的字节与断线前**不连续**，
-但 MP3 帧自包含，旧解码器会当成同一条流继续解，听感是声音突然**「卡回」**。
+Supporting change: `StreamAudioSource` gained a **`sessionId`** (incremented on every successful connection, sent down
+with the audio chunks). When the client sees the session id change it **rebuilds the decoder** - the bytes after a
+reconnect are **not continuous** with those before the drop, but MP3 frames are self-contained, so the old decoder would
+keep decoding them as the same stream, which sounds like the audio suddenly **"snapping back"**.
 
-#### B. 调台噪（换台噪声）—— 反复出问题，最终定型
+#### B. Tuning noise (station-change noise) - kept going wrong, finally settled
 
-演进：固定 220ms（盖不住 600ms 空窗）→ 跟随空窗 + 连续稳定判定 →
-发现淡出**单向不可撤回** → **最终改为独立叠加层**。
+Evolution: fixed 220ms (could not cover a 600ms gap) -> follow the gap + consecutive-stable detection ->
+discovered the fade-out is **one-way and cannot be undone** -> **finally moved to an independent overlay layer**.
 
-> ⚠️ **绝对不要把效果音 premix 进 `SourceBuffer`**
-> 试过，连踩三坑（全部实测复现）：
-> 1. `reserveFadeGain` 把 20ms 空块误判成「缓冲见底」，压到 **2.8% 音量**
-> 2. 纯噪声块被 `any` 判成「节目回来了」，噪声自我淡出
-> 3. `premix` 用 `+=` 而清空只置 `length=0`，旧样本残留导致音量**逐块增长**（0.05→0.64，很快削波）
+> ⚠️ **Never premix effect sounds into `SourceBuffer`**
+> Tried it, hit three pitfalls in a row (all reproduced in testing):
+> 1. `reserveFadeGain` misjudged a 20ms empty chunk as "buffer empty" and pulled it down to **2.8% volume**
+> 2. A pure noise chunk was judged by `any` as "the programme is back", so the noise faded itself out
+> 3. `premix` used `+=` while clearing only set `length=0`, so old samples remained and the volume **grew chunk by chunk** (0.05 -> 0.64, clipping soon after)
 >
-> 根因：效果音**没有真实数据流的生命周期**，却被迫服从缓冲区的预热/丢弃/清零规则。
+> Root cause: effect sounds **have no real data-stream lifecycle** but were forced to obey the buffer's priming/discard/clear rules.
 >
-> 现行：`overlayEffects()` 独立叠加，但**复用主链的 `sourceGain()` 与 `panForPosition()`**，
-> 所以音量/距离/声像天然一致。
+> Current design: `overlayEffects()` overlays independently, but **reuses the main chain's `sourceGain()` and `panForPosition()`**,
+> so volume/distance/pan are naturally consistent.
 
-当前行为：换台时旧音频**淡出 120ms**、噪声**淡入**，两者重叠无断点。
-触发点：`S2C_SELECT_ACK`（含方块坐标）、`handleChunk` 换台分支、`S2C_RELOADED`。
-**去重窗口 400ms** —— 一次换台会从多处触发，不去重会**放两遍**。
+Current behaviour: on a station change the old audio **fades out over 120ms** and the noise **fades in**, the two
+overlapping with no break. Trigger points: `S2C_SELECT_ACK` (carries the block position), the station-change branch of
+`handleChunk`, `S2C_RELOADED`. **Dedupe window 400ms** - a single station change triggers from several places, and
+without deduping it **plays twice**.
 
-#### C. 网络差底噪 —— 语义改了三轮，最终定型
+#### C. Bad-network noise floor - semantics changed three times, finally settled
 
-| 版本 | 判据 | 问题 |
+| Version | Criterion | Problem |
 |---|---|---|
-| v1 | 抖动缓冲剩余深度 | 直播流缓冲恒定在起播水位 → **永久 40%，不消失** |
-| v2 | 单块欠载就响 | 直播流正常抖动频繁误报 → **一直断噪** |
-| v3 | 连续 8 块无数据 | 卡顿间隙的静音**没人填**，其余时间无提示 |
-| **v4（现行）** | **两档 + 粘性** | — |
+| v1 | Remaining jitter buffer depth | The live-stream buffer sits permanently at the start level -> **stuck at 40%, never goes away** |
+| v2 | Sounds on any single underrun | Normal jitter on live streams caused constant false alarms -> **noise cuts in all the time** |
+| v3 | 8 consecutive chunks with no data | The silence in the stall gaps **went unfilled**, and the rest of the time had no indicator |
+| **v4 (current)** | **Two levels + stickiness** | - |
 
-现行逻辑（`PcmSink.updateNetworkNoise()`）：
-- **卡住**（这一块完全没数据）→ **满强度**，填满那段死寂
-- **不卡但缓冲未恢复** → **0.4 弱底噪**持续提示
-- 粘性：保持到缓冲**连续健康 25 块**（约 0.5 秒）才撤
-- 停止：网络恢复 / 手动切台 / 空选
+Current logic (`PcmSink.updateNetworkNoise()`):
+- **Stalled** (this chunk has no data at all) -> **full strength**, filling that dead air
+- **Not stalled but the buffer has not recovered** -> a **0.4 weak noise floor** keeps indicating it
+- Stickiness: it holds until the buffer has been **healthy for 25 consecutive chunks** (about 0.5 seconds)
+- Stops on: network recovery / manual station change / deselection
 
-**三个导致「底噪又没了」的陷阱**：
-1. **不能每收到一块数据就清底噪** —— 块约 250ms 一个，卡顿一阵一阵，
-   「卡一下→底噪起→收到一块→被清→又卡」，底噪永远起不来
-2. **「没有音源」不能算健康** —— 早期 `isJitterBufferThinned()` 在 sources 为空时
-   返回「健康」，于是 `stop()` 清空音源后连续 25 块判健康 → 撤销底噪
-3. **「用户关台」≠「播放故障」** —— 见下面 D
+**Three traps that made "the noise floor disappeared again"**:
+1. **Do not clear the noise floor on every chunk received** - chunks arrive about every 250ms and stalls come in bursts,
+   "stall -> noise rises -> one chunk arrives -> cleared -> stall again", so the noise floor never gets going
+2. **"No audio source" must not count as healthy** - early on `isJitterBufferThinned()` returned "healthy" when sources
+   was empty, so after `stop()` cleared the sources, 25 consecutive chunks counted as healthy -> the noise floor was cancelled
+3. **"The user turned the station off" is not "a playback fault"** - see D below
 
-#### D. stop() 语义拆分（本会话最隐蔽的一处污染）
+#### D. Splitting the semantics of stop() (the most insidious contamination in this session)
 
-`ClientAudioPlayer.stop()` 原本被两类场景共用：
+`ClientAudioPlayer.stop()` was originally shared by two situations:
 
-| 场景 | 玩家意图 | 该响底噪吗 |
+| Situation | Player intent | Should the noise floor play |
 |---|---|---|
-| 用户空选/拆方块/走远 | 不听了 | **不该** |
-| 服务端报故障（无音频/超时） | **还想听**，暂时失败 | **该** |
+| User deselects / breaks the block / walks away | Does not want to listen | **No** |
+| Server reports a fault (no audio / timeout) | **Still wants to listen**, failing for now | **Yes** |
 
-故障借用 `stop()` 会撤销播放意图 → 底噪不响。修复：拆成两个入口，
-共用 `stopInternal()`（只拆播放，不碰意图）：
-- `stop(pos)` → 撤销 `playbackWanted`
-- `stopForFailure(pos)` → **保留** `playbackWanted`
-- 新增 `PcmSink.playbackWanted`，区分「异常断流」与「正常空选」
+A fault borrowing `stop()` cancelled the playback intent -> the noise floor stayed silent. Fix: split into two entry
+points sharing `stopInternal()` (which only tears down playback and does not touch intent):
+- `stop(pos)` -> clears `playbackWanted`
+- `stopForFailure(pos)` -> **keeps** `playbackWanted`
+- Added `PcmSink.playbackWanted` to tell "abnormal stream loss" apart from "normal deselection"
 
-#### E. 刷新按钮不再重订阅
+#### E. The refresh button no longer resubscribes
 
-曾把「重连」并进「扫描」，理由是「都是重新问一遍状态」——**这个判断是错的**。
-网络直播流每次重连都是**全新 HTTP 连接**，上游从自己的编码缓冲处开始发，
-重连后播放的是**几秒前的旧内容** → **割裂 + 卡顿**。
+Reconnecting was once folded into scanning, on the grounds that "both ask for the state again" - **that judgement was wrong**.
+Every reconnect of an internet live stream is a **brand-new HTTP connection**, and upstream starts sending from its own
+encoder buffer, so after a reconnect you are playing **content from several seconds ago** -> **disjointed + stuttering**.
 
-现在 `onScan()` 只做 `requestStations()`。
-重订阅只在**确认失败**时由 `AutoSubscriber` 触发。
+Now `onScan()` only does `requestStations()`.
+Resubscription is triggered by `AutoSubscriber` only when a failure is **confirmed**.
 
-#### F. 音量相关（用户多次反馈）
+#### F. Volume-related (repeated user feedback)
 
-| 现象 | 根因 | 修复 |
+| Symptom | Root cause | Fix |
 |---|---|---|
-| 不开 UI 音量就不受控 | `applyBlockVolume()` 只在订阅时调一次 | `AutoSubscriber` **每次扫描都同步**（0.5 秒） |
-| 效果音不受音量控制 | 未乘方块独立音量 | 统一走 `sourceGain()` |
-| 效果音无距离衰减 | 刻意省掉了（错误判断） | 补 `distanceGainAt()` |
-| **点扫描音量条跳变** | `stop()` 的 `clearVolumeFor()` 删记录，GUI 反查 `volumeFor()` 回退 1.0 | GUI 用自维护的 `currentVolume`；扫描后补回 |
+| Volume is out of control unless the UI is open | `applyBlockVolume()` was only called once, at subscription | `AutoSubscriber` **syncs on every scan** (0.5 seconds) |
+| Effect sounds ignore the volume | Did not multiply the per-block volume | All go through `sourceGain()` now |
+| Effect sounds have no distance attenuation | Deliberately left out (wrong call) | Added `distanceGainAt()` |
+| **The volume bar jumps when Scan is pressed** | `clearVolumeFor()` in `stop()` deleted the record, so the GUI's lookup of `volumeFor()` fell back to 1.0 | The GUI uses its own `currentVolume` and restores it after scanning |
 
-#### G. 故障显示渲染（`RadioBlockEntityRenderer`）
+#### G. Fault display rendering (`RadioBlockEntityRenderer`)
 
-用户原型：明日方舟的收音机，**红灯就是 POWER 指示灯**，在液晶屏右上角。
+User's reference: the radio in Arknights, where **the red light is the POWER indicator**, at the top right of the LCD.
 
-**设计要点：红灯最大亮度，液晶屏与错误码跟随环境光照**
-- 红灯 `LightTexture.FULL_BRIGHT` —— 自发光指示灯，暗处必须看得见
-- 液晶屏底色 + 错误码 → `packedLight` —— 被照亮的显示面，不是光源
+**Design point: the red light at maximum brightness, the LCD and error code following ambient light**
+- Red light `LightTexture.FULL_BRIGHT` - a self-illuminated indicator that must be visible in the dark
+- LCD background + error code -> `packedLight` - a lit display surface, not a light source
 
-**四个已踩的坑（全部实测）**：
-1. `IllegalStateException: Not filled all elements of the vertex` ——
-   `RenderType.translucent()` 格式含 **normal**，漏了必崩。
-   该渲染器平时完全不画，所以直到断网触发故障才第一次暴露
-2. **画在背面** —— 模型主箱体 `from [3,0,7] to [13,6,9]`，
-   `north` 面 uv `[0,0,5,3]` 才是正面图案；MC 规范里 north 面在
-   **`z = from[2] = 7`、朝 -Z**。误用 `to[2]=9` 并按 +Z 画 → 全在背面
-3. **文字上下颠倒 + 左右镜像** —— `pxToY` 把「贴图向下」转「方块向上」，
-   `yTop`/`yBottom` 传反；且字体默认朝 +Z，需绕 Y 轴转 180° 才面向 -Z 观察者
-4. 法线写 `(0,0,1)` + +Z 绕序 → 从正面看背对观察者，**被背面剔除吞掉**（灯不亮）
+**Four pitfalls already hit (all measured)**:
+1. `IllegalStateException: Not filled all elements of the vertex` -
+   the `RenderType.translucent()` format includes **normal**, and omitting it always crashes.
+   This renderer normally draws nothing at all, so it only surfaced the first time a network failure triggered a fault
+2. **Drawn on the back face** - the model's main box is `from [3,0,7] to [13,6,9]`,
+   and the `north` face uv `[0,0,5,3]` is the front artwork; in the MC convention the north face is at
+   **`z = from[2] = 7`, facing -Z**. Using `to[2]=9` by mistake and drawing along +Z -> everything landed on the back
+3. **Text upside down and mirrored left to right** - `pxToY` converts "texture down" to "block up", and
+   `yTop`/`yBottom` were passed swapped; also the font faces +Z by default, so it needs a 180 degree rotation around Y
+   before it faces a -Z viewer
+4. Normal written as `(0,0,1)` with +Z winding -> from the front the quad faces away from the viewer and is
+   **swallowed by back-face culling** (the light does not show)
 
-错误码格式 `ERRnnn`，借用 HTTP 语义：403 距离过远 / 404 频道不存在 /
-408 数据超时 / 410 已停止推送 / 415 格式不支持 / 422 无可用音频 / 500 未知。
-**只显示在液晶屏，不输出到聊天栏**。
+Error codes use the format `ERRnnn`, borrowing HTTP semantics: 403 too far away / 404 station does not exist /
+408 data timeout / 410 push already stopped / 415 format not supported / 422 no audio available / 500 unknown.
+**Shown on the LCD only, never printed to the chat bar**.
 
-#### H. 重载与命令
+#### H. Reload and commands
 
-- `/radio reload`（权限 2）：重载配置 + **重建所有订阅** + 通知客户端播调台噪
-- 原版 `/reload` 也生效（`RadioReloadListener` 挂资源重载）
-- **只改 `startEpochMillis` 不够**：已建立的订阅持有固定文件指针，
-  必须 `AudioStreamManager.rebuildAll()` 才真正从头播
+- `/radio reload` (permission level 2): reloads the config + **rebuilds every subscription** + tells clients to play the tuning noise
+- Vanilla `/reload` works too (`RadioReloadListener` hooks the resource reload)
+- **Changing `startEpochMillis` alone is not enough**: established subscriptions hold a fixed file pointer,
+  so `AudioStreamManager.rebuildAll()` is required to really start over from the beginning
 
-#### I. HLS / HE-AAC 技术评估（已评估，用户决定**不做**）
+#### I. HLS / HE-AAC technical evaluation (evaluated; the user decided **not to do it**)
 
-用户要求支持喜马拉雅 HLS 流，且**必须客户端独立完成**（不是所有玩家都装 ffmpeg）。
+The user wanted Himalaya HLS streams supported, and it **had to be done entirely on the client** (not every player has ffmpeg installed).
 
-| 项 | 结果 |
+| Item | Result |
 |---|---|
-| 流格式 | HLS，每 7 秒一个 `.aac` 分片，**HE-AAC**（SBR+PS），44.1kHz/2ch/65kbps |
-| `de.sfuhrm:jaad 0.8.7` | **0% 成功率**（SBR 不完整，151 帧全挂） |
-| `com.tianscar.javasound:jaad 0.9.4` | **100% 成功**（151/151，44100Hz/2ch/16bit），jar 643 KB |
-| JAAD 性能 | 7 秒音频 **101.9 ms**（69x 实时，1.45% 单核） |
-| JLayer 性能 | 7 秒音频 **36.2 ms**（193x 实时，0.52% 单核） |
+| Stream format | HLS, one `.aac` segment every 7 seconds, **HE-AAC** (SBR+PS), 44.1kHz/2ch/65kbps |
+| `de.sfuhrm:jaad 0.8.7` | **0% success rate** (incomplete SBR, all 151 frames failed) |
+| `com.tianscar.javasound:jaad 0.9.4` | **100% success** (151/151, 44100Hz/2ch/16bit), jar 643 KB |
+| JAAD performance | 7 seconds of audio in **101.9 ms** (69x realtime, 1.45% of one core) |
+| JLayer performance | 7 seconds of audio in **36.2 ms** (193x realtime, 0.52% of one core) |
 
-**结论：用户选择 MP3，不换 HE-AAC** —— 解码慢 2.8 倍，唯一优势是带宽减半，不值得。
-服务端 ffmpeg 版的 `HlsAudioSource.java` 已删除。
-若以后要做：jaad 0.9.4 作为**可选依赖**，按 `.m3u8` 后缀分流到独立客户端播放路径
-（拉列表 → 取最新分片 → JAAD 解码 → 喂 PcmSink），注意直播延迟控制与分片预取。
+**Conclusion: the user chose MP3 and is not switching to HE-AAC** - decoding is 2.8x slower, and the only advantage is
+halved bandwidth, which is not worth it. The server-side ffmpeg version of `HlsAudioSource.java` has been deleted.
+If this is ever done later: jaad 0.9.4 as an **optional dependency**, routed by `.m3u8` suffix to a separate client
+playback path (fetch the list -> take the newest segment -> JAAD decode -> feed PcmSink), taking care with live latency
+control and segment prefetching.
 
-### 第三轮修复（同日 17:40，用户实测截图 + 断网反馈）
+### Round 3 fixes (same day, 17:40, user's measured screenshots + offline feedback)
 
-#### J. 故障显示渲染：位置全错（本轮最大一块）
+#### J. Fault display rendering: positions were all wrong (the biggest item this round)
 
-用户截图证据：**红灯和液晶屏底色完全不可见**，而 `ERR408` 文字**上下颠倒、左右镜像**，且浮在屏幕上方的键盘区。三个独立缺陷叠加，全部已定位并由反编译原版字节码证实：
+Evidence from the user's screenshot: **the red lamp and the LCD background color were completely invisible**, while the `ERR408` text was **upside down and mirrored left-to-right**, floating in the keyboard area above the screen. Three independent defects were stacked on top of each other, and all of them were pinpointed and confirmed against decompiled vanilla bytecode:
 
-| # | 缺陷 | 根因 | 修复 |
+| # | Defect | Root cause | Fix |
 |---|---|---|---|
-| 1 | 红灯/底色四边形**完全看不见** | 朝向旋转写成 `-facing.toYRot()`，与正确值差 **180°**，整个 overlay 落到方块**背面**；法线/绕序背对观察者 → 被背面剔除吞掉 | `180.0F - facing.toYRot()` |
-| 2 | 即使朝向对，图案仍**左右镜像** | `pxToX` 写成 `FACE_X_LOW + ...`。反编译 `FaceInfo.NORTH`：顶点为 (MAX_X,MAX_Y),(MAX_X,MIN_Y),(MIN_X,MIN_Y),(MIN_X,MAX_Y)，配合 `BlockFaceUV#getU` 的索引规则（顶点0/1取uvs[0]，2/3取uvs[2]）⇒ **X 越小 u 越大**，u=0 在 +X 侧 | `FACE_X_HIGH - ...` |
-| 3 | 文字**上下颠倒** | `pose.scale(s, s, s)` 少了 y 的负号。字体空间 +y 向下、方块 +Y 向上 | `pose.scale(s, -s, s)`（原版 `SignRenderer#translateSignText` 同款） |
+| 1 | The red lamp / background quad was **completely invisible** | The orientation rotation was written as `-facing.toYRot()`, which is off by **180 degrees** from the correct value, dropping the whole overlay onto the **back** of the block; the normal / winding faced away from the viewer, so backface culling swallowed it | `180.0F - facing.toYRot()` |
+| 2 | Even with the right orientation the pattern was still **mirrored left-to-right** | `pxToX` was written as `FACE_X_LOW + ...`. In decompiled `FaceInfo.NORTH` the vertices are (MAX_X,MAX_Y),(MAX_X,MIN_Y),(MIN_X,MIN_Y),(MIN_X,MAX_Y), and combined with `BlockFaceUV#getU`'s index rule (vertices 0/1 use uvs[0], 2/3 use uvs[2]) that means **smaller X gives larger u**, so u=0 sits on the +X side | `FACE_X_HIGH - ...` |
+| 3 | The text was **upside down** | `pose.scale(s, s, s)` was missing the negative sign on y. Font space has +y pointing down, block space has +Y pointing up | `pose.scale(s, -s, s)` (same as vanilla `SignRenderer#translateSignText`) |
 
-补充修正（**都是评审中发现的**，前两条是"改完仍然看不见"的隐藏坑）：
+Follow-up corrections (**all found during review**; the first two are the hidden pitfalls behind "still invisible after the fix"):
 
-- **镜像与顶点绕序必须成对处理**——`pxToX` 改成镜像后，`pxToX(x0) > pxToX(x1)`，
-  而 `drawQuad` 的顶点序 `(x0,yB),(x0,yT),(x1,yT),(x1,yB)` 只有在 **x0 < x1** 时
-  叉积才给出 -Z（朝观察者）。直接传镜像后的原值会让法线翻成 +Z ⇒ 被 CULL 剔除 ⇒ **仍然完全不可见**。
-  这两种"看不见"现象一模一样、极难区分，所以 `drawPixelQuad()` 内部统一做
-  `Math.min/Math.max` 归一化，**不允许**调用方直接给 `drawQuad` 传未排序的 x。
-- **纯色四边形不能写 `uv(0,0)..(1,1)`**——`RenderType.translucent()` 的纹理状态是
-  `BLOCK_SHEET_MIPPED`，即**整张方块图集**；`uv 0..1` 在 GL 里就是"整张贴图"，
-  四边形会把整个图集缩放铺出来，而顶点色只是**乘**在上面、抹不平。
-  改为取图集里均匀白色的 sprite（选了 `minecraft:block/snow`，实测均值 (249,254,254)，
-  比 white_wool 的 (234,236,237) 更接近纯白），只采样其中心 16% 区域。
-  图集未就绪时**跳过绘制**而不是退化到 uv 0..1。
-- 文字显示模式 `SEE_THROUGH` → **`POLYGON_OFFSET`**（原版告示牌也用这个）。SEE_THROUGH 不测深度，正是"文字能穿过整块方块从背面看见"的来源。
-- 新增 `drawPixelQuad()`：调用方只给**贴图像素矩形**，绕序与 y 翻转在函数内统一处理，杜绝再次把 yTop/yBottom 传反。
-- 字号 0.0085 → 0.009，并按液晶屏**绿区**（不是含黑边）限制宽度——黑字压到黑边上就消失了。
+- **Mirroring and vertex winding have to be handled as a pair** - once `pxToX` mirrors, `pxToX(x0) > pxToX(x1)`,
+  while `drawQuad`'s vertex order `(x0,yB),(x0,yT),(x1,yT),(x1,yB)` only produces -Z (toward the viewer)
+  from the cross product when **x0 < x1**. Passing the mirrored values straight through flips the normal to +Z,
+  so it gets culled and is **still completely invisible**.
+  Both "invisible" symptoms look identical and are extremely hard to tell apart, so `drawPixelQuad()`
+  normalizes with `Math.min/Math.max` internally and **callers are not allowed** to hand unsorted x values to `drawQuad`.
+- **A solid-color quad must not use `uv(0,0)..(1,1)`** - the texture state of `RenderType.translucent()` is
+  `BLOCK_SHEET_MIPPED`, i.e. **the entire block atlas**; `uv 0..1` in GL means "the whole texture",
+  so the quad would stretch and tile the whole atlas, and vertex color only **multiplies** on top of it, which cannot smooth that out.
+  Instead we sample a uniformly white sprite from the atlas (chose `minecraft:block/snow`, measured mean (249,254,254),
+  closer to pure white than white_wool's (234,236,237)) and sample only its central 16% region.
+  When the atlas is not ready we **skip drawing** rather than falling back to uv 0..1.
+- Text display mode `SEE_THROUGH` -> **`POLYGON_OFFSET`** (vanilla signs use this too). SEE_THROUGH does not test depth, which is exactly where "the text shows through the whole block from the back" came from.
+- Added `drawPixelQuad()`: callers only supply a **texture pixel rectangle**, and winding plus y-flip are handled uniformly inside the function, so yTop/yBottom can never be passed backwards again.
+- Font size 0.0085 -> 0.009, and the width is limited to the LCD's **green area** (not including the black bezel) - black glyphs that spill onto the bezel disappear.
 
-> ⚠️ **液晶屏不重绘底色**（用户明确要求）
-> 早期故障时会把屏幕刷成暗红底（`LCD_BG_FAULT`）。用户否定：**显示屏背景保持贴图原样，只有文字变黑**。
-> 现在 `LED_COLOR_FAULT` 是唯一绘制的四边形，文字色 `0xFF000000`。
-> 这也更符合真实设备——液晶底色由偏光片物理决定，变的只有笔画。
+> ⚠️ **The LCD does not repaint its background** (explicit user requirement)
+> Early on, a fault would paint the screen a dark red (`LCD_BG_FAULT`). The user rejected that: **the display background stays exactly as the texture, only the text turns black**.
+> Now `LED_COLOR_FAULT` is the only quad that gets drawn, and the text color is `0xFF000000`.
+> This also matches real hardware - the LCD background is physically fixed by the polarizer; only the strokes change.
 
-**验证方式**（可复现）：把四个朝向、贴图 UV 与文字变换一次性数值化，
-确认「u=0→屏幕左、LED 在右上、文字可正读、法线朝观察者」四个朝向全部成立；
-并用用户截图反推：贴图左侧黑色面板在 facing=south 时应落在观众左手边，与实际截图一致。
+**How this was verified** (reproducible): the four orientations together with the texture UVs and the text transform were all reduced to numbers at once,
+confirming that "u=0 -> left side of the screen, LED in the top right, text readable upright, normal facing the viewer" holds for all four orientations;
+and cross-checked against the user's screenshot: the black panel on the left of the texture should land on the viewer's left hand side at facing=south, matching the actual screenshot.
 
-#### K. 「断网无噪音」
+#### K. "No noise when the network drops"
 
-两条**互补**路径，任一条成立就完全没声：
+Two **complementary** paths, either one of which results in complete silence:
 
-1. **纯链路断（服务端不发状态包）**：`overlayEffects()` 的 `if (anchor < 0) return;` ——
-   调台噪与网络底噪**共用同一个 `tuningNoiseBlock` 锚点**，而该锚点只由换台路径设置。
-   断网没换过台 ⇒ 锚点 -1 ⇒ 整层直接 return，底噪连生成都不做。
-2. **服务端报故障**：`stopForFailure()` 最终仍调 `PcmSink.stop()` ⇒ `silent = true` ⇒
-   混音线程走静音分支，而 `updateNetworkNoise()`/`overlayEffects()` 都在 `continue` 之后，
-   且该分支每 20ms `networkNoise.reset()` ⇒ 底噪永远不可能响。
+1. **Pure pipeline break (the server sends no status packets)**: the `if (anchor < 0) return;` in `overlayEffects()` -
+   tuning noise and network noise floor **share the same `tuningNoiseBlock` anchor**, and that anchor is only set by the retune path.
+   A network drop with no retune means the anchor stays at -1, so the whole layer returns immediately and the noise floor is not even generated.
+2. **The server reports a fault**: `stopForFailure()` still ends up calling `PcmSink.stop()` -> `silent = true` ->
+   the mixer thread takes the silent branch, while `updateNetworkNoise()`/`overlayEffects()` both sit after that `continue`,
+   and that branch calls `networkNoise.reset()` every 20ms -> the noise floor can never sound.
 
-> 这也解释了为什么表现为「时有时无」：**换过台**的场景本来就有锚点，是能响的。
+> This also explains the "sometimes there, sometimes not" behavior: in scenarios where **a retune happened** the anchor exists and it can sound.
 
-修复（沿用「一个函数不承担两种语义」）：
-- 新增独立的 `networkNoiseBlock` 锚点：`tuningNoiseBlock` = **事件**归属（换台拟音），
-  `networkNoiseBlock` = **状态**归属（链路坏了）。两者并列，不复用。
-- 抽出 `overlayNetworkNoise()`，让静音分支**只**能出声底噪。
-  **调台噪绝不能进静音分支**——它的时长上限靠正常路径的 `followSilence()` 推进，
-  静音分支不推进，跟进去会卡在 active 上无限响。
-- **无锚点时不 return**：调台噪是效果音（没方位就不放，合理），
-  网络底噪是故障提示（定位不到就退化为居中 + 只乘原版音量，**牺牲方位保住提示**）。
-- `PcmSink` 新增 `silenceForFailure()`：静音 + flush，但**不**清锚点、**不** reset 底噪。
-  这正是第八节 D 那次语义拆分**没做完的下半截**——`ClientAudioPlayer` 早就拆了
-  `stop()`/`stopForFailure()`，但两者最终都调 `PcmSink.stop()`，在混音器层又被合并回一个函数。
-- 静音分支按 `playbackWanted` 分流：true → 跑 `updateNetworkNoise()` + `overlayNetworkNoise()`；
-  false → reset + 纯静音（用户空选必须绝对安静）。
-- 新增「本流首次出声」门（`streamFlowing`）与「明确上报故障」门（`faultReported`），
-  由 `faultSignalAllowed()` 统一判定。**没有这道门，正常起播会先沙约 1 秒假底噪。**
+Fixes (following "one function must not carry two meanings"):
+- Added a separate `networkNoiseBlock` anchor: `tuningNoiseBlock` = **event** ownership (retune foley),
+  `networkNoiseBlock` = **state** ownership (the link is broken). They sit side by side and are not reused.
+- Extracted `overlayNetworkNoise()` so that the silent branch can produce **only** the noise floor.
+  **Tuning noise must never enter the silent branch** - its duration cap is advanced by `followSilence()` on the normal path,
+  which the silent branch does not run, so it would get stuck active and ring forever.
+- **Do not return when there is no anchor**: tuning noise is an effect sound (no position, no sound - reasonable),
+  but the network noise floor is a fault indication (if it cannot be localized, degrade to centered + multiplied by vanilla volume only - **sacrifice directionality, keep the indication**).
+- New `PcmSink.silenceForFailure()`: silence + flush, but does **not** clear the anchor and does **not** reset the noise floor.
+  This is exactly the unfinished second half of the semantic split in section 8, item D - `ClientAudioPlayer` already split
+  `stop()`/`stopForFailure()`, but both ended up calling `PcmSink.stop()`, merging them back into one function at the mixer layer.
+- The silent branch now splits on `playbackWanted`: true -> run `updateNetworkNoise()` + `overlayNetworkNoise()`;
+  false -> reset + pure silence (an empty selection by the user must be absolutely quiet).
+- Added a "this stream has produced sound" gate (`streamFlowing`) and an "explicitly reported fault" gate (`faultReported`),
+  both judged by `faultSignalAllowed()`. **Without that gate, a normal start of playback would first hiss a fake noise floor for about one second.**
 
-#### L. 「恢复了 ERR 也不消除」
+#### L. "ERR does not clear even after recovery"
 
-主因：**本地 TIMEOUT 只点灯、没有灭灯边沿**。
-`AutoSubscriber` 只在 `stale` 时 `markLocalFault(TIMEOUT)`，而 `stale` 依赖
-`isStalled()` 读 `lastChunkAt`（每收到一块就刷新）。数据一恢复 `stale` 立刻变 false，
-于是**再没有任何代码清 `clientFaultStatus`**。注释里写的「恢复后 markFault(OK) 会自动熄灭」
-在代码里根本不存在（全工程只有 `AudioStreamManager:136` 发 OK）。
+Primary cause: **the local TIMEOUT only lights the lamp, there is no turn-off edge**.
+`AutoSubscriber` only calls `markLocalFault(TIMEOUT)` while `stale`, and `stale` relies on
+`isStalled()` reading `lastChunkAt` (refreshed on every chunk). As soon as data resumes, `stale` turns false immediately,
+and from then on **no code clears `clientFaultStatus` at all**. The comment claiming "markFault(OK) automatically clears after recovery"
+simply does not exist in the code (the only place in the whole project that sends OK is `AudioStreamManager:136`).
 
-次因：`AudioStreamManager.subscribe()` 的**幂等早退**（同频道同方块直接复用）**不发 `sendStatus(OK)`**。
-而客户端重订阅恰恰是在确认故障之后发起的 —— 闷声复用 = ERR408 永久留在屏上。
+Secondary cause: the **idempotent early return** in `AudioStreamManager.subscribe()` (same channel, same block -> reuse) **does not send `sendStatus(OK)`**.
+And it is precisely after a fault is confirmed that the client re-subscribes - reusing silently means ERR408 stays on screen forever.
 
-修复：
-- 幂等早退分支补 `sendStatus(player, pos, AudioStatus.OK)`。
-- `handleChunk`（**AudioIngest 线程**）检测到数据恢复后，经
-  `Minecraft.getInstance().execute(...)` **跳回主线程**清显示。
-  直接写 `setClientFaultStatus` 会在 ingest 线程读 `client.level` —— 必须跳线程。
-  带**代际检查**（`FAULT_GENERATION`）：排队期间若来了新故障，这次清除作废，
-  避免「故障一闪就灭」。
-- `AutoSubscriber` 保持**只点灯**，灭灯责任唯一交给上面那条恢复边沿
-  （避免"这一 tick 没判超时"导致显示来回抖）。
-- 用户清台（`stop`）也清显示，不留孤儿 ERR。
+Fixes:
+- The idempotent early-return branch now sends `sendStatus(player, pos, AudioStatus.OK)`.
+- Once `handleChunk` (**the AudioIngest thread**) detects that data has resumed, it hops **back to the main thread** via
+  `Minecraft.getInstance().execute(...)` to clear the display.
+  Writing `setClientFaultStatus` directly would touch `client.level` from the ingest thread - the thread hop is mandatory.
+  It carries a **generation check** (`FAULT_GENERATION`): if a new fault arrives while the clear is queued, this clear is voided,
+  preventing a "fault that flashes and goes out".
+- `AutoSubscriber` stays **light-only**; the sole responsibility for turning the lamp off is handed to the recovery edge above
+  (so that "this tick did not judge a timeout" cannot make the display flicker back and forth).
+- User tuning-off (`stop`) also clears the display, leaving no orphan ERR.
 
-#### M. 本轮新增的语义拆分（第十二节同一形状，第四次）
+#### M. Semantic splits added this round (same shape as section 12, fourth occurrence)
 
-| 函数 | 被混淆的语义 | 后果 |
+| Function | Confused meanings | Consequence |
 |---|---|---|
-| `overlayEffects()` 的锚点 | 「换台拟音归属」vs「链路故障归属」 | 断网无噪音 |
-| `PcmSink.stop()` | 「用户不要了」vs「故障静音」 | 底噪被当成用户主动关台（D 节没做完的下半截） |
-| 静音分支 `networkNoise.reset()` | 「空选静止」vs「故障拿不到数据」 | 底噪永远起不来 |
-| `ClientAudioPlayer` 的 `STREAMS` | 「真的在收流」vs「玩家点过确认还没撤销」 | 首块前失败不响 / 关台后迟到包又点亮 |
+| The anchor in `overlayEffects()` | "retune foley ownership" vs "link fault ownership" | no noise when offline |
+| `PcmSink.stop()` | "the user no longer wants it" vs "fault mute" | noise floor treated as the user switching the station off (the unfinished second half of item D) |
+| `networkNoise.reset()` in the silent branch | "empty selection, idle" vs "fault, no data available" | noise floor never comes up |
+| `STREAMS` in `ClientAudioPlayer` | "actually receiving a stream" vs "the player pressed confirm and has not revoked it" | no sound on failure before the first chunk / late packets light it up again after the station is switched off |
 
-**结论同第八节 D**：`STREAMS`（事实）与 `REQUESTED`（意图）必须分开，
-意图只能有一个判据，否则两种相反误判必然同时存在。
+**The conclusion is the same as section 8, item D**: `STREAMS` (fact) and `REQUESTED` (intent) must be separate;
+intent can have only one predicate, otherwise both opposite misjudgments necessarily exist at the same time.
 
-#### N. 第四轮微调（用户实测「渲染没问题」之后）
+#### N. Round 4 fine-tuning (after the user tested and reported "rendering is fine")
 
-渲染定位已确认正确，本轮只调整观感与日志噪音：
+Rendering placement is now confirmed correct; this round only adjusts feel and log noise:
 
-| 项 | 改动 |
+| Item | Change |
 |---|---|
-| 红灯 | **快闪**，半周期 250ms（2Hz，每 0.5 秒一个明暗周期）。灭相时**整个四边形不画**，露出贴图原本的暗红"未点亮"状态。用墙钟而不是 `getGameTime()`——后者在暂停时会让灯冻在半亮 |
-| 屏幕文字 | `ERRnnn` → **`NOSIGNAL`**，且**常显不闪**（文字要能读；闪的是红灯，两者职责不同） |
-| 音量滑块 | 行程 **10 档 → 5 档**（0/25/50/75/100%）。18px 宽的滑块上 10 档每档不到 2 像素，根本停不准 |
-| 自动重试 | 服务端重连**不再放弃**（`MAX_RECONNECT_ATTEMPTS` → 无上限）。原先 120 次后彻底放弃，长断网需靠客户端重订阅重建整条订阅、丢掉抖动缓冲 |
-| **日志刷屏** | 见下 |
+| Red lamp | **Fast blink**, half period 250ms (2Hz, one bright/dark cycle every 0.5s). During the off phase **the entire quad is not drawn**, revealing the texture's original dark red "unlit" state. Uses wall clock rather than `getGameTime()` - the latter freezes the lamp half-lit while paused |
+| Screen text | `ERRnnn` -> **`NOSIGNAL`**, and **always shown, never blinking** (text must be readable; the lamp is what blinks - different responsibilities) |
+| Volume slider | Travel **10 steps -> 5 steps** (0/25/50/75/100%). On an 18px-wide slider, 10 steps means under 2 pixels per step - impossible to stop accurately |
+| Auto retry | Server reconnection **no longer gives up** (`MAX_RECONNECT_ATTEMPTS` -> unlimited). It used to give up completely after 120 attempts, so a long outage required the client to re-subscribe and rebuild the whole subscription, losing the jitter buffer |
+| **Log spam** | See below |
 
-##### 日志刷屏的四个来源（全部已修）
+##### The four sources of log spam (all fixed)
 
-用户实测反馈「失败只要在开始和结束的时候 log 一下就行，现在会刷屏」。
-逐一找出并压成**每次故障两行**（开始 / 结束）：
+The user reported: "a failure only needs a log line at the start and one at the end, right now it spams".
+Each source was found and compressed into **two lines per fault** (start / end):
 
-| 位置 | 原来每多久一条 | 现在 |
+| Location | Old rate | Now |
 |---|---|---|
-| `StreamAudioSource.scheduleReconnect()` | 每次重试都 WARN（断网时每 3 秒一条） | 新增 `episodeLogged`：本次故障**只报一次**"失联"，恢复时报一次"已恢复（重试 N 次，失联 X ms）"。逐次尝试降为 `debug` |
-| `StreamAudioSource.connect()` | 每次（重）连成功都 INFO「已连接」 | 只在**首次**连接（`sessionId==1`）打 INFO；重连成功交给上面那条"已恢复"统一报 |
-| `AutoSubscriber` | 每次重订阅都 INFO「数据超时，重新拉流」（每 6 秒一条） | 新增 `retryLogged` 集合：每次故障只报一次「开始自动重试」。恢复正常收流后移除，下次故障还能再报 |
-| `ClientRadioNetwork` 状态包 | 每次收到非 OK 都 WARN | 新增 `ClientAudioPlayer.logFaultOnce()`：**方块 + 状态码**都没变就不重复；恢复时 `resetFaultLog()` |
+| `StreamAudioSource.scheduleReconnect()` | WARN on every retry (one every 3s while offline) | New `episodeLogged`: **one** "lost contact" report per fault, plus one "recovered (N retries, lost for X ms)" on recovery. Per-attempt logs demoted to `debug` |
+| `StreamAudioSource.connect()` | INFO "connected" on every (re)connect | INFO only on the **first** connection (`sessionId==1`); successful reconnects are reported by the "recovered" line above |
+| `AutoSubscriber` | INFO "data timed out, re-pulling stream" on every re-subscribe (one every 6s) | New `retryLogged` set: one "starting automatic retry" per fault. Removed once streaming recovers, so the next fault can report again |
+| `ClientRadioNetwork` status packets | WARN on every non-OK packet | New `ClientAudioPlayer.logFaultOnce()`: no repeat while **block + status code** are unchanged; `resetFaultLog()` on recovery |
 
-> 设计取向：**开始与结束各一行，中间完全静默**。想看重试细节把日志级别调到 DEBUG。
-> 这与第八节「no silent degradation」不冲突——静默的是**重试的重复过程**，
-> 不是"出了什么问题"这件事本身。
+> Design intent: **one line at the start, one at the end, completely silent in between**. Bump the log level to DEBUG to see retry details.
+> This does not conflict with "no silent degradation" in section 8 - what goes silent is the **repetitive retry process**,
+> not the fact that something went wrong.
 
-#### O. 第五轮：职责重新划分（用户明确的架构要求）
+#### O. Round 5: responsibilities redrawn (explicit architectural requirement from the user)
 
-用户原话：
-> 重连是客户端的事情，断网了服务端就标记为已下线（包括退出游戏），重新连接回来算已上线，
-> 服务端不管网络电台的死活，只管自定义电台和方块数据，玩家掉线/断网就清理连接状态，
-> 客户端在连接不通畅的情况下不与服务器彻底断开连接就只是底噪比较大，不会直接重连，
-> 但服务器判定玩家断开了连接就重置该玩家的订阅
+The user's exact words:
+> Reconnecting is the client's business. When the network drops the server just marks it offline (including quitting the game), and reconnecting counts as coming back online.
+> The server does not care whether a network station lives or dies, it only manages custom stations and block data. When a player disconnects or loses the network, clean up the connection state.
+> While the connection is unhealthy the client does not fully disconnect from the server, it just has a louder noise floor and does not reconnect directly,
+> but once the server decides the player has disconnected it resets that player's subscriptions.
 
-##### 新的职责边界（这是本轮最重要的设计约束）
+##### New responsibility boundary (the most important design constraint this round)
 
-| 层 | 负责 | 明确<b>不</b>负责 |
+| Layer | Responsible for | Explicitly <b>not</b> responsible for |
 |---|---|---|
-| **服务端** | 自定义电台（本地文件/播放列表）、方块数据、<b>连接</b>生命周期 | 网络电台的死活（上游断了<b>不修、不重试</b>） |
-| **客户端** | 显示状态、底噪提示 | 弱网时重建订阅/重连（只在<b>本地没有订阅</b>时补订阅） |
+| **Server** | Custom stations (local files / playlists), block data, connection <b>lifecycle</b> | Whether a network station lives or dies (if upstream dies, <b>no repair, no retry</b>) |
+| **Client** | Displaying status, noise floor indication | Rebuilding subscriptions / reconnecting on a weak network (only fills in a subscription when there is <b>no local subscription</b>) |
 
-##### 落地改动
+##### Implementation changes
 
-1. **删掉服务端的网络流重连状态机**（`StreamAudioSource`）
-   - 移除 `scheduleReconnect` / `maintainReconnect` / 退避 / `MAX_RECONNECT_ATTEMPTS`
-   - 建连失败、读到 EOF、读异常 → **标记 `finished` 并就此结束**，只打一条日志
-   - `read()` 在结束/建连中返回<b>空数组</b>（不能返回 null，那会让读线程直接退出、订阅作废）
-   - 保留 `sessionId` 协议字段（客户端仍需判断字节流连续性），但一条实例恒为 1
+1. **Removed the server-side network stream reconnect state machine** (`StreamAudioSource`)
+   - Removed `scheduleReconnect` / `maintainReconnect` / backoff / `MAX_RECONNECT_ATTEMPTS`
+   - Connection failure, EOF, read exception -> **mark `finished` and stop there**, with a single log line
+   - `read()` returns an <b>empty array</b> when finished or while connecting (it must not return null, which would make the read thread exit and invalidate the subscription)
+   - Kept the `sessionId` protocol field (the client still needs to judge byte-stream continuity), but a single instance is always 1
 
-2. **读循环要能退出**（`AudioSubscription.readLoop`）
-   - 新增：`source.isFinished()` 时退出循环并 `notifyAll`
-   - <b>为什么必须加</b>：服务端不再重连后，死掉的流会永远返回空数组；
-     不加这个判断，读线程会每 50ms 空转、订阅一直挂着占名额。
-   - 退出后订阅仍 active（服务端不主动踢），只是不再产数据——符合"不管死活"
+2. **The read loop must be able to exit** (`AudioSubscription.readLoop`)
+   - Added: exit the loop and `notifyAll` when `source.isFinished()`
+   - <b>Why it is mandatory</b>: now that the server no longer reconnects, a dead stream would return an empty array forever;
+     without this check the read thread would spin every 50ms and the subscription would hang around occupying a slot.
+   - After exiting, the subscription stays active (the server does not kick it), it just stops producing data - consistent with "does not care whether it lives or dies"
 
-3. **连接生命周期显式化**（`SmileSRadio`）
-   - `DISCONNECT` → `unsubscribeAll`（清空该玩家全部订阅，含关闭 HTTP 连接）
-   - `JOIN` → 同样 `unsubscribeAll`（幂等保险：崩溃恢复/异常时不留残留订阅）
-   - JOIN 时清理可避免"订阅数超限"误判与向失效连接发包
+3. **Connection lifecycle made explicit** (`SmileSRadio`)
+   - `DISCONNECT` -> `unsubscribeAll` (clear all of that player's subscriptions, including closing HTTP connections)
+   - `JOIN` -> also `unsubscribeAll` (idempotent safety net: no leftover subscriptions after a crash recovery / exception)
+   - Cleaning on JOIN avoids a spurious "too many subscriptions" and sending packets to dead connections
 
-4. **客户端不再因弱网重订阅**（`AutoSubscriber`）
-   - 语义拆成三态，<b>只有第一、二种才订阅</b>：
+4. **The client no longer re-subscribes on a weak network** (`AutoSubscriber`)
+   - The semantics split into three states, <b>only the first two subscribe</b>:
 
-     | 状态 | 判据 | 动作 |
+     | State | Predicate | Action |
      |---|---|---|
-     | 新增/换台 | `isNew` | 订阅 |
-     | **本地没有订阅对象** | `!isStreaming()` | 订阅（带 6 秒退避） |
-     | 订阅在但没数据 | `isStalled()` | **只显示故障，绝不订阅** |
+     | New / retuned | `isNew` | subscribe |
+     | **No local subscription object** | `!isStreaming()` | subscribe (with a 6s backoff) |
+     | Subscription exists but no data | `isStalled()` | **show the fault only, never subscribe** |
 
-   - 这正是 HANDOVER 第十二节那个模式的又一例：把"该修"与"该显示"混成一个判据，
-     就会在断网期间反复重建订阅，把本来只是抖的音频抖得更厉害。
+   - This is yet another instance of the pattern from section 12: merging "should repair" and "should display" into one predicate
+     means the subscription gets rebuilt repeatedly during an outage, shaking audio that was merely stuttering into something worse.
 
-5. **客户端 JOIN 时清空本地流表**（`AudioLifecycleHooks`）
-   - 服务端下线时已清订阅，客户端不清 `STREAMS` 的话 `isStreaming()` 仍为 true，
-     AutoSubscriber 认为"已在播"，<b>重连后永久沉默</b>
+5. **The client clears its local stream table on JOIN** (`AudioLifecycleHooks`)
+   - The server already clears subscriptions when the player goes offline; if the client does not clear `STREAMS`,
+     `isStreaming()` stays true, AutoSubscriber thinks "already playing", and it stays <b>permanently silent after reconnecting</b>
 
-##### 无信号显示收窄（用户补充要求）
+##### Narrowing the no-signal display (additional user request)
 
-> 但客户端的无信号是针对网络电台的，而非自定义电台
+> But the client's no-signal is about network stations, not custom stations.
 
-`NOSIGNAL` 只表示"上游网络断了"，因此两处入口都加了电台类型判断：
+`NOSIGNAL` only means "the upstream network is down", so both entry points now check the station type:
 
-- **本地判定**（`AutoSubscriber`）：`stale && isStreamingStation(stationId)` 才点亮
-- **服务端状态**（`ClientRadioNetwork.displayStatusFor`）：新建一层翻译，
-  把传输层状态码映射成"该不该上屏幕"：
+- **Local judgement** (`AutoSubscriber`): lights up only when `stale && isStreamingStation(stationId)`
+- **Server status** (`ClientRadioNetwork.displayStatusFor`): a new translation layer was added that
+  maps transport-layer status codes to "should this go on screen":
 
-  | 状态码 | 上屏幕 | 理由 |
+  | Status code | On screen | Reason |
   |---|---|---|
-  | `TIMEOUT` + 网络电台 | ✅ NOSIGNAL | 真正的"没信号" |
-  | `TIMEOUT` + 本地电台 | ❌ | 本地文件没有"信号"这回事 |
-  | `TOO_FAR` | ❌ | 玩家自己走远了，走进范围就恢复 |
-  | `STOPPED` / `NO_AUDIO` / `UNSUPPORTED_FORMAT` / `UNKNOWN_STATION` | ❌ | 服主配置或转码问题，与信号无关 |
+  | `TIMEOUT` + network station | ✅ NOSIGNAL | a genuine "no signal" |
+  | `TIMEOUT` + local station | ❌ | local files have no such thing as a "signal" |
+  | `TOO_FAR` | ❌ | the player walked away; it comes back on entering range |
+  | `STOPPED` / `NO_AUDIO` / `UNSUPPORTED_FORMAT` / `UNKNOWN_STATION` | ❌ | server-owner configuration or transcoding problems, unrelated to signal |
 
-> 这些状态<b>仍然照常打日志</b>（排查需要），只是不上屏幕。
-> 这样 `NOSIGNAL` 的含义就是单一且准确的：**这台网络电台的上游断了**。
+> These statuses <b>are still logged as usual</b> (needed for troubleshooting), they just do not go on screen.
+> That way `NOSIGNAL` has a single, accurate meaning: **the upstream of this network station is down**.
 
-#### P. 第六轮：配置校验 / 未知频道报警 / rate 字段
+#### P. Round 6: config validation / unknown channel alarm / rate field
 
-##### 1. 配置失败的频道<b>不显示</b>
+##### 1. Channels that fail config validation are <b>not shown</b>
 
-新增 `RadioStationRegistry#isPlayable()`，在 `load()` 时逐条校验：
+Added `RadioStationRegistry#isPlayable()`, validating each entry in `load()`:
 
-- <b>网络电台</b>：合法 http(s) 即有效。上游此刻通不通<b>不算配置错误</b>——
-  断流时显示 NOSIGNAL，而不是把它从列表里删掉。
-- <b>本地电台</b>：`resolveTracks()` 非空，且至少一首是 MP3 或可转码格式。
+- <b>Network stations</b>: a valid http(s) URL counts as valid. Whether upstream is reachable right now <b>is not a config error</b> -
+  a dead stream shows NOSIGNAL instead of being deleted from the list.
+- <b>Local stations</b>: `resolveTracks()` is non-empty, and at least one track is MP3 or a transcodable format.
 
-无效的频道<b>不进入 `stations`</b>（客户端列表里看不到），
-同时把 id 记进 `invalidStationIds()`，供"方块上还记着它"的场景报警。
+Invalid channels <b>do not enter `stations`</b> (invisible in the client list),
+and their ids are recorded in `invalidStationIds()` for the case where "a block still remembers it" needs to raise an alarm.
 
-##### 2. 已配置却被重载搞坏 / 未知频道 → <b>持续噪音 + NOSIGNAL</b>
+##### 2. Configured but broken by reload / unknown channel -> <b>continuous noise + NOSIGNAL</b>
 
-关键在于分辨两种"放不出来"：
+The key is to distinguish the two kinds of "cannot play":
 
-| 情形 | 列表 | 方块上的表现 |
+| Case | List | Block behavior |
 |---|---|---|
-| 配置就写错了（文件不存在） | <b>隐藏</b> | — |
-| 配好过，重载后变无效/被删 | 隐藏 | <b>持续噪音 + NOSIGNAL</b> |
-| 方块记着完全不存在的 id | — | <b>持续噪音 + NOSIGNAL</b> |
+| Misconfigured from the start (file does not exist) | <b>hidden</b> | - |
+| Was fine, became invalid / was deleted after reload | hidden | <b>continuous noise + NOSIGNAL</b> |
+| Block remembers a completely nonexistent id | - | <b>continuous noise + NOSIGNAL</b> |
 
-从客户端角度看，后两者是同一件事：<b>方块 NBT 里的 id 在 `ClientRadioData` 里找不到</b>。
+From the client's point of view the last two are the same thing: <b>the id in the block NBT cannot be found in `ClientRadioData`</b>.
 
-实现要点：
-- `ClientRadioData.findStation()`：判"配置里到底有没有这个频道"
-- `ClientRadioNetwork.displayStatusFor()`：`UNKNOWN_STATION` <b>一律</b>上屏幕；
-  `TIMEOUT` 时若方块 id 已不在配置中，也升级成 `UNKNOWN_STATION`
-- `AutoSubscriber`：`unknownStation` 分支<b>不等 8 秒超时窗口</b>就点亮
-  （它注定不会好，等窗口没意义），并且<b>不再发起订阅</b>
-- `ClientAudioPlayer.markUnknownStationFailure()`：<b>新入口，不复用 stopForFailure</b>。
-  原因：`stopForFailure` 依赖 `REQUESTED`（玩家点过确认），
-  而未知频道常见于"进服时方块已经坏了"，本机从没发过订阅请求、`REQUESTED` 为空，
-  复用会导致底噪不响，正好违反要求。
+Implementation notes:
+- `ClientRadioData.findStation()`: answers "does this channel exist in the config at all"
+- `ClientRadioNetwork.displayStatusFor()`: `UNKNOWN_STATION` <b>always</b> goes on screen;
+  on `TIMEOUT`, if the block's id is no longer in the config, it is also upgraded to `UNKNOWN_STATION`
+- `AutoSubscriber`: the `unknownStation` branch lights up <b>without waiting for the 8-second timeout window</b>
+  (it is never going to get better, waiting is pointless), and it <b>does not initiate a subscription</b>
+- `ClientAudioPlayer.markUnknownStationFailure()`: <b>a new entry point, not reusing stopForFailure</b>.
+  Reason: `stopForFailure` depends on `REQUESTED` (the player pressed confirm),
+  while an unknown channel typically comes from "the block is already broken by the time you join the server"; this machine has never sent a subscription request and `REQUESTED` is empty,
+  so reusing it would leave the noise floor silent, exactly violating the requirement.
 
-> 注意"持续"两个字：底噪由混音器按缓冲状态维持，不会被一次状态包清掉；
-> NOSIGNAL 由方块实体状态维持，直到数据真的回来或玩家处理。
+> Note the word "continuous": the noise floor is maintained by the mixer according to buffer state and is not wiped by a single status packet;
+> NOSIGNAL is maintained by the block entity state until the data really comes back or the player deals with it.
 
-##### 3. `rate` 字段（列表右侧）
+##### 3. The `rate` field (right side of the list)
 
-`RadioStation` 新增 `rate`；`displayRate()` 未配置时返回 <b>`NETWORK`</b>。
+`RadioStation` gained `rate`; `displayRate()` returns <b>`NETWORK`</b> when unset.
 
-界面：`RadioScreen.renderList()` 先算 rate 宽度并右对齐，
-<b>再用它反推名字可用宽度</b>（`nameBudget`）——否则长频道名会盖住 rate，两者都读不清。
-rate 用较暗的颜色，不抢频道名的注意力。
+UI: `RadioScreen.renderList()` first computes the rate width and right-aligns it,
+<b>then derives the available width for the name</b> (`nameBudget`) from it - otherwise a long channel name covers the rate and neither is readable.
+The rate uses a dimmer color so it does not compete with the channel name for attention.
 
-示例配置与自动生成的 `stations.json` 都带上了 `rate` 键（空串 = NETWORK）。
+The example config and the auto-generated `stations.json` both include the `rate` key (empty string = NETWORK).
 
-##### 4. 测试配置更新
+##### 4. Test config updated
 
-`run/saves/新的世界/serverconfig/radio-smile/stations.json` 与 `run/world/...`：
+`run/saves/New World/serverconfig/radio-smile/stations.json` and `run/world/...`:
 
-| id | 内容 | rate |
+| id | Content | rate |
 |---|---|---|
-| `tiehen` | 本地 OGG | FM105.7 |
-| `testaudio` | 本地 OGG | （空 → NETWORK）|
-| `qtfm` | 蜻蜓 FM 网络台 | （空 → NETWORK）|
-| **`fm907`** | **杭州潮流音乐电台**，`https://lhttp-hw.qtfm.cn/live/15318146/64k.mp3`，图标 `fm907.png` | **FM90.7** |
-| `broken` | 故意写一个不存在的文件 → 应被隐藏 | — |
+| `tiehen` | local OGG | FM105.7 |
+| `testaudio` | local OGG | (empty -> NETWORK) |
+| `qtfm` | Qingting FM network station | (empty -> NETWORK) |
+| **`fm907`** | **Hangzhou Pop Music Radio**, `https://lhttp-hw.qtfm.cn/live/15318146/64k.mp3`, icon `fm907.png` | **FM90.7** |
+| `broken` | deliberately points at a nonexistent file -> should be hidden | - |
 
-新流已实测可用：HTTP 200、`audio/mpeg`、`icy-metaint=16000`。
+The new stream has been measured working: HTTP 200, `audio/mpeg`, `icy-metaint=16000`.
 
-#### Q. 第七轮：文字闪烁根因 / rate 被滚动条遮挡 / 右键交互
+#### Q. Round 7: root cause of text flicker / rate hidden by the scrollbar / right-click interaction
 
-##### 1. NOSIGNAL 文字闪烁（**根因已定位，不是偶发**）
+##### 1. NOSIGNAL text flicker (**root cause found, not intermittent**)
 
-用户反馈"文字还是会闪"。查 `run/logs/latest.log` 得到决定性证据：
-**「音频已恢复」打印了 119 次，而「音频订阅失败」是 0 次** —— 故障是在<b>本地</b>被反复点亮/清除的。
+The user reported "the text still flickers". Checking `run/logs/latest.log` gave decisive evidence:
+**"audio recovered" was printed 119 times, while "audio subscription failed" was 0** - the fault was being lit and cleared repeatedly on the <b>local</b> side.
 
-两个独立缺陷叠在一起：
+Two independent defects stacked together:
 
-| # | 缺陷 | 后果 |
+| # | Defect | Consequence |
 |---|---|---|
-| 1 | `clearClientFaultOnResume` 里清完故障后**没把 `faultShown` 置回 false** | 那道"要不要排队"的门永远开着 → **每来一个音频块就重复清一次、重复打一条日志**（实测每 0.25s 一条）|
-| 2 | 客户端进世界时**从不请求电台列表**（只在打开 GUI 时请求） | 不碰界面的玩家 `ClientRadioData.stations()` 永远为空 → 我上一轮加的"未知频道"判定把<b>所有</b>频道都判成未知 → 每 0.5s 点亮一次，数据到了又清 → 闪 |
+| 1 | `clearClientFaultOnResume` **does not set `faultShown` back to false** after clearing the fault | that "should I queue" gate stays open forever -> **every incoming audio chunk clears again and logs another line** (measured: one line every 0.25s) |
+| 2 | The client **never requests the station list** when entering a world (it only requests it when the GUI opens) | a player who never touches the UI has a permanently empty `ClientRadioData.stations()` -> the "unknown channel" check I added last round classifies <b>every</b> channel as unknown -> lit every 0.5s, cleared again when data arrives -> flicker |
 
-修复：
-- `clearClientFaultOnResume` 显式 `faultShown = false`
-- `AudioLifecycleHooks` JOIN 时主动 `requestStations()`
-- 两道保险：`AutoSubscriber` 与 `ClientRadioNetwork.displayStatusFor` 都加
-  **`ClientRadioData.isLoaded()` 前置判断**，列表未到绝不判"未知"
+Fixes:
+- `clearClientFaultOnResume` explicitly sets `faultShown = false`
+- `AudioLifecycleHooks` actively calls `requestStations()` on JOIN
+- Two safety nets: both `AutoSubscriber` and `ClientRadioNetwork.displayStatusFor` get a
+  **`ClientRadioData.isLoaded()` precondition**, so "unknown" is never judged before the list arrives
 
-> 教训与第十二节同型：**「未知」和「还不知道」是两件事**。
-> 把"列表还没加载"当成"频道不存在"，就会在每次轮询里制造一次假故障。
+> Lesson, same shape as section 12: **"unknown" and "not known yet" are two different things**.
+> Treating "the list has not loaded" as "the channel does not exist" manufactures a fake fault on every poll.
 
-##### 2. rate 文字不显示
+##### 2. rate text not displayed
 
-右边界原本写成 `listRight - 8`，而滚动条区间是 `[listRight-5, listRight]`——
-短文案（如 `NETWORK`）的右端正好被压在滚动条下面。
-改为 `listRight - SCROLLBAR_WIDTH - 4`，并保证即使名字预算被压到 0 也照画 rate。
+The right edge was written as `listRight - 8`, while the scrollbar occupies `[listRight-5, listRight]` -
+so the right end of short text (e.g. `NETWORK`) sat right under the scrollbar.
+Changed to `listRight - SCROLLBAR_WIDTH - 4`, and the rate is drawn even when the name budget is squeezed to 0.
 
-##### 3. 右键交互：手持其它物品不触发
+##### 3. Right-click interaction: does not trigger while holding another item
 
-`RadioBlock#use` 新增 `isInteractionItem()`：只有**空手**或**拿着收音机物品**才打开界面，
-其余一律返回 `PASS` —— **拿方块右键能正常放置**、拿工具/食物正常作用，不被收音机截走。
+`RadioBlock#use` gained `isInteractionItem()`: the UI opens only with an <b>empty hand</b> or when <b>holding the radio item</b>;
+everything else returns `PASS` - **right-clicking with a block still places it normally**, tools/food work normally, nothing is stolen by the radio.
 
-同时修了一个只在服务端发生的隐藏 bug：原实现服务端返回 `PASS`，
-于是服务端会继续走 `ItemStack#useOn`，**拿着收音机物品右键收音机时会在服务端凭空放置一个方块**，
-而客户端已经弹出了界面。改为服务端返回 `SUCCESS` 吃掉交互（界面仍只在客户端打开）。
+It also fixed a hidden bug that only occurred on the server: the original implementation returned `PASS` on the server,
+so the server continued into `ItemStack#useOn`, and **right-clicking the radio while holding the radio item would conjure a block on the server**
+while the client had already opened the UI. Now the server returns `SUCCESS` and consumes the interaction (the UI still only opens on the client).
 
-> 交互矩阵：
+> Interaction matrix:
 >
-> | 手持 | 客户端 | 服务端 | 结果 |
+> | Held item | Client | Server | Result |
 > |---|---|---|---|
-> | 空手 | SUCCESS | SUCCESS | 打开界面 |
-> | 方块 / 工具 / 食物 | PASS | PASS | **正常走原版** |
-> | 收音机物品 | SUCCESS | SUCCESS | 打开界面，且不偷放方块 |
+> | Empty hand | SUCCESS | SUCCESS | opens the UI |
+> | Block / tool / food | PASS | PASS | **falls through to vanilla** |
+> | Radio item | SUCCESS | SUCCESS | opens the UI and does not secretly place a block |
 
-#### R. 第八轮：液晶屏显示 rate / 拆方块噪音 / 缓冲变薄预警
+#### R. Round 8: LCD shows rate / block-break noise / thin-buffer warning
 
-##### 1. `rate` 显示在<b>方块液晶屏</b>上（此前一直理解错位置）
+##### 1. `rate` shown on the <b>block's LCD</b> (the position had been misunderstood all along)
 
-前几轮把 `rate` 做到了**选台 GUI 的列表右侧**，用户反馈"不显示"——
-实际是**位置理解错了**：要求的是**方块液晶屏**上显示。
+Earlier rounds put `rate` on the <b>right side of the tuning GUI list</b>, and the user said "it doesn't show" -
+in fact the **position was misunderstood**: the requirement was to show it on the **block's LCD**.
 
-- 正常播放：液晶屏写该频道的 `displayRate()`（如 `FM90.7`，未配置则 `NETWORK`）
-- 故障：仍写 `NOSIGNAL`
-- 两者共用新抽出的 `drawLcdText()`，避免各写一份又只修好一边
-- `shouldRender()` 原来 `return fault != OK`，正常播放时**完全不画**——
-  必须改成 `return true`，否则屏幕上的频率永远看不到
-- 字号改为**按宽度自适应**：短文案放大、长文案缩小，上下限夹住
+- Normal playback: the LCD writes that channel's `displayRate()` (e.g. `FM90.7`, or `NETWORK` if unset)
+- Fault: still writes `NOSIGNAL`
+- Both share the newly extracted `drawLcdText()`, so we do not write two copies and fix only one side
+- `shouldRender()` used to `return fault != OK`, which <b>draws nothing at all</b> during normal playback -
+  it had to become `return true`, otherwise the frequency on screen would never be visible
+- Font size now **adapts to width**: short strings grow, long strings shrink, clamped at both ends
 
-##### 2. 拆方块有噪音
+##### 2. Noise when breaking the block
 
-两个叠加缺陷：
+Two overlapping defects:
 
-| # | 缺陷 | 修复 |
+| # | Defect | Fix |
 |---|---|---|
-| 1 | `silenceIfNoSources()` 只清 `tuningNoiseBlock`，**漏了网络底噪的锚点与增益**。拆方块时若 `STREAMS` 已空，会走这条路径 → 方块没了底噪还在响 | 一并清 `networkNoiseBlock`、复位 `networkNoise` 与全部计数 |
-| 2 | 拆方块的几个 tick 里，服务端先停推送 → `stale` 变 true，但方块实体还没移除 → 误判链路故障并点亮底噪 | 故障判定加「方块实体是否还在」前置检查 |
+| 1 | `silenceIfNoSources()` only clears `tuningNoiseBlock`, **missing the network noise floor's anchor and gain**. When breaking a block with `STREAMS` already empty this path runs -> the block is gone but the noise floor keeps sounding | clear `networkNoiseBlock` as well, reset `networkNoise` and all counters |
+| 2 | During the few ticks it takes to break the block, the server stops pushing first -> `stale` becomes true, but the block entity is not removed yet -> a link fault is misjudged and the noise floor lights up | the fault check gains a "does the block entity still exist" precondition |
 
-##### 3. 缓冲层薄时的底噪（用户要求：含切台、断网恢复）
+##### 3. Noise floor when the buffer runs thin (user requirement: including station switching and network recovery)
 
-新增 `isBufferThinning()`。**关键是不能重蹈 HANDOVER 第八节 C 的 v1 覆辙**：
-v1 用「相对配置目标的水位」判断，而直播流稳态固定在起播水位（300ms vs 目标 1000ms），
-于是永久 40% 不消失。
+Added `isBufferThinning()`. **The key is not to repeat the v1 mistake from section 8, item C**:
+v1 judged by "water level relative to the configured target", but a live stream settles at the startup water level (300ms vs a 1000ms target),
+so it sat at a permanent 40% that never went away.
 
-现行判据（两者取或）：
+Current predicates (either one triggers):
 
-| 判据 | 含义 | 阈值 |
+| Predicate | Meaning | Threshold |
 |---|---|---|
-| **相对自己的稳态变薄** | "网络在变差"的定义，与绝对水位无关 | 低于稳态 55% |
-| **绝对深度过薄** | 一层随时会断的薄缓冲 | 低于起播门槛 70% |
+| **Thinner relative to its own steady state** | the definition of "the network is getting worse", independent of the absolute level | below 55% of steady state |
+| **Absolutely too thin** | a thin buffer that can break at any moment | below 70% of the startup threshold |
 
-稳态基线的更新规则：**变厚立即跟随、变薄缓慢下移（1/1024）**。
-衰减必须比真实下降慢得多，否则基线会"吸收"掉下降、永不报警
-（实测 1/256 的半衰期 3.5 秒，比一次真实掉水还快，已改成约 14 秒）。
+Steady-state baseline update rule: **follow immediately when it grows thicker, drift down slowly when it gets thinner (1/1024)**.
+The decay must be much slower than a real drop, otherwise the baseline would "absorb" the drop and never alarm
+(measured: a 1/256 decay has a 3.5s half-life, faster than a real drain, so it was changed to about 14s).
 
-模拟验证（600 块）：
+Simulation verification (600 chunks):
 
-| 场景 | 触发块数 |
+| Scenario | Chunks triggered |
 |---|---|
-| 直播稳态 300ms | **0** |
-| 直播 300ms + 抖动 ±25% | **0** |
-| 本地稳态 1000ms | **0** |
-| 本地 1000ms 骤降到 400ms | 329 ✅ |
-| 匀速 300ms 降到 120ms | 455 ✅ |
+| Live steady state 300ms | **0** |
+| Live 300ms + jitter +-25% | **0** |
+| Local steady state 1000ms | **0** |
+| Local 1000ms drops abruptly to 400ms | 329 ✅ |
+| Constant rate 300ms drops to 120ms | 455 ✅ |
 
-> 正常场景全部零误报，异常场景都能检出。
+> Zero false positives in all normal scenarios, and every abnormal scenario is detected.
 
-#### S. 第九轮：选择框（不是碰撞箱）
+#### S. Round 9: selection box (not collision box)
 
-用户要求"调节下碰撞箱"，澄清后确认是**选择框**（射线高亮的轮廓），**不是实体碰撞**，
-且**天线可以不加**。
+The user asked to "adjust the collision box"; after clarification it was confirmed to be the **selection box** (the ray-traced highlight outline), **not entity collision**,
+and **the antenna may be left out**.
 
-1.20.1 里两者是独立的：
+In 1.20.1 the two are independent:
 
-| 方法 | 作用 | 本轮处理 |
+| Method | Purpose | This round |
 |---|---|---|
-| `getShape` | **选择框**：鼠标指上去的轮廓、射线命中范围 | **新增**，取机身几何 |
-| `getCollisionShape` | 实体碰撞：玩家/生物/掉落物能否穿过 | **保持空**（与火把同类，可穿过） |
+| `getShape` | **selection box**: the outline when hovering, the ray-hit range | **added**, using the body geometry |
+| `getCollisionShape` | entity collision: whether players/mobs/dropped items can pass through | **kept empty** (same category as torches, passable) |
 
-- 形状 = 模型主箱体 `x=3..13, y=0..6, z=7..9`，**不含天线**
-- 按 `180 - toYRot()` 旋转（与渲染层同一套角度，否则会"看得见点不到"）
-- **必须显式保留 `getCollisionShape = Shapes.empty()`**：
-  1.20.1 默认实现回落到 `getShape`，不写就会让玩家撞在薄片上走不过去
+- Shape = the model's main box `x=3..13, y=0..6, z=7..9`, **excluding the antenna**
+- Rotated by `180 - toYRot()` (the same angle set as the render layer, otherwise you can "see it but cannot click it")
+- **`getCollisionShape = Shapes.empty()` must be kept explicitly**:
+  the 1.20.1 default implementation falls back to `getShape`, and if you omit it, players will collide with a thin sheet and cannot walk through
 
-> 坑：1.20.1 的 `Shapes` **没有**公开的旋转方法（只有 box/or/join/getFaceShape），
-> `VoxelShape` 也只有 `move`。这里手写绕 Y 轴 90° 倍数换轴：`(x,z) -> (z, 1-x)`。
+> Pitfall: 1.20.1's `Shapes` has **no** public rotation method (only box/or/join/getFaceShape),
+> and `VoxelShape` only has `move`. So the axis swap for 90-degree multiples around Y is written by hand: `(x,z) -> (z, 1-x)`.
 
-### 配置文件位置（常被问）
+### Where the config lives (frequently asked)
 
-| 文件 | 路径 | 说明 |
+| File | Path | Notes |
 |---|---|---|
-| **电台配置** | `<世界存档>/serverconfig/radio-smile/stations.json` | 开发环境：`run/saves/<存档名>/serverconfig/radio-smile/` |
-| 音频文件 | 同上 `audio/` | 单文件或目录（播放列表） |
-| 电台图标 | 同上 `icons/` | |
-| 转码缓存 | 同上 `cache/baked/` | ffmpeg 产物，可安全删除 |
-| **客户端配置** | `run/config/radio-smile-client.json` | 只在客户端；也可用 ModMenu 界面改 |
+| **Station config** | `<world save>/serverconfig/radio-smile/stations.json` | dev environment: `run/saves/<save name>/serverconfig/radio-smile/` |
+| Audio files | `audio/` in the same place | single file or a directory (playlist) |
+| Station icons | `icons/` in the same place | |
+| Transcode cache | `cache/baked/` in the same place | ffmpeg output, safe to delete |
+| **Client config** | `run/config/radio-smile-client.json` | client only; can also be edited in the ModMenu UI |
 
-> 注意 `stations.json` 是**按存档**存的（不是全局 `run/config/`），
-> 换存档就要在新存档的 `serverconfig` 下重新配置。
+> Note that `stations.json` is stored **per save** (not globally in `run/config/`),
+> so switching saves means reconfiguring under the new save's `serverconfig`.
 
-#### T. 第十轮：配置迁到 config / txt 重定向播放列表 / 轻量哈希
+#### T. Round 10: config moved to config / txt redirect playlists / lightweight hash
 
-##### 1. 电台配置迁移到全局 `config/`
+##### 1. Station config moved to the global `config/`
 
-| | 旧路径 | 新路径 |
+| | Old path | New path |
 |---|---|---|
-| 电台配置 | `<存档>/serverconfig/radio-smile/` | **`config/radio-smile/`** |
+| Station config | `<save>/serverconfig/radio-smile/` | **`config/radio-smile/`** |
 
-理由：旧路径**按存档隔离**，换存档/开新世界就要把几十 MB 音频重配一遍。
-新位置全局唯一，与 `config/radio-smile-client.json` 同级。
+Reason: the old path was **isolated per save**, so switching saves or starting a new world meant reconfiguring tens of MB of audio.
+The new location is globally unique and sits next to `config/radio-smile-client.json`.
 
-**旧位置自动迁移**：新位置还没有 `stations.json` 而旧位置有时，
-首次加载整棵目录复制过来（含 audio/ icons/，因为配置里都是相对路径）。
+**Automatic migration from the old location**: if the new location has no `stations.json` yet and the old one does,
+the whole directory tree is copied over on first load (including audio/ and icons/, because the config uses relative paths throughout).
 
-##### 2. txt 重定向播放列表
+##### 2. txt redirect playlists
 
-`file` 字段可以指向一个 `.txt`（也支持 `.list` / `.m3u` / `.m3u8`）：
+The `file` field may point at a `.txt` (also `.list` / `.m3u` / `.m3u8`):
 
 ```
-# 第一行是模式（可省略，默认 sequence）
+# first line is the mode (optional, defaults to sequence)
 sequence
 song_a.mp3
 folder/song_b.ogg
 https://example.com/song.mp3
 ```
 
-- 模式：`sequence`/`order`/`loop`（顺序）、`random`/`shuffle`（固定 seed 打乱）
-- **播放顺序 = txt 行从上到下**（用户明确要求）
-- 空行与 `#` 开头的行忽略；支持行尾注释（`#` 前有空白才算，避免误伤 URL 里的 `#`）
+- Modes: `sequence`/`order`/`loop` (in order), `random`/`shuffle` (shuffled with a fixed seed)
+- **Play order = txt lines top to bottom** (explicit user requirement)
+- Blank lines and lines starting with `#` are ignored; trailing comments are supported (only when there is whitespace before the `#`, so a `#` inside a URL is not harmed)
 
-##### 3. 播放顺序 = txt 行从上到下（**不要做分桶/排序**）
+##### 3. Play order = txt lines top to bottom (**do not bucket or sort**)
 
-未缓存好的网络条目处于**挂起**状态：它们**不进入**可播列表，
-所以「播放到那一行就自动跳过」是天然成立的，播放层不需要任何额外判断。
-后台下载完成后，它们会自己并入可播列表。
+Uncached network entries are in a **pending** state: they **do not enter** the playable list,
+so "skip automatically when playback reaches that line" holds naturally, and the playback layer needs no extra check.
+Once background downloads finish, they merge into the playable list on their own.
 
-> ⚠️ **不要重新引入"优先级分桶"**。曾实现过「本地 > 已缓存网络 > 未缓存网络」
-> 的三级优先级，意图是"先播能播的"，但它会**打乱按行顺序**——
-> 而用户明确要求"顺序播放就是按 txt 行从上到下"，混播（本地/网络交替）时尤其不能乱。
-> 挂起跳过本身已解决"未缓存不卡住播放"，排序是多余的且有害。
+> ⚠️ **Do not reintroduce "priority bucketing"**. A three-tier priority of "local > cached network > uncached network" was implemented once,
+> with the intent of "play what is playable first", but it **scrambles the line order** -
+> and the user explicitly requires "sequential playback means top to bottom of the txt lines", which must not be disturbed especially in mixed playlists (local/network alternating).
+> Pending-skip already solves "uncached entries must not block playback"; sorting is redundant and harmful.
 >
-> 实测（A/网络/B/网络/C 混排）：可播条目 = A、B、C，顺序保持原样。
+> Measured (mixed A/network/B/network/C): playable entries = A, B, C, order preserved.
 
-##### 3b. 网络地址：缓存到本地 + 转 MP3
+##### 3b. Network addresses: cache locally + transcode to MP3
 
-`RemoteAudioCache` 负责：下载 → 存到 `cache/remote/` → 交给 `AudioTranscoder` 转 MP3。
-之后与普通本地音频**完全一样**地参与时间轴——这样架构里不需要第二条播放路径
-（直播流不可 seek、没有时长，混进列表会破坏多人同步）。
+`RemoteAudioCache` handles: download -> store in `cache/remote/` -> hand to `AudioTranscoder` to convert to MP3.
+After that they participate in the timeline **exactly like** ordinary local audio - so the architecture needs no second playback path
+(live streams cannot seek and have no duration; mixing them into the list would break multiplayer synchronization).
 
-**校验包（proof）**：另存一份 `<id>.proof`，内容是**前 8KB + 文件总大小**。
-下次校验只需 Range 请求取头部几 KB 比对，不必重新下载整个文件。
+**Proof file**: also stores `<id>.proof`, containing the **first 8KB + total file size**.
+The next validation only needs a Range request for the first few KB to compare; no need to re-download the whole file.
 
-##### 4. 挂起机制 + 流式自动注释
+##### 4. Pending mechanism + automatic streaming annotation
 
-- **未缓存网络条目 → 挂起**：不在可播列表里，播放到那行**直接跳到下一首**
-- 后台单线程串行下载，下完清解析缓存，下一轮自然并入
-- **流式传输（无限流）自动注释**：检测到没有 `Content-Length`（或超过 512MB 上限）时，
-  直接在 txt 里把那一行改成
-  `# [已禁用：流式传输，无法缓存] https://...`
-  —— 服主打开文件就能看到原因，不用翻日志
+- **Uncached network entry -> pending**: not in the playable list; playback **jumps straight to the next track**
+- Background downloads run serially on a single thread; when done the parse cache is cleared and the entry merges in naturally on the next round
+- **Automatic annotation of streaming (infinite) transfers**: when `Content-Length` is missing (or exceeds the 512MB cap),
+  that line in the txt is rewritten in place to
+  `# [disabled: streaming transfer, cannot be cached] https://...`
+  - the server owner opens the file and sees the reason without digging through logs
 
-> ⚠️ 直播流（如 `lhttp-hw.qtfm.cn/live/...`）**不能**写进 txt：
-> 它没有文件长度、永远下载不完。直播流应当直接配成频道的 `file`（走 `StreamAudioSource`）。
+> ⚠️ Live streams (e.g. `lhttp-hw.qtfm.cn/live/...`) **must not** be written into a txt:
+> they have no file length and never finish downloading. A live stream should be configured directly as a channel's `file` (going through `StreamAudioSource`).
 
-##### 5. 轻量哈希（节省算力）
+##### 5. Lightweight hash (saves CPU)
 
-缓存校验从「整文件 SHA-256」改为 `quickHash()` = **前 64KB + 文件大小**：
+Cache validation changed from "whole-file SHA-256" to `quickHash()` = **first 64KB + file size**:
 
-- 20MB 文件从 ~50ms 降到 ~0.1ms
-- 每次 `/reload` 都要对所有文件重算，累积起来很可观
-- `AudioTranscoder.cacheKey()` **同步改用同一函数**——两处不一致会导致
-  "校验认为没变、但缓存键变了"，表现为每次启动都重新转码却始终不命中缓存
+- A 20MB file goes from ~50ms to ~0.1ms
+- Every `/reload` recomputes it for all files, and that adds up
+- `AudioTranscoder.cacheKey()` **now uses the same function** - a mismatch between the two produces
+  "validation thinks nothing changed, but the cache key changed", which shows up as re-transcoding on every startup with a cache that never hits
 
-#### U. 第十一轮：真实网络链接适配（B 站 .m4s / 网易云 .mp3）
+#### U. Round 11: adapting to real network links (Bilibili .m4s / NetEase .mp3)
 
-用用户提供的真实链接实测，发现并修掉 5 个缺陷：
+Tested with real links supplied by the user; 5 defects were found and fixed:
 
-| # | 缺陷 | 修复 |
+| # | Defect | Fix |
 |---|---|---|
-| 1 | `.m4s` 不在转码白名单 → B 站链接直接被跳过 | 白名单加入 `m4s/mp4/mkv/webm`。**实测 .m4s 是 MP4/ISO-BMFF 容器**（magic `ftypiso5`，音轨 AAC 48kHz 立体声），ffmpeg 能正常提取 |
-| 2 | Content-Type 不可信：B 站代理把 .m4s 标成 `audio/mpeg` | 不依赖响应头判格式，只看扩展名 + 交给 ffmpeg |
-| 3 | 无扩展名 URL 下载成 `.bin` 后永远转不了码 | 新增**魔数嗅探** `sniffAndRename`：按文件头识别 mp3/ogg/flac/wav/m4a 并改名 |
-| 4 | **临时签名链接过期后缓存被误丢** | 关键取舍：**拿不到校验证明 ≠ 文件变了**。请求失败/不返回 206 时**继续信任已有缓存**（本地文件是完整的），只有"拿到新头部却对不上"才判失效 |
-| 5 | 解析阶段每条网络地址等 1 秒做 Range 校验 | 解析只查本地存在性（`verify=false`），有效性校验带 **10 分钟 TTL 缓存**。实测 **4477ms → 216ms（20 倍）** |
+| 1 | `.m4s` was not on the transcode whitelist -> Bilibili links were skipped outright | added `m4s/mp4/mkv/webm` to the whitelist. **Measured: .m4s is an MP4/ISO-BMFF container** (magic `ftypiso5`, AAC 48kHz stereo audio track), and ffmpeg extracts it fine |
+| 2 | Content-Type is untrustworthy: Bilibili's proxy labels .m4s as `audio/mpeg` | do not judge format from response headers, use the extension only and let ffmpeg decide |
+| 3 | An extension-less URL downloads as `.bin` and can never be transcoded | added **magic-number sniffing** `sniffAndRename`: identify mp3/ogg/flac/wav/m4a from the file header and rename |
+| 4 | **The cache was wrongly discarded after a temporary signed link expired** | key trade-off: **no proof available != the file changed**. On request failure / no 206, **keep trusting the existing cache** (the local file is complete); only "got a new header and it does not match" counts as invalid |
+| 5 | The parse stage waited 1 second per network address for a Range check | parsing only checks local existence (`verify=false`); validity checks carry a **10-minute TTL cache**. Measured **4477ms -> 216ms (20x)** |
 
-##### 实测结果（真实链接）
+##### Measured results (real links)
 
-| 链接 | 结果 |
+| Link | Result |
 |---|---|
-| 网易云 .mp3（6.8MB） | 下载 1.8s，原生 MP3 无需转码，二次命中 **24ms** |
-| B 站 .m4s（4.5MB） | 下载 12.4s，识别为 `.m4s`，转出 **3分11秒** MP3 |
-| 校验包 | 每个 8200 字节（8KB 头部 + 8 字节长度） |
+| NetEase .mp3 (6.8MB) | downloaded in 1.8s, native MP3 needs no transcode, second hit **24ms** |
+| Bilibili .m4s (4.5MB) | downloaded in 12.4s, identified as `.m4s`, produced a **3:11** MP3 |
+| Proof file | 8200 bytes each (8KB header + 8 bytes length) |
 
-##### 测试配置
+##### Test config
 
-`run/config/radio-smile/audio/realtest.txt`：
+`run/config/radio-smile/audio/realtest.txt`:
 
 ```
 sequence
-test_station.ogg          # 本地
-https://.../xxx.mp3       # 网易云
-https://.../xxx.m4s       # B站（m4s）
+test_station.ogg          # local
+https://.../xxx.mp3       # NetEase
+https://.../xxx.m4s       # Bilibili (m4s)
 https://.../yyy.mp3
 https://.../yyy.m4s
 ```
 
-调 `realtest` 频道即可验证：前 4 个已缓存立即可播，未缓存的挂起并后台下载。
+Switch to the `realtest` channel to verify: the first 4 are cached and play immediately, uncached ones are pending and download in the background.
 
-> ⚠️ **B 站链接带 `deadline` 参数，约 2 小时后失效**。失效后再校验会走"拿不到证明 → 沿用缓存"分支，
-> 已下载的文件仍能正常播放。但要重新下载就必须换新链接。
+> ⚠️ **Bilibili links carry a `deadline` parameter and expire after about 2 hours**. After expiry, validation goes down the "no proof -> use the cache" branch,
+> and already-downloaded files still play fine. Re-downloading, however, requires a fresh link.
 
-#### V. 第十二轮：修复「时序完全乱」+ 模式写法放宽
+#### V. Round 12: fixing "the timeline is completely scrambled" + looser mode syntax
 
-##### 1. 时序错乱的根因（**这是本轮最重要的一条**）
+##### 1. Root cause of the scrambled timeline (**the most important item this round**)
 
-现象：接入网络链接后，播放列表的切换时机与界面/时间轴完全对不上。
+Symptom: after hooking up network links, playlist switching times no longer matched the UI/timeline at all.
 
-根因是一条**三段式连锁**，每一段单独看都"合理"：
+The root cause is a **three-stage chain**, and each stage looks "reasonable" on its own:
 
-| 阶段 | 发生了什么 |
+| Stage | What happened |
 |---|---|
-| ① | `load()` 时 txt 里的网络条目处于**挂起**（还没下载），预热只处理了本地文件 |
-| ② | 后台下载完成后**只清了 txt 解析缓存，没有触发转码** —— 没有任何东西会再跑一次预热 |
-| ③ | 于是 `resolveTracks()` 拿到的是未转码的 `.m4s`。而 `AudioDuration` **只认 MP3 帧** → 时长 -1 → 兜底成 **1ms** |
+| (1) | At `load()` the network entries in the txt are **pending** (not downloaded yet); preheating only handled local files |
+| (2) | When the background download finished it **only cleared the txt parse cache and did not trigger transcoding** - nothing would ever run preheating again |
+| (3) | So `resolveTracks()` got untranscoded `.m4s`. And `AudioDuration` **only recognizes MP3 frames** -> duration -1 -> falls back to **1ms** |
 
-**1ms 的曲目会把它之后所有曲目的起点全部往前拉**，于是"第几轮第几首第几毫秒"的定位与真实播放彻底脱节。
-同时 `PlaylistAudioSource.openTrack()` 拒绝非 MP3，运行时又反复跳曲——两个错误叠加，表现就是"时序完全乱"。
+**A 1ms track pulls the start point of every following track forward**, so "round N, track M, millisecond K" positioning completely diverges from real playback.
+At the same time `PlaylistAudioSource.openTrack()` rejects non-MP3 and skips tracks repeatedly at runtime - the two errors compound, which is exactly the "completely scrambled timeline".
 
-修复（三处，缺一不可）：
+Fixes (three places, all required):
 
-1. **下载完成后立即转码**（`RemoteAudioCache`）：`AudioTranscoder.preheat(List.of(local))`
-2. **txt 解析优先返回转码产物**（`TxtPlaylist`）：`mp3For(cached)`
-3. **时间轴只接受 MP3**（`PlaylistTimeline.of`）：非 MP3 直接剔除并告警，**绝不让它进时间轴**。
-   这是防线的最后一层——即使前两步失败，也不会再产出错位的时间轴。
+1. **Transcode immediately after download** (`RemoteAudioCache`): `AudioTranscoder.preheat(List.of(local))`
+2. **Return the transcoded artifact first when parsing the txt** (`TxtPlaylist`): `mp3For(cached)`
+3. **The timeline only accepts MP3** (`PlaylistTimeline.of`): drop non-MP3 with a warning, **never let it into the timeline**.
+   This is the last line of defense - even if the first two fail, a misaligned timeline can no longer be produced.
 
-> `durationOf()` 的告警文案也从"将按 1ms 处理"改成明确的错误，
-> 因为这个兜底本身就是错乱源，不该被当成正常路径。
+> `durationOf()`'s warning text also changed from "will be treated as 1ms" to an explicit error,
+> because this fallback is itself the source of the scrambling and should not be treated as a normal path.
 
-##### 实测验证
+##### Measured verification
 
-| 项 | 修复前 | 修复后 |
+| Item | Before | After |
 |---|---|---|
-| `.m4s` 转码 | 未转码，被时间轴吞掉 | 2 个全部转出 MP3 |
-| 各曲时长 | `.m4s` = **1ms** | 139920 / 191088 / 839664 / 1272744 ms |
-| 时间轴 | 起点全部错位 | 5 首 / 每轮 **1527.1 秒** |
-| 定位抽查 | 对不上 | 时刻 1526149ms → 第 5 首 138920ms，**恰好等于该曲真实时长** |
+| `.m4s` transcode | not transcoded, swallowed by the timeline | both transcoded to MP3 |
+| Per-track duration | `.m4s` = **1ms** | 139920 / 191088 / 839664 / 1272744 ms |
+| Timeline | All start points misaligned | 5 tracks / **1527.1 seconds** per round |
+| Spot-check seek | Does not line up | Time 1526149ms → track 5 at 138920ms, **exactly that track's real duration** |
 
-##### 2. mode 写法放宽（用户要求）
+##### 2. Looser mode syntax (user request)
 
-`mode` 现在接受多组同义写法：
+`mode` now accepts several groups of synonymous spellings:
 
-| 语义 | 可用写法 |
+| Meaning | Accepted spellings |
 |---|---|
-| **单曲循环** | `block` / `single` / `false` / `0` |
-| **列表循环** | `sequence` / `order` / `loop` / `true` / `1` |
-| **随机播放** | `random` / `shuffle` |
+| **Single-track loop** | `block` / `single` / `false` / `0` |
+| **Playlist loop** | `sequence` / `order` / `loop` / `true` / `1` |
+| **Shuffle** | `random` / `shuffle` |
 
-大小写不敏感、忽略首尾空白；**空值等同未配置**（单曲循环）。
+Case-insensitive, leading/trailing whitespace ignored; **an empty value is the same as unconfigured** (single-track loop).
 
-> `true`/`1` 映射到**列表循环**而不是随机——读 `true` 时最自然的理解是"按列表循环"。
-> 随机是不可猜的语义，必须写 `random`。
+> `true`/`1` maps to **playlist loop**, not shuffle — the most natural reading of `true` is "loop the list".
+> Shuffle is not a guessable meaning, so it must be written as `random`.
 
-##### 3. 默认示例配置重写
+##### 3. Rewritten default example config
 
-生成的 `stations.json` 现在自带 `_说明_*` 字段（播放模式/rate/txt/示例），
-5 个示例条目分别标注：单曲循环、列表循环、随机、txt 播放列表、网络直播流。
-同时生成 `example/mylist.txt` 作为 txt 格式参考。
+The generated `stations.json` now ships with built-in note fields (play mode / rate / txt / example),
+and the 5 example entries are each annotated: single-track loop, playlist loop, shuffle, txt playlist, live network stream.
+It also generates `example/mylist.txt` as a txt format reference.
 
-另外关闭了 Gson 的 HTML 转义（`disableHtmlEscaping`）：
-否则配置文件里会出现 `mode\u003dblock` 这种转义，完全没法一眼看懂。
+Gson's HTML escaping was also turned off (`disableHtmlEscaping`):
+otherwise the config file would contain escapes like `mode\u003dblock`, which are impossible to read at a glance.
 
-#### W. 第十三轮：配速根因修复（丢一半包）+ 音量步进 + txt 布尔开关
+#### W. Round 13: root cause of the pacing bug (dropping half the packets) + volume step + txt boolean switch
 
-##### 1. 「丢一半包、剩下的是噪音」——配速换算根因
+##### 1. "Half the packets dropped, the rest is noise" — root cause in the pacing conversion
 
-用户描述「一长串音频有规律地少了一半，后面的接上来」「丢的那一半变成噪音」。
-从录屏音频频谱量化出决定性证据：
+The user described it as "a long stretch of audio regularly missing half, with the rest spliced on" and "the dropped half turns into noise".
+Quantifying the spectrogram of a screen recording produced decisive evidence:
 
-| 测量项 | 数值 | 对应 |
+| Measurement | Value | Corresponds to |
 |---|---|---|
-| 周期性断续 | **3.01 秒** | 客户端缓冲上限 **3.000 秒** |
-| 高频爆发占空比 | **49.6%** | 约一半数据被丢弃 |
-| 波形自相关 | ≈0.003 | 拼接而非重复播放 |
-| 数字全零段 | **0** | 不是断流，是 `dropFront` 丢最旧数据 |
+| Periodic dropout | **3.01 seconds** | Client buffer cap of **3.000 seconds** |
+| High-frequency burst duty cycle | **49.6%** | About half the data is dropped |
+| Waveform autocorrelation | ~0.003 | Spliced, not replayed |
+| All-zero digital segments | **0** | Not a stream break; `dropFront` is dropping the oldest data |
 
-**根因**：`AudioSubscription.markSent()` 用
-`audioSentMillis = sentBytesFromStart * 1000 / bytesPerSecond` 做配速锚点，
-而播放列表的 `bytesPerSecond()` 返回的是**整条列表平均码率**（172.8 kbps），
-但列表里混着 128 kbps 与 320 kbps：
+**Root cause**: `AudioSubscription.markSent()` uses
+`audioSentMillis = sentBytesFromStart * 1000 / bytesPerSecond` as the pacing anchor,
+but the playlist's `bytesPerSecond()` returns the **average bitrate of the whole list** (172.8 kbps),
+while the list mixes 128 kbps and 320 kbps tracks:
 
-| 曲目类型 | 配速误差 | 后果 |
+| Track type | Pacing error | Consequence |
 |---|---|---|
-| 320 kbps（网易云） | **+85%** | 发送≈1.85×实时 → 缓冲堆到 3 秒上限 → **丢弃最旧音频** |
-| 128 kbps（本地转码/B站 m4s） | **−26%** | 只发出 74% 数据 → 缓冲饿死 → **那段时间只剩噪音** |
+| 320 kbps (NetEase Cloud Music) | **+85%** | Sends ~1.85x real time → buffer piles up to the 3-second cap → **oldest audio dropped** |
+| 128 kbps (locally transcoded / Bilibili m4s) | **-26%** | Only 74% of the data is sent → buffer starves → **nothing but noise during that stretch** |
 
-修复（三处）：
-1. **锚点改为累加本块真实时长**：`audioSentMillis += intervalMs`。
-   `intervalMs` 由 `AudioDurationEstimator` 逐帧解析 MP3 帧头得出，
-   与码率字段是否准确**完全无关**。实测 4 个 mp3 的估算与真实时长偏差 **< 0.1%**。
-2. 首包锚点同步改用累加值，不再走字节换算。
-3. `PlaylistAudioSource.bytesPerSecond()` 改为返回**当前曲目**码率
-   （旧注释担心"换曲跳变"是对的，但解法错了：用平均值回避跳变，
-   代价是每首都配错速）。
-4. 客户端缓冲溢出时**打告警日志**（限流 5 秒一条）——
-   这个症状历史上完全没有日志，才会被反复误判成解码/网络问题。
+Fix (three places):
+1. **Anchor changed to accumulate each chunk's real duration**: `audioSentMillis += intervalMs`.
+   `intervalMs` comes from `AudioDurationEstimator` parsing MP3 frame headers frame by frame,
+   and is **completely independent** of whether the bitrate field is accurate. Measured on 4 mp3 files, the estimate deviates from the real duration by **< 0.1%**.
+2. The first-packet anchor also switched to the accumulated value, no longer using byte conversion.
+3. `PlaylistAudioSource.bytesPerSecond()` now returns the **current track's** bitrate
+   (the old comment's worry about "a jump when the track changes" was right, but the solution was wrong: averaging away the jump
+   meant every track got the wrong pacing).
+4. **Log a warning** when the client buffer overflows (rate-limited to one per 5 seconds) —
+   historically this symptom had no logging at all, which is why it kept being misdiagnosed as a decoding or network problem.
 
-##### 2. 音量步进改为 5%
+##### 2. Volume step changed to 5%
 
-`VOLUME_STEP_PERCENT = 5`（20 格），而不是之前的 `VOLUME_STEPS = 5`（5 格 = 每格 20%）。
-两个值含义完全不同，常量改名以避免再次误会。
+`VOLUME_STEP_PERCENT = 5` (20 steps), instead of the previous `VOLUME_STEPS = 5` (5 steps = 20% per step).
+The two values mean completely different things, so the constant was renamed to prevent another misunderstanding.
 
-##### 3. txt 第一行改为布尔开关（「打乱顺序」）
+##### 3. First line of txt changed to a boolean switch ("shuffle order")
 
 ```
-# 第一行：打乱顺序
-false          # 不打乱，严格按下面从上到下（默认，可整行省略）
-true           # 打乱顺序，所有玩家顺序一致
+# First line: shuffle order
+false          # do not shuffle, strictly top-to-bottom below (default, the whole line may be omitted)
+true           # shuffle order, same order for every player
 ```
 
-- 接受 `true/false`、`1/0`，大小写不敏感
-- **兼容旧写法**：`random/shuffle` → 打乱，`sequence/order/loop` → 不打乱
-- 第一行不是开关时按普通条目处理
+- Accepts `true/false`, `1/0`, case-insensitive
+- **Backward compatible with the old style**: `random/shuffle` → shuffle, `sequence/order/loop` → no shuffle
+- If the first line is not a switch, it is treated as a normal entry
 
-> 用户措辞：文档里叫「**打乱顺序**」，不叫"随机播放/列表播放"。
+> The user's wording: call it "**shuffle order**" in the docs, not "random playback / playlist playback".
 
-#### X. 第十四轮：ffmpeg 路径可配置
+#### X. Round 14: configurable ffmpeg path
 
-`stations.json` **顶层**（频道列表之外）新增 `ffmpeg` 字段：
+A `ffmpeg` field was added at the **top level** of `stations.json` (outside the station list):
 
 ```json
 {
@@ -1190,130 +1212,130 @@ true           # 打乱顺序，所有玩家顺序一致
 }
 ```
 
-用于 ffmpeg 不在 PATH 的服务器（自建容器、精简系统、多版本共存需指定某一份构建）。
+For servers where ffmpeg is not on PATH (self-hosted containers, stripped-down systems, or several versions coexisting where one specific build must be picked).
 
-| 配置值 | 行为 |
+| Configured value | Behavior |
 |---|---|
-| 字段缺失 / 空串 | 用 PATH 里的 `ffmpeg`（默认，不打扰既有部署） |
-| 有效路径 | 采用，日志确认「已按配置指定 ffmpeg」 |
-| 路径不存在 | WARN 并回退 PATH，**明确说明**若 PATH 也没有则无法转码 |
+| Field missing / empty string | Use the `ffmpeg` on PATH (default, leaves existing deployments untouched) |
+| Valid path | Adopted, and the log confirms "ffmpeg specified by config" |
+| Path does not exist | WARN and fall back to PATH, **explicitly stating** that if PATH has none either, transcoding is impossible |
 
-> 关键实现约束：探测（`ffmpegAvailable`）与实际转码（`runFfmpeg`）**必须走同一个
-> `ffmpegCommand()`**。否则会出现"探测说可用、转码却找不到"这种自相矛盾的状态——
-> 正是 HANDOVER 第十二节那个「一个语义两处实现」的老毛病。
+> Key implementation constraint: probing (`ffmpegAvailable`) and the actual transcode (`runFfmpeg`) **must go through the same
+> `ffmpegCommand()`**. Otherwise you get the self-contradictory state where "probing says available, transcoding says not found" —
+> exactly the old "one meaning, two implementations" problem from Section 12 of the HANDOVER.
 
-实测四种配置组合均正确；并用真实 .ogg 验证**按配置路径转码成功**。
+All four configuration combinations tested correctly; and a real .ogg confirmed **transcoding via the configured path succeeds**.
 
-#### Y. 第十五轮：Linux 兼容性审计（在 WSL 里实测）
+#### Y. Round 15: Linux compatibility audit (measured in WSL)
 
-用 WSL2 Ubuntu 做了实际验证（静态审计 + Linux 语义下的行为测试）。
+Verified for real on WSL2 Ubuntu (static audit plus behavior tests under Linux semantics).
 
-##### 发现并修复的两个真实缺陷
+##### Two real defects found and fixed
 
-| # | 缺陷 | 后果 | 修复 |
+| # | Defect | Consequence | Fix |
 |---|---|---|---|
-| 1 | **配置里的 `\\` 路径在 Linux 上失效** | Windows 上配好再上传到 Linux 服务器，`audio\\song.mp3` 会去找一个名叫 `audio\song.mp3` 的单层文件 → 永远"频道没有可用音频"，而目录里明明有文件 | 新增 `normalizeSeparators()`，把 `\\` 统一成 `/`。覆盖音频路径、图标路径、txt 条目 |
-| 2 | **UTF-8 BOM 让 txt 首行开关失效** | Windows 记事本"另存为 UTF-8"会写 BOM，首行变成 `"\uFEFFfalse"`；`trim()` 不去 U+FEFF → 开关静默失效 | 新增 `stripBom()` |
+| 1 | **`\\` paths in the config break on Linux** | Configure on Windows, then upload to a Linux server: `audio\\song.mp3` looks for a single flat file literally named `audio\song.mp3` → always "station has no usable audio", even though the directory clearly contains files | Added `normalizeSeparators()` to turn `\\` into `/`. Covers audio paths, icon paths, and txt entries |
+| 2 | **A UTF-8 BOM disables the txt first-line switch** | Windows Notepad's "Save as UTF-8" writes a BOM, so the first line becomes `"\uFEFFfalse"`; `trim()` does not strip U+FEFF → the switch silently fails | Added `stripBom()` |
 
-第 2 条特别隐蔽：BOM 是不可见字符，服主会困惑"我明明写了 true 怎么没打乱"。
+Item 2 is especially sneaky: the BOM is an invisible character, so the server owner is left wondering "I clearly wrote true, why did it not shuffle".
 
-##### WSL 实测结果
+##### WSL test results
 
 ```
-=== 反斜杠路径（Linux 语义）===
-修复前: audio\song.mp3 -> exists=False
-修复后: audio\song.mp3 -> exists=True
-        sub\b.mp3     -> exists=True
-=== txt 解析 ===
-t_bom        打乱=true   条目=1   ← BOM 下开关正确生效
-t_backslash  打乱=false  条目=1
-t_crlf       打乱=true   条目=1   ← CRLF 正常
+=== Backslash paths (Linux semantics) ===
+Before fix: audio\song.mp3 -> exists=False
+After fix:  audio\song.mp3 -> exists=True
+            sub\b.mp3     -> exists=True
+=== txt parsing ===
+t_bom        shuffle=true   entries=1   ← switch correctly applied with BOM
+t_backslash  shuffle=false  entries=1
+t_crlf       shuffle=true   entries=1   ← CRLF works
 ```
 
-##### 审计通过项（无需改动）
+##### Audit items that passed (no changes needed)
 
-| 项 | 结论 |
+| Item | Conclusion |
 |---|---|
-| 资源路径大小写 | 11 个资源文件，**0 个大小写冲突**，代码引用 0 处缺失 |
-| 传给 ffmpeg 的路径 | 全部由 `getConfigDir()` 派生，**均为绝对路径**，不受 cwd 影响 |
-| `ffmpeg` 可执行名 | 用裸名走 PATH；另有 `ffmpeg` 配置项可指定绝对路径 |
-| CRLF / LF 行尾 | `readAllLines` + `trim()` 双向兼容 |
-| 文件内容编码 | 所有读写显式 `StandardCharsets.UTF_8` |
-| `RandomAccessFile` / `Path` / `ProcessBuilder` | 均为跨平台 API |
+| Resource path casing | 11 resource files, **0 casing conflicts**, 0 missing references in code |
+| Paths handed to ffmpeg | All derived from `getConfigDir()`, **all absolute**, unaffected by cwd |
+| `ffmpeg` executable name | Bare name via PATH; a separate `ffmpeg` config field can specify an absolute path |
+| CRLF / LF line endings | `readAllLines` + `trim()` handle both |
+| File content encoding | All reads and writes use an explicit `StandardCharsets.UTF_8` |
+| `RandomAccessFile` / `Path` / `ProcessBuilder` | All cross-platform APIs |
 
-> **已知限制**（非本项目可控）：中文**文件名**的解析依赖 JVM 的
-> `sun.jnu.encoding`。Linux 默认 UTF-8 正常；Windows 中文版若为 GBK
-> 且存档路径含中文，属于 JVM 层面问题。
+> **Known limitation** (outside this project's control): parsing **Chinese file names** depends on the JVM's
+> `sun.jnu.encoding`. Linux defaults to UTF-8 and works; on a Chinese Windows install running GBK,
+> a save path containing Chinese is a JVM-level problem.
 
-#### Z. 第十六轮：换曲心跳包 / 图标自动降分辨率 / 架构答疑
+#### Z. Round 16: heartbeat on track change / automatic icon downscaling / architecture Q&A
 
-##### 1. 换曲间隙误报警（发心跳空包）
+##### 1. False alarm in the gap between tracks (send empty heartbeat packets)
 
-**根因**：`AudioStreamManager.pump()` 在 `pollChunk() == null` 时**直接 return，什么都不发**。
-换曲/轮转/上游短暂卡顿时，读线程有几百毫秒拿不到数据，客户端那边就是"服务端没消息"——
-而客户端判断「流僵住」「该不该响底噪」都看 `lastChunkAt`，
-积累到 8 秒就判超时 → **点亮 NOSIGNAL + 响底噪**，可实际上服务一切正常，只是中间换了首歌。
+**Root cause**: `AudioStreamManager.pump()` **just returns and sends nothing** when `pollChunk() == null`.
+On a track change, a playlist round wrap, or a brief upstream stall, the read thread goes a few hundred milliseconds without data,
+and from the client's side that looks like "the server went quiet" — yet the client decides both "the stream is stuck" and "whether to play the noise floor" from `lastChunkAt`,
+so after 8 seconds it declares a timeout → **NOSIGNAL lights up + the noise floor plays**, when the server is actually fine and merely changed song.
 
-**方案选择**：用户给了两条路——「做到无缝」或「发空包」。选了**发空包**：
-- 无缝需要客户端预解码下一首并拼接 PCM，改动面大，且换曲处容易出爆音；
-- 发空包精确表达了"我还活着，只是这段没数据"，十几字节。
+**Design choice**: the user offered two paths — "make it seamless" or "send empty packets". **Empty packets** was chosen:
+- Seamless needs the client to pre-decode the next track and splice PCM: a large change surface, and prone to pops at the splice point;
+- An empty packet says exactly "I am still alive, this stretch just has no data", in a dozen-odd bytes.
 
-实现要点：
+Implementation points:
 
-| 位置 | 作用 |
+| Location | Purpose |
 |---|---|
-| `sendHeartbeat()` | 复用 `S2C_AUDIO_CHUNK` 通道，**空载荷**；字段顺序必须与音频块完全一致 |
-| `pump()` 无数据分支 | `isDue()==true` 但没数据 → 发心跳（`isFinished()` 时不发） |
-| `pumpAll()` 未到节拍分支 | `isDue()==false` 时也要能发——**这条最容易漏**，配速可能把 `nextSendAt` 推到很远的未来 |
-| `ClientAudioPlayer.handleChunk` | 空数组 → **只刷 `lastChunkAt` 就 return**，不喂解码器、不清故障显示 |
+| `sendHeartbeat()` | Reuses the `S2C_AUDIO_CHUNK` channel with an **empty payload**; field order must match an audio chunk exactly |
+| `pump()` no-data branch | `isDue()==true` but no data → send a heartbeat (not sent when `isFinished()`) |
+| `pumpAll()` not-yet-due branch | Must also be able to send when `isDue()==false` — **the easiest one to miss**, since pacing can push `nextSendAt` far into the future |
+| `ClientAudioPlayer.handleChunk` | Empty array → **refresh `lastChunkAt` and return**, without feeding the decoder or clearing the fault display |
 
-关键不变量：
-1. 心跳**不调 `markSent()`** → 不参与配速，不影响音频节奏
-2. 心跳**立即 `markHeartbeatSent()`** → 否则推送线程每 5ms 转一圈就会刷屏
-3. 间隔 1000ms：正常播放（块间隔 ~250ms）时**心跳 0 次**；远小于客户端 8 秒超时
-4. `source.isFinished()` 时**不发** → 上游真死仍能正常报故障
+Key invariants:
+1. The heartbeat **does not call `markSent()`** → it does not participate in pacing and does not disturb the audio rhythm
+2. The heartbeat **immediately calls `markHeartbeatSent()`** → otherwise the push thread would spam on every 5ms pass
+3. 1000ms interval: during normal playback (chunk interval ~250ms) **zero heartbeats are sent**; far below the client's 8-second timeout
+4. **Not sent** when `source.isFinished()` → a genuinely dead upstream can still report a fault normally
 
-##### 2. 图标服务端自动降分辨率
+##### 2. Server-side automatic icon downscaling
 
-服主常放 500×500 PNG，而界面只画 **16×16**。服务端下发前用 JDK 自带 `ImageIO`
-缩到 **32×32**（留 2 倍余量防高 DPI 糊）：
+Server owners often drop in a 500x500 PNG, while the UI only draws **16x16**. Before sending, the server shrinks it with the JDK's built-in `ImageIO`
+to **32x32** (2x headroom against blur on high DPI):
 
-| 项 | 数值 |
+| Item | Value |
 |---|---|
-| fm907.png | 500×500 / 36639 B → **32×32 / 566 B**（省 **98%**） |
+| fm907.png | 500x500 / 36639 B → **32x32 / 566 B** (saves **98%**) |
 
-- 用 `ImageIO` + `Graphics2D` 高质量插值，**不引入新依赖**
-- 缩放失败（headless/格式罕见）→ **退回原图**，不让图标消失
-- **必须设 `java.awt.headless=true`**：专用服务器没有图形环境
-- 带缓存（键含文件修改时间）；`/radio reload` 时清空
+- Uses `ImageIO` + `Graphics2D` high-quality interpolation, **with no new dependency**
+- If scaling fails (headless / rare format) → **fall back to the original image**, so the icon never disappears
+- **Must set `java.awt.headless=true`**: dedicated servers have no graphics environment
+- Cached (the key includes the file modification time); cleared on `/radio reload`
 
-##### 3. 架构答疑：网络电台是服务端重分发
+##### 3. Architecture Q&A: network radio is server-side redistribution
 
-用户问"为什么感觉网络电台是服务端重分发而不是客户端直连"——**感觉是对的**。
+The user asked "why does it feel like network radio is server-side redistribution rather than the client connecting directly" — **the feeling is correct**.
 
 ```
-上游 HTTP 流 → 服务端 StreamAudioSource(读线程) → AudioSubscription(配速)
-             → S2C_AUDIO_CHUNK → 客户端 Mp3StreamDecoder → PcmSink → 声卡
+upstream HTTP stream → server StreamAudioSource (read thread) → AudioSubscription (pacing)
+                     → S2C_AUDIO_CHUNK → client Mp3StreamDecoder → PcmSink → sound card
 ```
 
-三个硬理由：
-1. **多人同步**：各自连流缓冲深度不同 → 内容错开数秒，直播流不可 seek 没法事后再对齐
-2. **ICY 剥离**：上游每 N 字节插元数据，服务端剔一次即可
-3. **客户端无需外网**：受限网络里玩家直连上游会失败
+Three hard reasons:
+1. **Multi-player sync**: each client's stream buffer depth differs → content drifts by seconds, and a live stream cannot seek, so it cannot be re-aligned afterwards
+2. **ICY stripping**: the upstream injects metadata every N bytes; the server strips it once
+3. **No internet needed on the client**: in restricted networks, a player connecting straight to the upstream fails
 
-代价：服务端上行 = 码率 × 听众人数；上游断则所有玩家一起没声音（这是 O 节的既定职责划分）。
+Cost: server upstream = bitrate x listener count; if the upstream dies, every player loses sound at once (this is the division of responsibility set out in Section O).
 
-#### AA. 第十七轮：打乱模式「第一首永远相同」
+#### AA. Round 17: shuffle mode "the first track is always the same"
 
-**现象**：用户反馈「随机打乱播放，每次播放的第一个都是同一个音频」。
+**Symptom**: the user reported "with shuffle playback, the first track is always the same audio".
 
-**根因**：轮次 = `elapsed / roundTotalMillis`，而 `elapsed` 从服务端启动/重载那一刻算起
-→ **每次都从第 0 轮开始**。而第 0 轮的顺序由 `mixSeed(seed, 0)` 唯一决定
-（seed 不填时按频道 id 派生，更是恒定），于是首曲永远是同一首。
+**Root cause**: round = `elapsed / roundTotalMillis`, and `elapsed` counts from the moment the server starts or reloads
+→ **every session begins at round 0**. And round 0's order is uniquely determined by `mixSeed(seed, 0)`
+(when seed is not set it is derived from the station id, which is even more fixed), so the first track is always the same one.
 
-> 这不是"打乱没生效"——**每一轮内部确实是打乱的**，只是每次都从同一轮开始。
+> This is not "shuffle not working" — **each round really is shuffled**, it just always starts from the same round.
 
-**修复**：新增 `roundOffset`（起点轮次随机偏移），仅在 `random` 模式生效：
+**Fix**: added `roundOffset` (a random offset on the starting round), active only in `random` mode:
 
 ```java
 this.roundOffset = random
@@ -1321,241 +1343,241 @@ this.roundOffset = random
     : 0;
 ```
 
-- 乘大奇数散开：直接用 `now/3600000` 时相邻小时只差 1，实测 12 次开服仅 4 种首曲；
-  乘后 **5 首池全部覆盖**
-- **同一进程内稳定**（构造时算一次，`final` 字段），不会每次订阅都跳歌
-- **同步性不受影响**：时间轴只在**服务端**构造（客户端零引用），
-  所有玩家共用同一实例、同一 `startEpochMillis`，因此同一时刻算出的轮次/位置仍完全一致
+- Multiplying by a large odd number spreads it out: with plain `now/3600000`, adjacent hours differ by only 1, and across 12 server starts only 4 distinct first tracks appeared;
+  after multiplying, **all 5 in the pool are covered**
+- **Stable within a single process** (computed once at construction, a `final` field), so it does not jump songs on every subscription
+- **Synchronization is unaffected**: the timeline is only constructed on the **server** (zero client references),
+  and all players share the same instance and the same `startEpochMillis`, so the round/position computed at any instant is still identical
 
-**配套修复**：`PlaylistTimeline.clearCache()`，并在配置重载时调用。
-时间轴实例固化了 `roundOffset`，复用旧实例会导致「重载了但首曲还是那首」。
+**Companion fix**: `PlaylistTimeline.clearCache()`, called on config reload.
+The timeline instance bakes in `roundOffset`, so reusing the old instance would produce "reloaded but the first track is still that one".
 
-##### 顺带核实的架构问题
+##### Architecture question verified along the way
 
-用户问「网络电台为什么感觉是服务端重分发而非客户端直连」——**感觉是对的**，
-详见 Z 节第 3 小节（三个硬理由：多人同步 / ICY 剥离 / 客户端无需外网）。
+The user asked "why does network radio feel like server-side redistribution rather than a direct client connection" — **the feeling is correct**,
+see Section Z part 3 (three hard reasons: multi-player sync / ICY stripping / no internet needed on the client).
 
-#### AB. 第十八轮：音量滑条底部遮挡
+#### AB. Round 18: volume slider occluded at the bottom
 
-**现象**：用户反馈「音量滑条下段往上一点，有点遮挡」。
+**Symptom**: the user reported "the lower part of the volume slider is a bit occluded toward the top".
 
-**根因**：`volumeBottom = height - 50`，而底部按钮从 `height - 30` 开始、高 20。
-滑条面板背景还向外扩 2px，于是面板底边到 `height - 48`，
-与按钮区（`height - 30`）重叠约 18px——
-**百分比文字画在 `volumeBottom - 10`，正好被按钮压住**。
+**Root cause**: `volumeBottom = height - 50`, while the bottom buttons start at `height - 30` and are 20 tall.
+The slider panel background also expands 2px outward, so the panel's bottom edge reaches `height - 48`
+and overlaps the button area (`height - 30`) by about 18px —
+**the percentage text is drawn at `volumeBottom - 10`, exactly where the buttons cover it**.
 
-**修复**：`volumeBottom` 改为 `height - 38`，并按自下而上的布局需求推导：
+**Fix**: `volumeBottom` changed to `height - 38`, derived from the bottom-up layout requirements:
 
 ```
-按钮底边           = height - 10
-按钮顶边           = height - 30
-留 6px 间隙        -> 面板底边上限 = height - 36
-面板背景外扩 2px   -> volumeBottom 上限 = height - 38
+button bottom edge      = height - 10
+button top edge         = height - 30
+leave a 6px gap         -> panel bottom edge limit = height - 36
+panel background +2px   -> volumeBottom limit      = height - 38
 ```
 
-实测四种窗口高度（240 / 300 / 480 / 720）均满足：
-- 面板与按钮间隙恒为 **6px**（无重叠）
-- 百分比文字底边距面板底 **2px**（不贴边）
-- 滑条轨道底始终在文字上方
+Tested at four window heights (240 / 300 / 480 / 720), all satisfied:
+- The gap between panel and buttons is always **6px** (no overlap)
+- The percentage text's bottom is **2px** above the panel bottom (not flush)
+- The slider track bottom is always above the text
 
-点击/拖动命中区（`mouseY <= volumeBottom`）与音量映射（`volumeBottom - 12`）
-用的都是同一个字段，随之自动一致，无需另行修改。
+The click/drag hit area (`mouseY <= volumeBottom`) and the volume mapping (`volumeBottom - 12`)
+use the same field, so they stay consistent automatically with no separate change needed.
 
-### 当前构建状态
+### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`，约 330 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 330 KB**
 - `gradlew clean build` → BUILD SUCCESSFUL
-- **git 已初始化**（单条初始提交，含本轮全部修复）
+- **git is initialized** (a single initial commit containing all the fixes from this round)
 
-### 待用户实测确认（下次会话优先问这些）
+### Awaiting user verification (ask these first next session)
 
-> 本清单只保留**尚未验证**的项。已验证通过的移到下方「历史验证」。
+> This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
 
-**第十六轮（心跳 / 图标 / 架构）**：
-- ⚠️ **换曲时不应再出现 NOSIGNAL + 底噪** — 这是本轮主要验证点。
-  播完一首切下一首、播放列表轮转时，屏幕不应闪故障、也不应响底噪。
-  （服务端现在会发 1 秒一次的心跳空包维持连接）
-- ⚠️ **图标清晰度** — 自动降到 32×32 后图标应仍然清晰；
-  若明显糊了，把 `ICON_TARGET_PX` 调大（代价是带宽）。
-- ⚠️ **图标带宽** — 500×500 的图标现在只传 ~566 B，打开界面应更快。
+**Round 16 (heartbeat / icons / architecture)**:
+- ⚠️ **NOSIGNAL + noise floor should no longer appear when changing track** — the main verification point this round.
+  When one track ends and the next starts, or the playlist wraps, the screen should not flash a fault and no noise floor should play.
+  (The server now sends an empty heartbeat every 1 second to keep the connection alive)
+- ⚠️ **Icon sharpness** — icons should still be sharp after the automatic downscale to 32x32;
+  if they are visibly blurry, raise `ICON_TARGET_PX` (at the cost of bandwidth).
+- ⚠️ **Icon bandwidth** — a 500x500 icon now transfers only ~566 B, so opening the UI should be faster.
 
-**最高优先级（第十三轮配速修复，2026-11-23 你的最后一个反馈）**：
-- ⚠️ **「丢一半包」是否消失** — 之前播 320kbps 曲目时发送 1.85× 实时、
-  客户端缓冲撞 3 秒上限丢最旧数据；128kbps 时只发 74%、缓冲饿死成噪音。
-  现在锚点改为按**本块真实时长**累加。**判断方法**：
-  正常听完整首歌不应再有「规律性断一块 + 接上来」；
-  若仍有，日志里会出现新加的「抖动缓冲溢出，丢弃 N ms 最旧音频」告警
-  —— 那说明还有别的供数过快路径（这条告警是本轮专门为定位加的）。
+**Highest priority (Round 13 pacing fix, your last feedback on 2026-11-23)**:
+- ⚠️ **Has "dropping half the packets" actually gone away** — previously, playing 320kbps tracks sent 1.85x real time and
+  the client buffer hit the 3-second cap and dropped the oldest data; at 128kbps only 74% was sent and the buffer starved into noise.
+  The anchor now accumulates by **each chunk's real duration**. **How to judge**:
+  listening through a whole track normally should no longer produce a "regular chunk cut out + spliced on";
+  if it still does, the log will show the newly added "jitter buffer overflow, dropping N ms of oldest audio" warning
+  — which means some other path is still feeding data too fast (that warning was added this round specifically to pin this down).
 
-**第十三轮其余**：
-- ⚠️ **音量每动一次 5%** — 拖动应停在 0/5/10/…/100% 共 21 个位置。
-- ⚠️ **txt 首行布尔** — `true` 打乱、`false`/省略 按顺序；旧写法 `random`/`sequence` 仍兼容。
+**Rest of Round 13**:
+- ⚠️ **Volume moves 5% per step** — dragging should land on 0/5/10/.../100%, 21 positions in total.
+- ⚠️ **txt first-line boolean** — `true` shuffles, `false`/omitted keeps order; the old `random`/`sequence` spellings still work.
 
-**第十四轮**：
-- ⚠️ **ffmpeg 路径** — `stations.json` 顶层 `ffmpeg` 留空时应回退 PATH；
-  填一个**不存在的路径**时，日志应有一行 WARN 明确说"回退到 PATH，若那里也没有则无法转码"。
+**Round 14**:
+- ⚠️ **ffmpeg path** — with the top-level `ffmpeg` in `stations.json` left empty it should fall back to PATH;
+  with a **non-existent path**, the log should have a WARN line explicitly saying "falling back to PATH, and if it is not there either, transcoding is impossible".
 
-**第十五轮（Linux）**：
-- ⚠️ 若在 Linux 上部署：配置里用 `\` 写的路径应仍能工作（已做分隔符归一化）；
-  Windows 记事本保存的 txt（带 BOM）首行开关应生效。
+**Round 15 (Linux)**:
+- ⚠️ If deploying on Linux: paths written with `\` in the config should still work (separator normalization is in place);
+  the first-line switch in a txt saved by Windows Notepad (with BOM) should take effect.
 
-**历史验证（已通过，仅作记录）**：
-- ✅ 故障显示位置、黑色文字、液晶屏背景不变（第三轮）
-- ✅ 选择框贴合机身、实体可穿过（第九轮）
-- ✅ 液晶屏正常播放显示频率（第八轮）
-- ✅ 日志不再刷屏（第七轮，"音频已恢复"只在真正恢复时一条）
+**Historical verification (passed, recorded for reference)**:
+- ✅ Fault display position, black text, LCD background unchanged (Round 3)
+- ✅ Selection box hugs the body, entities can pass through (Round 9)
+- ✅ LCD shows the frequency during normal playback (Round 8)
+- ✅ Logs no longer spam (Round 7, "audio recovered" only logs once on a real recovery)
 
-**仍未经用户确认但不影响使用**：
-- 调台噪重叠是否真无缝
-- 起播延迟（约 `bufferMillis`，可调小）
-- 长断网（>2 分钟）后能否自愈
+**Still unconfirmed by the user but not blocking use**:
+- Whether the tuning-noise overlap is truly seamless
+- Start-up latency (about `bufferMillis`, can be lowered)
+- Whether it self-heals after a long disconnection (>2 minutes)
 
 
-### 已知限制
+### Known limitations
 
-- 网络电台（直播流）**必须是 MP3**，且无法精确定位，只能从连接时刻顺序播放
-- **直播流不能写进 txt**：无 `Content-Length` 则无法缓存/转码，
-  写了会被自动注释（见 T 节）。直播流应直接配成频道 `file`
-- **转码强依赖 ffmpeg**：缺失时非 MP3 频道一律被拒绝播放（不静默降级）
-- 首次启动需等转码完成（大文件可能几十秒），之后命中缓存秒完成
-- 播放列表换曲不是无缝的：换曲时解码器重建，两首之间有极短空隙
-- **HLS/AAC 流不支持**（已评估，用户决定不做）
-- 临时签名链接（如 B 站带 `deadline` 的地址）**约 2 小时后失效**：
-  已缓存的可继续播放，但要重新下载必须换新链接
-- 中文**文件名**依赖 JVM 的 `sun.jnu.encoding`（Linux 默认 UTF-8 正常）
+- Network radio (live streams) **must be MP3**, and cannot be seeked precisely; it can only play sequentially from the moment of connection
+- **Live streams cannot go into txt**: without `Content-Length` they cannot be cached or transcoded,
+  and if written they are auto-commented out (see Section T). A live stream should be configured directly as the station's `file`
+- **Transcoding depends hard on ffmpeg**: without it, every non-MP3 station is refused (no silent downgrade)
+- First start has to wait for transcoding to finish (tens of seconds for large files); afterwards the cache makes it instant
+- Playlist track changes are not seamless: the decoder is rebuilt on a track change, leaving a very short gap between tracks
+- **HLS/AAC streams are not supported** (evaluated; the user decided not to do it)
+- Temporary signed links (such as Bilibili URLs with a `deadline`) **expire after about 2 hours**:
+  cached copies keep playing, but re-downloading requires a fresh link
+- **Chinese file names** depend on the JVM's `sun.jnu.encoding` (Linux defaults to UTF-8 and works)
 
 ---
 
-## 九、测试环境
+## 9. Test Environment
 
-`run/` 目录下的测试配置：
+Test configuration under `run/`:
 
 ```
 run/world/serverconfig/radio-smile/
-├── stations.json     3 个频道（tiehen / testaudio / qtfm）
+├── stations.json     3 stations (tiehen / testaudio / qtfm)
 ├── audio/
-│   ├── qtfm_tiehen.ogg   22.5 MB（B站「铁痕电台#02」转码）
+│   ├── qtfm_tiehen.ogg   22.5 MB (transcoded from Bilibili "Tiehen Radio #02")
 │   └── test_station.ogg  14.9 MB
 └── cache/
     └── manifest.json
 ```
 
-**当前实际测试配置**（`run/config/radio-smile/`）：
+**Current actual test config** (`run/config/radio-smile/`):
 
-| id | 类型 | rate |
+| id | Type | rate |
 |---|---|---|
-| `tiehen` | 本地 OGG（`qtfm_tiehen.ogg`，23MB） | FM105.7 |
-| `fm907` | 网络直播流 `lhttp-hw.qtfm.cn/live/15318146/64k.mp3` | FM90.7 |
-| `realtest` | **txt 播放列表**（1 本地 + 4 网络：网易云 mp3 ×2 / B站 m4s ×2） | FM101.7 |
-| `mixed` | **txt 混播**（2 本地，演示新版首行格式） | FM100.0 |
+| `tiehen` | Local OGG (`qtfm_tiehen.ogg`, 23MB) | FM105.7 |
+| `fm907` | Live network stream `lhttp-hw.qtfm.cn/live/15318146/64k.mp3` | FM90.7 |
+| `realtest` | **txt playlist** (1 local + 4 network: NetEase Cloud mp3 x2 / Bilibili m4s x2) | FM101.7 |
+| `mixed` | **txt mixed playlist** (2 local, demonstrating the new first-line format) | FM100.0 |
 
-两个 txt 均已改用**新版首行布尔**（`false`），`stations.json` 顶层已带 `ffmpeg` 字段。
+Both txt files now use the **new first-line boolean** (`false`), and the top level of `stations.json` already carries the `ffmpeg` field.
 
-> `realtest.txt` 是验证网络缓存/转码/时序的关键测试素材。
-> 注意 B 站链接带 `deadline` 参数，**约 2 小时后失效**；
-> 失效后仍能用已缓存的本地文件播放，但要重新下载就得换新链接。
+> `realtest.txt` is the key test material for verifying network caching / transcoding / timing.
+> Note that the Bilibili link carries a `deadline` parameter and **expires after about 2 hours**;
+> after that the cached local file still plays, but re-downloading requires a fresh link.
 
-客户端配置：`maxBandwidthKbps=1024`、`maxChunkBytes=8192`、`bufferMillis=1000`
+Client config: `maxBandwidthKbps=1024`, `maxChunkBytes=8192`, `bufferMillis=1000`
 
 ---
 
-## 十、快速恢复工作的方法
+## 10. How to Resume Work Quickly
 
 1. `cd "C:\Projects\Smile's Radio mod"`
-2. `gradlew build` 确认构建通过
-3. `gradlew runServer` 验证服务端启动 + 转码预热日志
-4. `gradlew runClient`（配合 `--quickPlaySingleplayer` 自动进档）
-5. 关键日志关键字（按排查顺序）：
+2. `gradlew build` to confirm the build passes
+3. `gradlew runServer` to verify server startup + transcode preheat logs
+4. `gradlew runClient` (with `--quickPlaySingleplayer` to drop straight into the world)
+5. Key log keywords (in troubleshooting order):
 
-   | 关键字 | 确认什么 |
+   | Keyword | What it confirms |
    |---|---|
-   | `电台配置已加载` | 配置位置与无效频道数（含「另有 N 个配置无效已隐藏」） |
-   | `已从旧位置迁移` | 旧存档配置是否成功搬到 `config/` |
-   | `转码预热` | ffmpeg 预热进度；`ffmpeg 不可用` 说明缺依赖 |
-   | `已按配置指定 ffmpeg` | 顶层 `ffmpeg` 路径是否生效 |
-   | `已连接网络电台` | 直播流建连 |
-   | `网络音频已缓存到本地` | 网络文件下载完成 |
-   | `txt 播放列表已预热` | txt 里网络条目数量 |
-   | `MP3 定位到` + `播放列表定位` | 订阅时的精确定位（多人同步的基础） |
-   | `[自动订阅]` | 自动订阅触发 |
-   | `声卡已打开` | 音频设备与缓冲参数 |
-   | `抖动缓冲溢出` | **⚠️ 供数快于消费**——第十三轮新增，看到它说明配速仍有问题 |
+   | station config loaded | Config location and the number of invalid stations (including "plus N invalid configs hidden") |
+   | migrated from old location | Whether the old save config was successfully moved to `config/` |
+   | transcode preheat | ffmpeg preheat progress; "ffmpeg unavailable" means the dependency is missing |
+   | ffmpeg specified by config | Whether the top-level `ffmpeg` path took effect |
+   | connected to network radio | Live stream connection established |
+   | network audio cached locally | Network file download complete |
+   | txt playlist preheated | Number of network entries in the txt |
+   | MP3 seek to + playlist seek | The exact seek on subscription (the basis of multi-player sync) |
+   | [auto-subscribe] | Auto-subscription triggered |
+   | sound card opened | Audio device and buffer parameters |
+   | jitter buffer overflow | **⚠️ Feeding faster than consuming** — added in Round 13; seeing it means pacing is still wrong |
 
-6. 想验证「时序是否正确」，最有效的方法是**录屏 + 看频谱图**（见 V 节）：
-   用 `ffmpeg -i rec.mp4 -lavfi showspectrumpic` 生成，
-   **规则性的柱状断续**就是丢包/配速错误，正常音乐不会有那种结构。
-
----
-
-## 十一、后续可做
-
-| 优先级 | 事项 | 备注 |
-|---|---|---|
-| **高** | 验证「丢一半包」是否真的消失 | 第十三轮配速修复，影响最大，见「待确认」节 |
-| 高 | 长时播放连续性验证 | 跨曲、长时间无人值守、网络抖动 |
-| 中 | AutoSubscriber 扫描开销优化 | 当前每 0.5s 扫 81 区块 |
-| 中 | 播放进度 UI | 当前界面无进度指示 |
-| 中 | 故障显示字号 | 绿区 46×13 像素，`NOSIGNAL`(8字符) 已到宽度极限；
-|    |  | 想更大必须把贴图提到 512×512（用户已知） |
-| 低 | HLS/AAC 支持 | 技术已验证可行（jaad 0.9.4），用户决定暂不做 |
-| 低 | 客户端自定义电台 | 仅网络流；本地文件仅限内置服务器 |
-| 低 | 列表分页/滚动性能 | 频道很多时（>200）才需要考虑 |
+6. To verify "whether the timing is correct", the most effective method is **screen recording + inspecting the spectrogram** (see Section V):
+   generate it with `ffmpeg -i rec.mp4 -lavfi showspectrumpic` —
+   **regular comb-like dropouts** mean packet loss or bad pacing, and normal music never has that structure.
 
 ---
 
-## 十二、给下一个会话的提醒
+## 11. Possible Next Steps
 
-**这个项目的 bug 有一个共同模式：同一个函数/字段承担了两种语义。** 已经修过 7 次：
-
-| 函数 | 被混淆的语义 | 后果 |
+| Priority | Item | Notes |
 |---|---|---|
-| `AudioSubscription.markSent()` 的锚点 | 「读线程预读位置」vs「已发给客户端的位置」 | 首包后 4 秒空窗 |
-| `isJitterBufferThinned()` 无音源时 | 「空选静止」vs「故障拿不到数据」 | 底噪该响时不响 |
-| `ClientAudioPlayer.stop()` | 「用户不要了」vs「服务端故障」 | 底噪被当成用户主动关台 |
-| `overlayEffects()` 的锚点 | 「换台拟音归属」vs「链路故障归属」 | 断网无噪音（K 节） |
-| `PcmSink.stop()` | 「用户不要了」vs「故障静音」 | D 节没做完的下半截 |
-| `ClientAudioPlayer.STREAMS` | 「真的在收流」vs「玩家点过确认」 | 首块前失败不响 / 关台后被迟到包点亮 |
-| `PlaylistTimeline` 的曲目列表 | 「能播的」vs「配了的」 | 未转码文件进时间轴 → **整条列表时序错乱**（V 节）|
+| **High** | Verify "dropping half the packets" is really gone | Round 13 pacing fix, the largest impact; see the "Awaiting verification" section |
+| High | Verify long-run playback continuity | Across tracks, long unattended runs, network jitter |
+| Medium | Optimize AutoSubscriber scan cost | Currently scans 81 chunks every 0.5s |
+| Medium | Playback progress UI | The current UI has no progress indicator |
+| Medium | Fault display font size | The green area is 46x13 pixels, and `NOSIGNAL` (8 chars) is already at the width limit; |
+|    |  | going bigger requires raising the texture to 512x512 (the user already knows) |
+| Low | HLS/AAC support | Technically verified feasible (jaad 0.9.4); the user decided to defer |
+| Low | Client-defined stations | Network streams only; local files are limited to the built-in server |
+| Low | List paging / scroll performance | Only worth considering with a lot of stations (>200) |
 
-> 第七次（V 节）代价最大：一个"能不能播"的判断没在时间轴入口做，
-> 导致时长算成 1ms、后面所有曲目起点全错，表现是"时序完全乱"——
-> 而根因藏在"播放列表里混进了未转码文件"这么小的一个疏漏后面。
+---
 
-**改动前先问：这个函数被几个语义不同的地方调用？**
-如果答案不是 1，优先拆开入口，而不是在函数内部加条件判断。
+## 12. Reminders for the Next Session
 
-另外两条硬约束：
-1. **不要动效果音与缓冲区的关系** —— 见 B 节的三个坑
-2. **不要用 gradle 之外的构建方式验证** —— 临时 javac 的 classpath 与 loom 不一致，容易假阳性
+**This project's bugs share one common pattern: a single function or field carries two meanings.** This has already been fixed 7 times:
 
-验证脚本在 `build-verify/`（含 REPORT.md 与 sim/），可重复执行。
-本轮新增 `build-verify/audio/`（底噪/ERR 状态机模拟，`run-verify.ps1` → `VERIFY_EXIT=0`）
-与 `build-verify/geom/`（原版 jar 反编译产物，用于验证 UV/旋转/字体矩阵）。
+| Function | Confused meanings | Consequence |
+|---|---|---|
+| Anchor in `AudioSubscription.markSent()` | "position the read thread has read ahead to" vs "position already sent to the client" | 4-second dead air after the first packet |
+| `isJitterBufferThinned()` with no audio source | "idle, nothing selected" vs "fault, cannot get data" | The noise floor fails to play when it should |
+| `ClientAudioPlayer.stop()` | "the user no longer wants it" vs "server fault" | The noise floor is treated as the user switching the station off |
+| Anchor in `overlayEffects()` | "attribution of the tuning sound effect" vs "attribution of a link fault" | No noise on a disconnect (Section K) |
+| `PcmSink.stop()` | "the user no longer wants it" vs "fault mute" | The unfinished second half of Section D |
+| `ClientAudioPlayer.STREAMS` | "actually receiving a stream" vs "the player clicked confirm" | Fails silently before the first chunk / lit up by late packets after switching off |
+| Track list in `PlaylistTimeline` | "playable" vs "configured" | Untranscoded files enter the timeline → **the whole playlist's timing goes wrong** (Section V) |
 
-### 版本控制（2026-11-23 起）
+> The seventh (Section V) was the costliest: a "can it play" check was not done at the timeline entry point,
+> so durations were computed as 1ms and every later track's start point was wrong, presenting as "the timing is completely broken" —
+> with the root cause hidden behind a tiny oversight: "untranscoded files got mixed into the playlist".
 
-`git` 已初始化，**每轮修复对应一个提交**（提交信息用英文，便于检索）。常用：
+**Before changing anything, ask: how many places with different meanings call this function?**
+If the answer is not 1, split the entry point first, rather than adding conditionals inside the function.
+
+Two more hard constraints:
+1. **Do not touch the relationship between sound effects and the buffer** — see the three pitfalls in Section B
+2. **Do not verify with any build method other than gradle** — an ad-hoc javac classpath does not match loom's, and easily produces false positives
+
+The verification scripts live in `build-verify/` (including REPORT.md and sim/) and are repeatable.
+This round added `build-verify/audio/` (noise floor / ERR state machine simulation, `run-verify.ps1` → `VERIFY_EXIT=0`)
+and `build-verify/geom/` (decompiled output of the vanilla jar, used to verify UV / rotation / font matrices).
+
+### Version control (since 2026-11-23)
+
+`git` is initialized, with **one commit per round of fixes** (commit messages in English, for easier searching). Common commands:
 
 ```powershell
-git log --oneline                  # 十五轮修复的历史
-git log --oneline -S "关键词"      # 查某个函数/字段是何时引入的
-git diff                           # 看未提交改动
-git show <sha> --stat              # 看某次提交改了哪些文件
-git show <sha> -- <file>           # 看某次提交对某文件的具体改动
+git log --oneline                  # history of the fifteen rounds of fixes
+git log --oneline -S "keyword"     # find when a function/field was introduced
+git diff                           # view uncommitted changes
+git show <sha> --stat              # see which files a commit changed
+git show <sha> -- <file>           # see a commit's specific changes to a file
 ```
 
-> 排查"这行为什么是现在这样"时，`git log -S` 比读 HANDOVER 更快：
-> 提交信息里写了每轮的核心改动，能直接定位到引入它的那一轮。
+> When investigating "why does this behave the way it does", `git log -S` is faster than reading the HANDOVER:
+> the commit messages record each round's core changes, so you can pinpoint the round that introduced it.
 
-> ⚠️ **不要对 `build-verify/geom/` 里的反编译产物感到意外**：那是研究用的一次性资料，
-> 体积不小但很有价值（下次改渲染/UV 直接查，不用重新反编译）。
+> ⚠️ **Do not be surprised by the decompiled output in `build-verify/geom/`**: it is one-off research material,
+> not small but very valuable (next time you touch rendering or UV, look it up directly instead of decompiling again).
 
 ---
 
-## 附：依赖安装说明
+## Appendix: Installing dependencies
 
 ```groovy
-// build.gradle 关键配置
+// key build.gradle configuration
 repositories {
     mavenLocal()  // smile_libbox
     maven { url = 'https://api.modrinth.com/maven' }
@@ -1569,5 +1591,5 @@ dependencies {
 }
 ```
 
-smile_libbox 1.0.26 需从 `C:\Projects\Smile's Lib Box` 项目构建并发布到 mavenLocal
-（`gradlew :1.20.1:publishToMavenLocal`）。
+smile_libbox 1.0.26 must be built from the `C:\Projects\Smile's Lib Box` project and published to mavenLocal
+(`gradlew :1.20.1:publishToMavenLocal`).

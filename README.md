@@ -1,55 +1,58 @@
 # Smile's Radio
 
-Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
+**English** | [简体中文](README.zh-CN.md)
 
-放下收音机、右键选台，就能听到服务端配置的电台——支持本地歌单、网络电台、
-多人同步播放、空间化音效，以及故障时的液晶屏错误提示。
+A **radio block that actually plays broadcasts** for Minecraft 1.20.1 (Fabric).
+
+Place a radio, right-click to tune in, and you hear the stations your server configured — local
+playlists, internet radio, synchronized multiplayer playback, spatial audio, and an LCD that shows
+an error when the signal dies.
 
 ---
 
-## 功能一览
+## Features
 
-| 功能 | 说明 |
+| Feature | Description |
 |---|---|
-| 收音机方块 | 薄片机型（仿明日方舟），放置时朝向玩家，需下方有实心支撑 |
-| 选台界面 | 搜索、滚动列表、音量滑块（5% 一档）、扫描、确认 |
-| 本地电音 | 单曲循环 / 播放列表（按文件名自然序 / 打乱顺序） |
-| 网络电台 | 直连直播流（MP3） |
-| **txt 重定向播放列表** | 一个 txt 里混写本地文件与网络地址 |
-| **网络音频缓存** | 网络地址自动下载→转 MP3→本地缓存，带轻量校验包 |
-| 多人同步 | 所有玩家听到同一时刻的同一内容 |
-| 空间化 | 距离衰减（48 格可听）+ 恒功率左右声像 |
-| 故障显示 | 红灯闪烁 + 液晶屏 `NOSIGNAL` |
-| 正常显示 | 液晶屏显示频道频率（如 `FM90.7`） |
-| 音效 | 换台调台噪、网络差底噪 |
+| Radio block | Slim form factor (Arknights-inspired), faces the player when placed, needs solid support below |
+| Station picker | Search, scrollable list, volume slider (5% steps), scan, confirm |
+| Local audio | Single-track loop / playlist (natural filename order / shuffled) |
+| Internet radio | Direct connection to a live stream (MP3) |
+| **txt redirect playlists** | One txt file mixing local files and remote URLs |
+| **Remote audio cache** | Remote URLs are downloaded, transcoded to MP3 and cached locally, with a lightweight proof file |
+| Multiplayer sync | Every player hears the same content at the same moment |
+| Spatialization | Distance attenuation (audible within 48 blocks) + constant-power L/R panning |
+| Fault display | Red light blinking + LCD showing `NOSIGNAL` |
+| Normal display | LCD shows the station frequency (e.g. `FM90.7`) |
+| Sound effects | Tuning noise on station change, static on a bad network link |
 
 ---
 
-## 安装
+## Installation
 
-1. 安装 Minecraft **1.20.1** + **Fabric Loader**（≥ 0.20.1）
-2. 放入必须的前置：
-   - [Fabric API](https://modrinth.com/mod/fabric-api)（≥ 0.92.12+1.20.1）
-   - **smile_libbox** 1.0.26+1.20.1（配置界面依赖它）
-3. 把 `radio-smile-1.0.0.jar` 放进 `mods/`
-4. **可选**：安装 [ModMenu](https://modrinth.com/mod/modmenu) 以便在游戏内改客户端设置
+1. Install Minecraft **1.20.1** + **Fabric Loader** (>= 0.20.1)
+2. Add the required dependencies:
+   - [Fabric API](https://modrinth.com/mod/fabric-api) (>= 0.92.12+1.20.1)
+   - **smile_libbox** 1.0.26+1.20.1 (the config screen depends on it)
+3. Drop `radio-smile-1.0.0.jar` into `mods/`
+4. **Optional**: install [ModMenu](https://modrinth.com/mod/modmenu) to change client settings in game
 
-### 可选：ffmpeg
+### Optional: ffmpeg
 
-**非 MP3 音频（ogg / flac / wav …）需要 ffmpeg 转码**才能播放。
+**Non-MP3 audio (ogg / flac / wav ...) needs ffmpeg to be transcoded** before it can play.
 
-- 已安装并加入 `PATH` → 开箱即用
-- 未安装 → 非 MP3 频道会被明确拒绝播放（不会静默降级成有问题的音频）
-- ffmpeg 不在 PATH 时，用配置里的 `ffmpeg` 字段指定绝对路径
+- Installed and on `PATH` -> works out of the box
+- Not installed -> non-MP3 stations are rejected explicitly (never silently degraded into broken audio)
+- If ffmpeg is not on `PATH`, point the `ffmpeg` field in the config at an absolute path
 
 ---
 
-## 配置
+## Configuration
 
-### 服务端：`config/radio-smile/stations.json`
+### Server: `config/radio-smile/stations.json`
 
-> 位置：**游戏根目录/config/radio-smile/**（全局唯一，不随存档变化）
-> 旧版本放在存档内 `serverconfig/radio-smile/` 的配置会**自动迁移**过来。
+> Location: **game root/config/radio-smile/** (global, independent of the world save)
+> Configs from older versions stored in `serverconfig/radio-smile/` inside the world are **migrated automatically**.
 
 ```json
 {
@@ -57,7 +60,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
   "stations": [
     {
       "id": "tiehen",
-      "name": "铁痕电台 #02",
+      "name": "Tiehen Radio #02",
       "icon": "fm907.png",
       "file": "qtfm_tiehen.ogg",
       "mode": "block",
@@ -65,7 +68,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
     },
     {
       "id": "fm907",
-      "name": "杭州潮流音乐电台",
+      "name": "Hangzhou Pop Music Radio",
       "icon": "fm907.png",
       "file": "https://lhttp-hw.qtfm.cn/live/15318146/64k.mp3",
       "mode": "block",
@@ -73,7 +76,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
     },
     {
       "id": "mixlist",
-      "name": "混合播放列表",
+      "name": "Mixed playlist",
       "icon": "",
       "file": "mylist.txt",
       "mode": "sequence",
@@ -83,183 +86,191 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
 }
 ```
 
-#### 顶层字段（频道列表之外）
+#### Top-level fields (outside the station list)
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `ffmpeg` | ffmpeg 可执行文件路径。**留空 = 用 PATH 里的 ffmpeg**；仅当 ffmpeg 不在 PATH 或需指定特定版本时填写（如 `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` 或 `/usr/local/bin/ffmpeg`） |
+| `ffmpeg` | Path to the ffmpeg executable. **Leave empty to use ffmpeg from `PATH`**; only set it when ffmpeg is not on `PATH` or you need a specific build (e.g. `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` or `/usr/local/bin/ffmpeg`) |
 
-#### 频道字段
+#### Station fields
 
-| 字段 | 必填 | 说明 |
+| Field | Required | Description |
 |---|---|---|
-| `id` | ✅ | 唯一标识。**`example` 是保留值**，该 id 的条目不加载 |
-| `name` | ✅ | 显示名称 |
-| `file` | ✅ | 单文件 / 文件夹（播放列表）/ `.txt`（重定向）/ `http(s)` 直播流 |
-| `icon` | | 图标文件名（放在 `icons/`） |
-| `mode` | | 见下表，默认单曲循环 |
-| `rate` | | 液晶屏与列表右侧显示的频率/档位，如 `FM90.7`、`第一期`。不填显示 `NETWORK` |
-| `seed` | | 打乱顺序用的种子，不填则按 id 派生（保证多人一致） |
+| `id` | Yes | Unique identifier. **`example` is reserved**: entries with that id are not loaded |
+| `name` | Yes | Display name |
+| `file` | Yes | Single file / folder (playlist) / `.txt` (redirect) / `http(s)` live stream |
+| `icon` | | Icon filename (placed in `icons/`) |
+| `mode` | | See the table below, defaults to single-track loop |
+| `rate` | | Frequency/slot shown on the LCD and at the right of the list, e.g. `FM90.7`, `Episode 1`. Empty shows `NETWORK` |
+| `seed` | | Seed for shuffling; derived from the id when omitted (keeps every player in sync) |
 
-#### `mode`（播放模式）
+#### `mode` (playback mode)
 
-| 模式 | 可用写法 |
+| Mode | Accepted values |
 |---|---|
-| **单曲循环** | `block` / `single` / `false` / `0` |
-| **列表循环**（按顺序播整条列表，播完从头） | `sequence` / `order` / `loop` / `true` / `1` |
-| **打乱顺序**（固定 seed，所有玩家顺序一致） | `random` / `shuffle` |
+| **Single-track loop** | `block` / `single` / `false` / `0` |
+| **Sequential loop** (plays the whole list in order, then restarts) | `sequence` / `order` / `loop` / `true` / `1` |
+| **Shuffle** (fixed seed, identical order for every player) | `random` / `shuffle` |
 
-> 大小写不敏感，允许首尾空格。不写 `mode` 等同单曲循环。
+> Case-insensitive, leading/trailing whitespace allowed. Omitting `mode` means single-track loop.
 
-### 目录结构
+### Directory layout
 
 ```
 config/radio-smile/
-├── stations.json        电台列表（+ 顶层 ffmpeg 路径）
-├── audio/               原始音频 / 文件夹播放列表 / .txt 重定向列表
-├── icons/               电台图标
-└── cache/               自动生成，可安全删除
-    ├── manifest.json    音频哈希清单（轻量校验）
-    ├── baked/           转码后的 MP3（ffmpeg 产物）
-    └── remote/          网络音频缓存 + .proof 校验包
+├── stations.json        station list (+ top-level ffmpeg path)
+├── audio/               raw audio / folder playlists / .txt redirect lists
+├── icons/               station icons
+└── cache/               generated automatically, safe to delete
+    ├── manifest.json    audio hash manifest (lightweight verification)
+    ├── baked/           transcoded MP3 (ffmpeg output)
+    └── remote/          remote audio cache + .proof verification files
 ```
 
 ---
 
-## txt 重定向播放列表
+## txt redirect playlists
 
-`file` 指向一个 `.txt`（也支持 `.list` / `.m3u` / `.m3u8`）即可把多个来源串成一条播放列表。
+Point `file` at a `.txt` (also `.list` / `.m3u` / `.m3u8`) to chain several sources into one playlist.
 
 ```text
-# 第一行：打乱顺序开关（可整行省略 = false）
+# First line: shuffle switch (the whole line may be omitted = false)
 false
 
-# 之后每行一个来源
+# One source per line from here on
 song_a.mp3
 folder/song_b.ogg
 https://example.com/song.mp3
 ```
 
-### 第一行：打乱顺序
+### First line: shuffle
 
-| 值 | 含义 |
+| Value | Meaning |
 |---|---|
-| `false` / `0` / 省略 | **不打乱**：严格按文件里从上到下的顺序播放（默认） |
-| `true` / `1` | **打乱顺序**：固定 seed，所有玩家听到的顺序一致 |
+| `false` / `0` / omitted | **No shuffle**: strict top-to-bottom file order (default) |
+| `true` / `1` | **Shuffle**: fixed seed, identical order for every player |
 
-> 兼容旧写法：`random`/`shuffle` = 打乱，`sequence`/`order`/`loop` = 不打乱。
+> Legacy spellings still work: `random`/`shuffle` = shuffle, `sequence`/`order`/`loop` = no shuffle.
 
-### 规则
+### Rules
 
-- **播放顺序 = 文件里从上到下**
-- 空行、`#` 开头的行忽略；支持行尾注释（`#` 前需有空白）
-- 本地路径：先相对 txt 所在目录找，再相对 `audio/` 找
-- **网络地址会被下载到本地、转成 MP3 后参与播放**（这样它才有确定的时长，能参与同步）
+- **Playback order = top to bottom in the file**
+- Blank lines and lines starting with `#` are ignored; trailing comments are supported (whitespace required before `#`)
+- Local paths: resolved relative to the txt file first, then relative to `audio/`
+- **Remote URLs are downloaded, transcoded to MP3 and then take part in playback** (that is what gives them a definite duration and lets them join the sync timeline)
 
 ---
 
-## 网络音频与缓存
+## Remote audio and caching
 
-### 直播流 vs 有限音频
+### Live streams vs. finite audio
 
-| 类型 | 判断依据 | 处理 |
+| Type | Detection | Handling |
 |---|---|---|
-| **直播流**（无限） | 无 `Content-Length` | **不能写进 txt**，只能作为频道 `file` 直连 |
-| **有限音频文件** | 有 `Content-Length` | 可写进 txt，会下载缓存、转 MP3 后播放 |
+| **Live stream** (unbounded) | no `Content-Length` | **Cannot go into a txt**, only usable as a station `file` |
+| **Finite audio file** | has `Content-Length` | Can go into a txt; downloaded, cached, transcoded to MP3, then played |
 
-如果在 txt 里写了直播流地址，模组会**自动把那一行注释掉**并注明原因：
+If a live stream URL appears in a txt, the mod **comments that line out automatically** and states why:
 
 ```text
-# [已禁用：流式传输，无法缓存] https://x/live.mp3
+# [disabled: streaming source cannot be cached] https://x/live.mp3
 ```
 
-### 缓存与校验
+### Cache and verification
 
-- 每个网络音频下载后存到 `cache/remote/`
-- 同时生成几 KB 的 **`.proof` 校验包**（文件头 8KB + 总大小）
-- 下次启动只需 Range 请求取头部比对，**不必重新下载**
-- 链接失效（如带 `deadline` 的临时签名地址）时**继续使用已有缓存**，
-  因为本地文件是完整的
+- Every remote audio file is downloaded into `cache/remote/`
+- A few-KB **`.proof`** file is written alongside it (first 8KB of the file + total size)
+- On the next start only a Range request for the header is needed — **no re-download**
+- When the link expires (e.g. a temporary signed URL with `deadline`) the **existing cache keeps being used**,
+  because the local file is complete
 
-> 下载后会自动转码成 MP3。未下载完成的条目处于**挂起**状态，
-> 播放到那一行时**直接跳过到下一首**，后台继续下载。
+> Downloads are transcoded to MP3 automatically. Entries that are not finished stay **pending**:
+> reaching that line in the playlist **skips straight to the next track** while the download continues in the background.
 
 ---
 
-## 客户端配置
+## Client configuration
 
-### ModMenu 界面
+### ModMenu screen
 
-| 项 | 默认 | 说明 |
+| Option | Default | Description |
 |---|---|---|
-| `enableStreaming` | true | 是否接收音频流 |
-| `maxBandwidthKbps` | 64 | 带宽期望 |
-| `maxChunkBytes` | 8192 | 单块大小上限 |
-| `bufferMillis` | 1000 | 抖动缓冲时长（越大越抗抖，延迟越高） |
-| `showNetworkStats` | false | 显示网络调试信息 |
+| `enableStreaming` | true | Whether to receive the audio stream |
+| `maxBandwidthKbps` | 64 | Expected bandwidth |
+| `maxChunkBytes` | 8192 | Upper bound for a single chunk |
+| `bufferMillis` | 1000 | Jitter buffer length (larger = more resilient, higher latency) |
+| `showNetworkStats` | false | Show network debug information |
 
-也可直接编辑 `config/radio-smile-client.json`。
+You can also edit `config/radio-smile-client.json` directly.
 
 ---
 
-## 游戏内使用
+## In-game usage
 
-| 操作 | 效果 |
+| Action | Effect |
 |---|---|
-| 放置收音机 | 自动朝向玩家 |
-| **右键**（任意手持物品） | 打开选台界面（不会误放置方块） |
-| 界面单击频道 | 选中；**再次点击已选中项 = 取消选择** |
-| 滚轮 / ↑↓ | 切换选中 |
-| Enter | 确认并关闭 |
-| 音量滑块 | 每次拖动 5% |
-| 扫描 | 重新拉取电台列表（**不会**重连正在播的流） |
+| Place the radio | Automatically faces the player |
+| **Right-click** (with any item in hand) | Opens the station picker (never places a block by mistake) |
+| Click a station in the list | Selects it; **clicking the selected entry again deselects it** |
+| Scroll wheel / Arrow up, down | Moves the selection |
+| Enter | Confirms and closes |
+| Volume slider | 5% per drag step |
+| Scan | Re-fetches the station list (does **not** reconnect the stream that is currently playing) |
 
-**聆听范围 48 格**，超出自动停止推送。
+**Listening range is 48 blocks**; beyond that the server stops pushing audio.
 
-### 故障显示
+### Fault display
 
-液晶屏在故障时显示 `NOSIGNAL`，红灯闪烁：
+On a fault the LCD shows `NOSIGNAL` and the red light blinks:
 
-| 场景 | 表现 |
+| Situation | Behaviour |
 |---|---|
-| 网络电台上游断了 | 持续底噪 + `NOSIGNAL` |
-| 频道配置失效 / 已删除 | 持续底噪 + `NOSIGNAL` |
-| 玩家走远 | 安静停止（不算故障） |
-| 本地电台读不出音频 | 只在日志报告，屏幕不显示「无信号」 |
+| Upstream internet radio died | Continuous static + `NOSIGNAL` |
+| Station config invalid / removed | Continuous static + `NOSIGNAL` |
+| Player walked away | Quietly stops (not a fault) |
+| Local station cannot read its audio | Logged only; the screen does not claim "no signal" |
 
-> 「无信号」只属于**网络电台**——本地文件不存在没有"信号"这回事。
+> "No signal" belongs to **internet radio only** — a missing local file has no signal to lose.
 
-### 命令
+### Commands
 
-| 命令 | 权限 | 说明 |
+| Command | Permission | Description |
 |---|---|---|
-| `/radio reload` | 2 | 重载配置 + 重建所有订阅（进度重置） |
-| `/reload` | 2 | 同样会重载电台配置 |
+| `/radio reload` | 2 | Reloads the config and rebuilds all subscriptions (progress reset) |
+| `/reload` | 2 | Also reloads the station config |
 
 ---
 
-## 已知限制
+## Known limitations
 
-- 网络直播流**必须是 MP3**，且无法精确定位，只能从连接时刻顺序播放
-- 非 MP3 本地音频**强依赖 ffmpeg**
-- 首次启动需等转码完成（大文件可能几十秒），之后命中缓存秒开
-- 播放列表换曲不是无缝的：解码器重建，两首间有极短空隙
-- 不支持 HLS / HE-AAC 流
-- 直播流**不能**放进 txt 播放列表（无时长，无法参与同步时间轴）
+- Internet live streams **must be MP3** and cannot be seeked; playback is sequential from the moment of connection
+- Non-MP3 local audio **hard-depends on ffmpeg**
+- The first start waits for transcoding (tens of seconds for large files); afterwards it opens instantly from cache
+- Track changes in a playlist are not gapless: the decoder is rebuilt, leaving a very short gap
+- HLS / HE-AAC streams are not supported
+- Live streams **cannot** go into a txt playlist (no duration, so they cannot join the sync timeline)
 
 ---
 
-## 从源码构建
+## Building from source
 
 ```bash
 ./gradlew build
-# 产物：build/libs/radio-smile-1.0.0.jar
+# artifact: build/libs/radio-smile-1.0.0.jar
 ```
 
-需要 JDK 17+。
+Requires JDK 17+.
 
 ---
 
-## 许可证
+## Developer documentation
+
+The engineering handover covers the architecture, network protocol, the audio pipeline and the
+pitfalls that have already been hit (English: [HANDOVER.md](HANDOVER.md), Chinese:
+[HANDOVER.zh-CN.md](HANDOVER.zh-CN.md)).
+
+---
+
+## License
 
 CC0-1.0
