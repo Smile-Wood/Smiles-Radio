@@ -132,6 +132,9 @@ public final class AudioStreamManager {
 			if (existing != null && existing.stationId().equals(stationId)) {
 				// 幂等：重复订阅直接回 OK（同本地电台的复用语义）
 				sendStatus(player, pos, AudioStatus.OK);
+				// 增益随订阅回复一起下发（幂等路径同样发）：客户端若因换台残留了
+				// 旧台的推流增益，这次重订阅就是清掉它的权威时机。
+				writeOutputGain(player, pos, STREAM_GAIN);
 				return null;
 			}
 			long count = SUBSCRIPTIONS.values().stream()
@@ -148,6 +151,16 @@ public final class AudioStreamManager {
 			}
 			STREAMING_SUBS.put(subKey, new StreamingSub(player, pos.immutable(), stationId));
 			sendStatus(player, pos, AudioStatus.OK);
+			// <b>增益随订阅回复下发</b>（用户提议）：网络电台的增益不该由客户端自己猜，
+			// 服务端在订阅成立的那一刻就说清楚——透传流恒为 1.0。
+			//
+			// 为什么必须在订阅时发：网络电台此后不再有音频块，pump 的
+			// 「增益变了才补发」路径永远不会为它触发。若客户端表里残留着
+			// 这个方块此前放本地台时收到的 outputGain（如 0.25），换到网络台后
+			// 没有任何包来覆盖它，整路就会被永久压到 25%——这正是
+			// 「网络电台声音小」的根因。订阅时下发 = 权威覆盖，客户端侧的
+			// 建流/停流兜底清理退居第二道防线。
+			writeOutputGain(player, pos, STREAM_GAIN);
 			SmileSRadio.LOGGER.info("网络电台订阅登记 {} @{}（客户端自行拉流）", stationId, pos);
 			return null;
 		}
@@ -746,6 +759,15 @@ public final class AudioStreamManager {
 	 * 客户端另有 {@code PcmSink.TRANSITION_SILENCE_MAX_MILLIS} = 3s 的总上限兜底。
 	 */
 	private static final int COMMAND_SWITCH_SILENCE_MILLIS = 1200;
+
+	/**
+	 * 网络电台订阅的增益（恒为 1.0）。
+	 *
+	 * <p>理由见 {@link #outputGainFor}：网络流是原样透传，电平本来就低一档，
+	 * 压它等于篡改别人的流。这个值随订阅回复下发（见 {@code subscribe} 的
+	 * 网络电台分支），让客户端的增益表在订阅成立时就被服务端权威刷新。
+	 */
+	private static final float STREAM_GAIN = 1.0F;
 
 	/**
 	 * 这个订阅当前的推流增益（0.00~1.00）。
