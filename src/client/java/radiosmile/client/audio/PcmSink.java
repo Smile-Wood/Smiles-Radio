@@ -833,15 +833,22 @@ public final class PcmSink {
 	}
 
 	public void playTuningNoise() {
-		// <b>去重</b>：一次换台会从多处触发——客户端收到握手回执（S2C_SELECT_ACK）
-		// 会触发一次，随后第一块新数据到达、handleChunk 发现频道变了又会触发一次。
+		// <b>去重</b>：一次换台会从多处触发——玩家点台的瞬间（selectStation）、
+		// 客户端收到握手回执（S2C_SELECT_ACK）、随后第一块新数据到达。
 		// 两次相隔仅几毫秒，早期会表现为「噪声放两遍」。
 		//
-		// 这里用一个很短的时间窗做去重：窗内的重复触发直接忽略。
+		// 这里用一个很短的时间窗做去重：窗内的重复触发<b>不硬重置</b>、
+		// 只「重新撑住」（retrigger）。硬重置会把已爬起来的增益拉回淡入起点，
+		// 听感是噪声一抖一抖；只忽略也不行——高 ping 下回执可能迟到超过
+		// 「稳定接上」的判定窗（约 300ms），旧台还没淡完的音频会把
+		// stableAudioBlocks 喂满，噪声提前退场，症状正是
+		// 「声音没了噪音才起」。重新撑住只清计数，不动增益。
+		//
 		// 窗长必须远小于一次正常换台的间隔，否则连续快速切台会被吞掉；
 		// 又不能太短，否则挡不住上述那对事件。
 		long now = System.currentTimeMillis();
 		if (now - this.lastTuningNoiseAt < TUNING_NOISE_DEDUPE_MILLIS) {
+			this.tuningNoise.retrigger();
 			return;
 		}
 		this.lastTuningNoiseAt = now;

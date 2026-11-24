@@ -28,12 +28,13 @@ import java.util.Random;
  * 再叠加一个最长上限，避免上游彻底坏掉时噪声无限响下去。
  *
  * <h2>音量</h2>
- * 刻意做得比节目<b>轻</b>（实测旧参数比节目响 8dB，正是「突然出现」的原因）。
- * 它是背景填补，不是主角。
+ * 与节目<b>同档</b>（用户实测反馈：太轻盖不住交界处的声音，「声音没了噪音才起」）。
+ * 调台噪的职责是<b>掩盖</b>——旧台淡出与新台进入都应发生在噪声底下；
+ * 早期参数（比节目轻一档甚至更多）只会「填补空白」，盖不住任何东西。
  */
 public final class TuningNoise {
-	/** 空窗期间维持的噪声强度（相对满幅）：比节目轻，只起填补作用。 */
-	private static final float HOLD_LEVEL = 0.075F;
+	/** 空窗期间维持的噪声强度（相对满幅）：与节目同档，才能真正盖住交界处的声音。 */
+	private static final float HOLD_LEVEL = 0.25F;
 	/**
 	 * 最长连续发声时间（毫秒）。
 	 *
@@ -90,6 +91,25 @@ public final class TuningNoise {
 		this.lowpassState = 0.0F;
 		this.highpassPrevIn = 0.0F;
 		this.highpassPrevOut = 0.0F;
+	}
+
+	/**
+	 * 重新撑住一次正在进行的调台噪（不重置增益与滤波器）。
+	 *
+	 * <p>去重窗内的重复触发走这里而不是 {@link #trigger()}：一次换台会从
+	 * 多处触发（点台瞬间、服务端回执、首块数据），若每次都硬重置，已爬起来的
+	 * 增益会被反复拉回淡入起点，听感是噪声「一抖一抖」。
+	 *
+	 * <p>但要重置两个计数：<b>稳定计数</b>（否则旧台还没淡完的音频会把
+	 * 「接上了」的判定喂满，噪声提前退场——高 ping 下回执迟到时正是这样，
+	 * 症状是「声音没了噪音才起」）和<b>衰减观察期</b>。startedAt 也刷新，
+	 * 让最长时长保护从最后一次确认重新计时。
+	 */
+	public void retrigger() {
+		this.active = true;
+		this.startedAt = System.currentTimeMillis();
+		this.stableAudioBlocks = 0;
+		this.fadeoutHoldBlocks = 0;
 	}
 
 	/** 当前是否在发声。 */

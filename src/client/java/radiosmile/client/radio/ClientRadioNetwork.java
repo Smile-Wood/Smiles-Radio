@@ -413,6 +413,19 @@ public final class ClientRadioNetwork {
 		if (!ClientPlayNetworking.canSend(RadioNetworking.C2S_SELECT_STATION)) {
 			return;
 		}
+		// <b>调台噪在点台瞬间就起，不等服务端回执</b>（用户实测反馈：
+		// 「声音没了噪音才起」「淡入的时机还是太晚了」）。
+		//
+		// 拧旋钮的那一刻，喇叭里就该是沙沙声——旧台此刻还在放，
+		// 噪声与它重叠，正是真实收音机的手感（一边沙沙响着一边旧台淡出）。
+		// 若等 S2C_SELECT_ACK 才触发，旧节目已经放到了最后一刻，
+		// 噪声起音时节目正好消失，听感是「声音没了噪音才冒出来」。
+		//
+		// 坐标此时就是本方块的坐标（换台不改方块位置）；
+		// 回执到达后的那次触发落在去重窗内，只会「重新撑住」不重置增益。
+		// 若选择失败（服务端不回执），旧音频继续供数，
+		// 「连续稳定」判定会把噪声自然淡出——不会卡在沙沙声里。
+		radiosmile.client.audio.PcmSink.INSTANCE.playTuningNoise(pos);
 		FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
 		buf.writeUtf(stationId);
 		buf.writeBlockPos(pos == null ? net.minecraft.core.BlockPos.ZERO : pos);
