@@ -61,6 +61,29 @@ public final class RadioNetworking {
 	 */
 	public static final ResourceLocation S2C_RELOADED = SmileSRadio.id("s2c_reloaded");
 
+	/**
+	 * 「空音量包」：服务端在<b>换曲预载 / 重载重建</b>期间下发的<b>无音频</b>包。
+	 *
+	 * <h2>为什么需要它</h2>
+	 * 换曲那一刻客户端会关掉旧解码器并 {@code flush()} 声卡，然后重新攒抖动缓冲，
+	 * 中间必然有几百毫秒「没有任何音源供上数据」。这段时间与「丢包」在客户端
+	 * 的判据里<b>无法区分</b>，于是会被当成弱网：响一段本该只在断网时出现的底噪。
+	 *
+	 * <p>服务端是<b>知道</b>这次空窗的（它正卡在打开下一首里），所以由它显式声明
+	 * 「接下来这段是预载，请输出数字静音、别当故障」是最准确的做法——
+	 * 客户端不必靠猜时限，也不必为一个客户端侧的常量去赌各种预载耗时。
+	 *
+	 * <h2>载荷</h2>
+	 * 方块坐标 + 频道 id + 曲目序号（便于日志对齐）+ 本次声明掩护的毫秒数。
+	 * <b>没有音频字节</b>：它不参与解码，只影响混音器的故障判定。
+	 *
+	 * <h2>为什么单开通道而不是复用数据块</h2>
+	 * 复用 {@code S2C_AUDIO_CHUNK} 只能靠「载荷为空」表达，而那已经是心跳的语义；
+	 * 再叠一层就得分长度、分格式 id，任何一处错位都会被当成 MP3 字节喂给解码器。
+	 * 单开通道最坏情况只是「旧客户端不认识这个通道、按原样响底噪」，不会污染音频。
+	 */
+	public static final ResourceLocation S2C_AUDIO_SILENCE = SmileSRadio.id("s2c_audio_silence");
+
 	private RadioNetworking() {
 	}
 

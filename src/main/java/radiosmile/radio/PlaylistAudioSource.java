@@ -53,14 +53,37 @@ public final class PlaylistAudioSource implements AudioSource {
 		while (!this.closed) {
 			byte[] data = this.current.read(maxBytes);
 			if (data != null && data.length > 0) {
+				// 新曲的第一个非空块到手：预载结束。
+				this.preloading = false;
 				return data;
 			}
 			// 当前曲目读完：切下一首（末尾回到第 0 首）
+			//
+			// <b>从这里到下一圈读到数据之间是「预载窗口」</b>：关旧曲、开新曲、
+			// 探测时长全在这个窗口里，期间一个字节也产不出来。推送线程靠
+			// {@link #isPreloadingTracks()} 认出这段窗口并下发空音量包，
+			// 免得客户端把它当弱网响底噪。
+			this.preloading = true;
 			if (!this.advance()) {
+				this.preloading = false;
 				return null;
 			}
 		}
 		return null;
+	}
+
+	/** 是否正在预载下一首（读线程卡在 {@link #advance()} 里）。 */
+	private volatile boolean preloading;
+
+	/**
+	 * 是否正在<b>换曲预载</b>。
+	 *
+	 * <p>由读线程置位、推送线程读取，因此必须是 {@code volatile}——
+	 * 两边是不同线程，靠它传递「现在这段没数据是正常的」这一判断。
+	 */
+	@Override
+	public boolean isPreloadingTracks() {
+		return this.preloading;
 	}
 
 	/**

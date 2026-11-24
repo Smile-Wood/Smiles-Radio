@@ -546,7 +546,28 @@ public final class AudioStreamManager {
 			// 这时继续发空包只会让客户端以为"一切正常"而永远不报故障。
 			// 因此只在<b>流还没结束</b>时发；真结束时不发，让客户端按既有逻辑判超时。
 			if (!sub.source().isFinished()) {
-				sendHeartbeat(sub);
+				// <b>换曲预载期间发「空音量包」，而不是普通心跳。</b>
+				//
+				// 两者都带 0 字节音频，差别只在语义与客户端的处置：
+				//   - 心跳：只告诉客户端"我还活着"，底噪该响还是响；
+				//   - 空音量包：明确声明"这段没声是换曲预载，请输出数字静音"，
+				//     客户端据此推迟故障判定（有总上限，见 PcmSink#TRANSITION_SILENCE_MAX_MILLIS）。
+				//
+				// <p>顺带修掉一个心率问题：这条分支原来<b>不判</b> {@code isHeartbeatDue}，
+				// 而推送线程 5ms 转一圈、{@code isDue()} 在没数据时又会一直为真，
+				// 于是空窗期间等于每 5ms 发一个包。现在按各自的间隔节流：
+				// 空音量包 {@link AudioSubscription#SILENCE_INTERVAL_MILLIS}（200ms，
+				// 必须比重载/换曲空窗更密，否则两头都盖不住），
+				// 心跳 {@code HEARTBEAT_INTERVAL_MILLIS}（1000ms，仍远小于客户端判超时的 8 秒）。
+				if (sub.source().isPreloadingTracks()) {
+					if (sub.isSilenceDue(now)) {
+						sendSilence(sub, PRELOAD_SILENCE_MILLIS);
+					}
+					return;
+				}
+				if (sub.isHeartbeatDue(now)) {
+					sendHeartbeat(sub);
+				}
 			}
 			return;
 		}
@@ -582,6 +603,13 @@ public final class AudioStreamManager {
 		// 队列积压约 4 秒，现读会让标签比字节流早约 4 秒，
 		// 客户端提前重建解码器并 flush 声卡 → 每次换曲约 1 秒静音。
 		int trackIndex = chunk.trackIndex();
+		// 换曲后的第一块：先声明一段「换曲空窗」，再发这块音频。
+		//
+		// 客户端收到这块数据时会关旧解码器 + flush 声卡 + 重新攒抖动缓冲，
+		// 中间几百毫秒没有任何音源供数。那段时间它自己的判据分不清
+		// 「换曲」和「丢包」，会点亮本该只在断网时出现的底噪。
+		// 由服务端提前说一句「这是预载」最准确——时限也只有服务端清楚。
+		boolean trackSwitched = sub.noteSentTrackIndex(trackIndex);
 		// 流会话号：网络流重连后会变，客户端据此重建解码器
 		int sessionId = sub.sessionId();
 		server.execute(() -> {
@@ -590,13 +618,20 @@ public final class AudioStreamManager {
 					SmileSRadio.LOGGER.warn("无法发送音频块：通道不可用 {}", target.getName().getString());
 					return;
 				}
-			FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
-			buf.writeBlockPos(targetPos);
-			buf.writeUtf(stationId);
-			buf.writeVarInt(trackIndex);
-			buf.writeVarInt(sessionId);
-			buf.writeVarInt(format.id());
-			buf.writeByteArray(data);
+				// 顺序<b>必须</b>是「空音量包 -> 音频块」：两个包在同一个
+				// server.execute 里发出，Fabric 的自定义载荷走可靠有序通道，
+				// 客户端会先开窗、后处理换曲，不会出现「先 flush 再开窗」的时序空档。
+				if (trackSwitched) {
+					writeSilence(target, stationId, targetPos, trackIndex,
+							TRACK_SWITCH_SILENCE_MILLIS);
+				}
+				FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
+				buf.writeBlockPos(targetPos);
+				buf.writeUtf(stationId);
+				buf.writeVarInt(trackIndex);
+				buf.writeVarInt(sessionId);
+				buf.writeVarInt(format.id());
+				buf.writeByteArray(data);
 				ServerPlayNetworking.send(target, RadioNetworking.S2C_AUDIO_CHUNK, buf);
 			} catch (Throwable t) {
 				SmileSRadio.LOGGER.error("[发送失败] 音频块发包异常", t);
@@ -655,6 +690,82 @@ public final class AudioStreamManager {
 				SmileSRadio.LOGGER.error("[心跳] 空包发送异常", t);
 			}
 		});
+	}
+
+	/**
+	 * 换曲后的第一块音频之前，声明多长的「过渡静音窗」（毫秒）。
+	 *
+	 * <p>这段时间正好是客户端关旧解码器 + {@code flush()} 声卡 +
+	 * 重新攒够抖动缓冲所需的时间（起播门槛约 300ms，再加重建解码器）。
+	 * 取 900ms 留余量；客户端另有总上限
+	 * （{@code PcmSink.TRANSITION_SILENCE_MAX_MILLIS} = 3 秒），真故障仍会按时报出来。
+	 */
+	private static final int TRACK_SWITCH_SILENCE_MILLIS = 900;
+
+	/**
+	 * 换曲预载期间，每个空音量包声明掩护的时长（毫秒）。
+	 *
+	 * <p>略大于发包间隔（{@link AudioSubscription#SILENCE_INTERVAL_MILLIS} = 200ms），
+	 * 使相邻两包声明的窗口<b>相互重叠</b>——包与包之间不能留缝，
+	 * 缝里客户端会重新走回「没数据 = 掉线」的判定。
+	 */
+	private static final int PRELOAD_SILENCE_MILLIS = 400;
+
+	/**
+	 * 发送一个<b>空音量包</b>（无音频字节，只是一句「这段请按数字静音处理」）。
+	 *
+	 * <p>用于换曲预载期：读线程卡在打开下一首里，队列排空，
+	 * 客户端若只看到「没数据」就会当弱网响底噪。
+	 *
+	 * <p><b>客户端不认识这个通道时自动降级</b>（{@code canSend} 返回 false）：
+	 * 旧客户端会保持原行为（提前一点响底噪），不会被污染音频——
+	 * 这正是单开通道而不是复用数据块的价值。
+	 *
+	 * @param sub    订阅
+	 * @param millis 本次声明掩护的毫秒数
+	 */
+	private static void sendSilence(AudioSubscription sub, int millis) {
+		ServerPlayer target = sub.player();
+		if (target == null || target.hasDisconnected()) {
+			return;
+		}
+		// 与心跳同理：立刻记时间，否则推送线程每 5ms 转一圈就判定「又该发了」。
+		sub.markSilenceSent(System.currentTimeMillis());
+		String stationId = sub.station().id();
+		BlockPos targetPos = sub.pos();
+		int trackIndex = sub.trackIndex();
+		var server = target.getServer();
+		if (server == null) {
+			return;
+		}
+		server.execute(() -> {
+			try {
+				writeSilence(target, stationId, targetPos, trackIndex, millis);
+			} catch (Throwable t) {
+				SmileSRadio.LOGGER.error("[空音量包] 发送异常", t);
+			}
+		});
+	}
+
+	/**
+	 * 真正写包（<b>不含线程跳转</b>），必须在服务端主线程调用。
+	 *
+	 * <p>抽出来是为了能在 {@code pump()} 的 {@code server.execute} 块里
+	 * <b>与音频块顺序发出</b>：两个包若各自 {@code execute} 一次，
+	 * 入队顺序与执行顺序就不再保证，「先开窗、后换曲」的时序会反过来。
+	 */
+	private static void writeSilence(ServerPlayer target, String stationId, BlockPos pos,
+			int trackIndex, int millis) {
+		if (!ServerPlayNetworking.canSend(target, RadioNetworking.S2C_AUDIO_SILENCE)) {
+			return;
+		}
+		FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
+		buf.writeBlockPos(pos);
+		buf.writeUtf(stationId);
+		// 曲目序号只为日志对齐：客户端不靠它做任何判定（换曲仍以数据块为准）。
+		buf.writeVarInt(trackIndex);
+		buf.writeVarInt(millis);
+		ServerPlayNetworking.send(target, RadioNetworking.S2C_AUDIO_SILENCE, buf);
 	}
 
 	public static void sendStatus(ServerPlayer player, BlockPos pos, int status) {

@@ -40,8 +40,15 @@ public final class NetworkNoise {
 	private static final float PULSE_LEVEL = 0.85F;
 
 	private final Random random = new Random();
-	/** 当前实际增益（0~1），向目标值平滑逼近。 */
-	private float gain;
+	/**
+	 * 当前实际增益（0~1），向目标值平滑逼近。
+	 *
+	 * <p><b>{@code volatile}</b>：它会被混音线程之外的线程直接改写——
+	 * 切歌/切台时 {@link PcmSink#beginTransitionSilence} 会立刻 {@code reset()}，
+	 * 那一刻必须对混音线程<b>立即可见</b>，否则下一块还会按旧增益发出「沙」的一声。
+	 * 只在这一处被读（每块一次，不在逐采样循环里），代价可忽略。
+	 */
+	private volatile float gain;
 	/** 低通状态。 */
 	private float lowpassState;
 

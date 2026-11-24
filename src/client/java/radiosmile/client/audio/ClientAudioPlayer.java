@@ -331,6 +331,17 @@ public final class ClientAudioPlayer {
 			// 注意要在 flush 之后触发，否则噪声自己也被清掉。
 			// 传入 pos 让噪声跟随【该方块自己的音量滑块】。
 			PcmSink.INSTANCE.playTuningNoise(pos);
+			// <b>标记「这是我们自己造成的空窗」</b>：见 PcmSink#beginTransitionSilence()。
+			//
+			// 上面的 flush() 把抖动缓冲清了，接下来几百毫秒没有任何音源供数——
+			// 混音器的判据分不清这和丢包的区别，8 块（约 160ms）后就会把
+			// 「弱网底噪」拉到满强度，节目接上后还要再沙 500ms。
+			// 听感正是「一换歌就沙一阵」。
+			//
+			// 服务端在换曲的第一块之前也会发一个空音量包（S2C_AUDIO_SILENCE）
+			// 做同样的事；这里是<b>兜底</b>：包丢了、或对面是旧服务端时，
+			// 本地判定仍然能把这段空窗认出来。
+			PcmSink.INSTANCE.beginTransitionSilence();
 			stream = null;
 		}
 		if (stream == null) {

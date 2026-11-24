@@ -358,6 +358,59 @@ public final class AudioSubscription {
 		this.lastSendAt = now;
 	}
 
+	/**
+	 * 「空音量包」的发送间隔（毫秒）。
+	 *
+	 * <p>取 <b>200ms</b>：它要<b>比重载/换曲的空窗更密</b>，否则两头都盖不住——
+	 * 客户端的过渡静音窗是按「本包声明的时长」铺开的，包与包之间只要有缝，
+	 * 缝里就会重新走回「没数据 = 掉线」的判定。
+	 *
+	 * <p>同时远大于推送线程的 5ms 轮询粒度，不会变成刷屏。
+	 */
+	public static final long SILENCE_INTERVAL_MILLIS = 200L;
+
+	/** 上次发空音量包的时刻。 */
+	private volatile long lastSilenceAt;
+
+	/** 是否该发空音量包了（与心跳各自独立计时）。 */
+	public boolean isSilenceDue(long now) {
+		return now - this.lastSilenceAt >= SILENCE_INTERVAL_MILLIS;
+	}
+
+	/**
+	 * 记录一次空音量包。
+	 *
+	 * <p>同时刷新 {@code lastSendAt}：空音量包也算「服务端发包了」，
+	 * 否则心跳路径会在同一时刻再多发一个冗余包。
+	 */
+	public void markSilenceSent(long now) {
+		this.lastSilenceAt = now;
+		this.lastSendAt = now;
+	}
+
+	/**
+	 * 上次真正发出的音频块的曲目序号；{@code -1} 表示还没发过。
+	 *
+	 * <p>只用来判断「本块是不是换曲后的第一块」——换曲那一刻客户端会重建解码器
+	 * 并 flush 声卡，服务端要提前发一个空音量包把这段空窗声明出去。
+	 */
+	private int lastSentTrackIndex = -1;
+
+	/**
+	 * 记录本块的曲目序号，并回答「这是不是换曲后的第一块」。
+	 *
+	 * <p><b>必须在真正发包之前调用</b>，且用块里冻结的序号
+	 * （见 {@link Chunk}）——用音源当前序号会让判定提前约一个队列（4 秒）。
+	 *
+	 * @param trackIndex 本块的曲目序号
+	 * @return 是否发生了换曲（首次发包恒为 {@code false}）
+	 */
+	public synchronized boolean noteSentTrackIndex(int trackIndex) {
+		boolean switched = this.lastSentTrackIndex >= 0 && this.lastSentTrackIndex != trackIndex;
+		this.lastSentTrackIndex = trackIndex;
+		return switched;
+	}
+
 
 	/**
 	 * 记一次发送并安排下一次。

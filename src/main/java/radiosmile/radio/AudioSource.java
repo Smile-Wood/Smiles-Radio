@@ -113,6 +113,23 @@ public interface AudioSource {
 	boolean isFinished();
 
 	/**
+	 * 是否正在<b>预载下一首</b>（播放列表换曲时卡在打开下一首文件的过程里）。
+	 *
+	 * <p>换曲的两端并不对称：读线程在 {@code advance()} 里关旧曲、开新曲、
+	 * 探测时长，这段时间<b>一个字节也产不出来</b>；队列随之外排空，
+	 * 推送线程看到的只是「没数据」。
+	 *
+	 * <p>服务端据此在预载期间下发
+	 * {@link radiosmile.net.RadioNetworking#S2C_AUDIO_SILENCE 空音量包}，
+	 * 告诉客户端「这段空窗是换曲，按数字静音处理，别当弱网响底噪」。
+	 *
+	 * @return 单文件 / 网络流恒为 {@code false}（它们没有"下一首"这回事）
+	 */
+	default boolean isPreloadingTracks() {
+		return false;
+	}
+
+	/**
 	 * 提示性重置/重开（用于本地文件在循环点回到开头）。
 	 *
 	 * <p>网络流不支持 seek，实现应为空操作。

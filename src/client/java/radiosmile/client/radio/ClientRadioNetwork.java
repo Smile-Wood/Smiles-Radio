@@ -62,6 +62,11 @@ public final class ClientRadioNetwork {
 						// 音量/距离/声像播放，与节目完全一致。
 						radiosmile.client.audio.PcmSink.INSTANCE.playTuningNoise(ackPos);
 
+						// 紧接着旧音频会被淡出并移除，新订阅的数据要等建连 + 预热，
+						// 这中间同样是一段「没有任何音源供数」的空窗——一并声明掉，
+						// 免得换台时也响一段弱网底噪。
+						radiosmile.client.audio.PcmSink.INSTANCE.beginTransitionSilence();
+
 						// 然后让旧音频淡出（不是硬切），与噪声重叠约 120ms，
 						// 这样交界处没有断点。服务端此刻已开始为新频道建连
 						// （网络流约 1 秒），旧内容不再是「当前节目」。
@@ -95,6 +100,24 @@ public final class ClientRadioNetwork {
 							radiosmile.radio.AudioFormat.byId(formatId), data);
 				});
 
+		// 「空音量包」：服务端声明「接下来这段是换曲预载/重载，请输出数字静音」。
+		//
+		// <b>它不带任何音频字节</b>，绝不能被喂给解码器；作用只有一个——
+		// 把混音器的过渡静音窗往后铺，让它在预载期间不把「没有任何音源供数」
+		// 当成弱网去响底噪（见 PcmSink#beginTransitionSilence）。
+		//
+		// <b>不 hop 到主线程</b>：窗口是时间敏感的（覆盖范围只有几百毫秒），
+		// 再等一个客户端 tick（最多 50ms）会让开头露在窗外。
+		// 这个方法只写 volatile 时间戳与混音线程独占的计数器，可以在网络线程直接调。
+		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_AUDIO_SILENCE,
+				(Minecraft client, ClientPacketListener handler, FriendlyByteBuf buf, PacketSender sender) -> {
+					buf.readBlockPos();          // 方块坐标：目前不参与判定，读掉以免字节错位
+					buf.readUtf();               // 频道 id：同上，为日志对齐预留
+					buf.readVarInt();            // 曲目序号：换曲仍以数据块为准
+					int millis = buf.readVarInt();
+					radiosmile.client.audio.PcmSink.INSTANCE.beginTransitionSilence(millis);
+				});
+
 		// 服务端重载了电台配置：接下来会有一轮重建订阅带来的跳变。
 		// 播一段调台噪把它盖住，并把各方块的故障显示清掉（重载后即将重新订阅）。
 		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_RELOADED,
@@ -102,6 +125,11 @@ public final class ClientRadioNetwork {
 					client.execute(() -> {
 						radiosmile.SmileSRadio.LOGGER.info("服务端已重载电台配置，播放跳变将由调台噪掩盖");
 						radiosmile.client.audio.PcmSink.INSTANCE.playTuningNoise();
+						// 重载会重建<b>每个频道</b>的订阅（网络台还要含建连），
+						// 空窗比普通换曲长得多，所以这里直接给一个更长的窗。
+						// 上限由 PcmSink 自己钳住（TRANSITION_SILENCE_MAX_MILLIS），
+						// 真坏掉的台仍会按时响底噪。
+						radiosmile.client.audio.PcmSink.INSTANCE.beginTransitionSilence(2000);
 					});
 				});
 

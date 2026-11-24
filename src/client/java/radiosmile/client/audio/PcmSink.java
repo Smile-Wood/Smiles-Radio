@@ -640,6 +640,10 @@ public final class PcmSink {
 		this.weakNoiseHeld = false;
 		this.healthyBlocks = 0;
 		this.failingNow = false;
+		// 用户关台：过渡静音窗一并作废。留着它只会让「下次开台」白得一段掩护，
+		// 而那次开台本来就有自己的窗口。
+		this.transitionSilenceUntil = 0L;
+		this.transitionSilenceCapUntil = 0L;
 	}
 
 	/**
@@ -1351,6 +1355,26 @@ public final class PcmSink {
 			return;
 		}
 
+		// <b>过渡静音窗</b>：切歌 / 切台 / 重载时我们自己 flush 出来的空窗，
+		// 不是链路故障。窗内一律按数字静音处理，判据全部清零（详见
+		// {@link #transitionSilenceUntil}）。
+		//
+		// <p>判据顺序很关键：这一段必须<b>早于</b>下面 healthy / thinning 的计算。
+		// flush 之后缓冲是 0，那两个判据必然"不健康"，先算就等于先 latch 弱底噪，
+		// 之后即使窗内把目标压成 0，{@code weakNoiseHeld} 的粘性也会让它
+		// 在窗后接着响 500ms。
+		//
+		// <p>只在「服务端没有明确报故障」时生效：{@code faultReported} 是被告知的结论，
+		// 优先级高于我们从欠载里做的推测。
+		if (!this.faultReported && this.inTransitionSilence()) {
+			this.consecutiveUnderruns = 0;
+			this.weakNoiseHeld = false;
+			this.healthyBlocks = 0;
+			this.failingNow = false;
+			this.networkNoise.updateTarget(0.0F);
+			return;
+		}
+
 		// 抖动缓冲是否已经回到健康水平（用来撤销「弱底噪」）。
 		//
 		// <b>这里合并了两个判据</b>：
@@ -1766,6 +1790,124 @@ public final class PcmSink {
 		this.recentThinnedBlocks = 0;
 		this.thinWindowCounter = 0;
 		this.networkNoise.reset();
+	}
+
+	// ------------------------------------------------------- 过渡静音窗（切歌/切台）
+
+	/**
+	 * 一次「换曲 / 换台 / 重载」过渡的默认静音窗长度（毫秒）。
+	 *
+	 * <p>取值依据：空窗 = 拆解码器 + {@link #flush()} + 重新攒够抖动缓冲。
+	 * 最后一项由 {@code startupTargetFrames()} 决定（默认约 300ms），
+	 * 再叠加解码器重建与首帧解码的开销，实测 300~700ms。
+	 * 取 900ms 留余量，又不至于把真正的故障也一起盖掉。
+	 */
+	public static final int TRANSITION_SILENCE_MILLIS = 900;
+
+	/**
+	 * 过渡静音窗的<b>总上限</b>（毫秒）：从这一窗第一次打开起算，最多掩护这么久。
+	 *
+	 * <h2>为什么必须有上限</h2>
+	 * 窗口可以被反复延长：服务端在换曲预载期间会连发「空音量包」
+	 * （{@code S2C_AUDIO_SILENCE}），每包都把窗口往后推一点。
+	 * 若没有总上限，上游彻底卡死时这些包会一直来，底噪就<b>永远不会响</b>——
+	 * 玩家听到的是无限静音，比听到底噪更糟（无法判断"是在加载还是坏了"）。
+	 *
+	 * <p>取 3000ms：正常换曲空窗（300~900ms）绰绰有余，
+	 * 而且远小于客户端判 {@code STALL_TIMEOUT} 的 8 秒——
+	 * 也就是说「窗口到顶」总是早于「客户端判超时」，两者不会打架。
+	 */
+	public static final int TRANSITION_SILENCE_MAX_MILLIS = 3000;
+
+	/**
+	 * 「过渡静音窗」结束时刻（{@link System#currentTimeMillis()} 口径）。
+	 *
+	 * <h2>它解决什么</h2>
+	 * 切歌 / 切台 / {@code /radio reload} 时，客户端会主动
+	 * {@code stream.close()} + {@code PcmSink.flush()}，于是混音器接下来有
+	 * <b>几百毫秒没有任何音源供上数据</b>。这段窗口在
+	 * {@link #updateNetworkNoise()} 眼里与「丢包」<b>完全一样</b>：
+	 * <ul>
+	 *   <li>{@code starved = true} → {@code consecutiveUnderruns} 每块 +1；</li>
+	 *   <li>8 块（约 160ms）后 {@code failing = true} → 底噪<b>直接拉到满强度</b>；</li>
+	 *   <li>此时 {@code streamFlowing} 早就是 true，预热门根本拦不住；</li>
+	 *   <li>抖动缓冲被 flush 归零，{@code isBufferThinning()} 与
+	 *       {@code isJitterBufferThinned()} 同时成立 → {@code weakNoiseHeld} 也粘住，
+	 *       节目接上后还要再沙 {@link #HEALTHY_RESTORE_BLOCKS} 块（约 500ms）才退。</li>
+	 * </ul>
+	 * 听感正是「一换歌就沙一阵」——这不是弱网，是<b>我们自己制造的</b>空窗。
+	 *
+	 * <h2>窗内做什么</h2>
+	 * 一律按<b>数字静音</b>处理：不判欠载、不 latch 弱底噪、目标增益归零。
+	 * 混音器照常把全 0 的 PCM 帧写给声卡（{@link #toBytes} 输出幅度 0，
+	 * 声卡时钟因此不停），跳变仍由调台噪盖住。
+	 *
+	 * <p>窗一过判据立刻恢复——真断线仍在约 160ms 后响底噪，不会被永久掩盖。
+	 *
+	 * <p><b>唯一例外</b>：{@code faultReported}（服务端/本地<b>明确告知</b>的故障）
+	 * 优先级更高，窗内也照响。重载后若服务端已报 NOSIGNAL，不该被一次切台顺手盖掉。
+	 */
+	private volatile long transitionSilenceUntil;
+
+	/** 本窗的总上限时刻；{@code 0} 表示尚未开过窗。见 {@link #TRANSITION_SILENCE_MAX_MILLIS}。 */
+	private volatile long transitionSilenceCapUntil;
+
+	/**
+	 * 打开 / 延长一个过渡静音窗（默认 {@link #TRANSITION_SILENCE_MILLIS}）。
+	 *
+	 * <p>必须在「已经决定要 flush / 已经 flush」<b>之后</b>调用：
+	 * 顺序反了的话噪声会先响起来再被收掉，听感是切换瞬间「沙」一下。
+	 *
+	 * <h2>可以重复调用</h2>
+	 * 服务端换曲预载期间会连发空音量包，每包都调一次这里；
+	 * 同一窗内的重复调用表现为<b>延长</b>，而不是重新起算——
+	 * 总时长仍受 {@link #TRANSITION_SILENCE_MAX_MILLIS} 约束。
+	 *
+	 * <p><b>线程</b>：主线程与音频摄入线程都可以调用。只写几个 volatile 时间戳
+	 * 与混音线程独占的计数器，与 {@link #clearNetworkNoise()} 的线程纪律一致。
+	 */
+	public void beginTransitionSilence() {
+		this.beginTransitionSilence(TRANSITION_SILENCE_MILLIS);
+	}
+
+	/**
+	 * 打开 / 延长一个指定长度的过渡静音窗。
+	 *
+	 * @param millis 本次希望掩护的时长（毫秒）；{@code <= 0} 时退回默认值
+	 */
+	public void beginTransitionSilence(int millis) {
+		int span = millis > 0 ? millis : TRANSITION_SILENCE_MILLIS;
+		long now = System.currentTimeMillis();
+		if (now >= this.transitionSilenceCapUntil) {
+			// 上一窗已经彻底结束（或从未开过）：重新起算总上限。
+			// 判据用 cap 而不是 until——until 会被「延长」不断推后，
+			// 用它会导致一窗接一窗永远开不完。
+			this.transitionSilenceCapUntil = now + TRANSITION_SILENCE_MAX_MILLIS;
+		}
+		long until = Math.min(now + span, this.transitionSilenceCapUntil);
+		this.transitionSilenceUntil = Math.max(this.transitionSilenceUntil, until);
+		this.consecutiveUnderruns = 0;
+		this.weakNoiseHeld = false;
+		this.healthyBlocks = 0;
+		// 卡顿滑动窗口也要清：否则窗一过，flush 前攒下的「见薄」痕迹
+		// 还会让弱底噪再响一阵，正好落在新节目的开头。
+		this.recentThinnedBlocks = 0;
+		this.thinWindowCounter = 0;
+		this.failingNow = false;
+		// <b>立刻收声，不能只 updateTarget(0)</b>：落音步长是 {@code 0.06}/块，
+		// 从满强度走下来要 16 块（约 320ms）——那正好是切换空窗本身，
+		// 等于噪声盖着新节目的开头。reset() 是瞬时归零。
+		this.networkNoise.reset();
+	}
+
+	/**
+	 * 是否仍在过渡静音窗内。
+	 *
+	 * <p>只在混音线程与主线程读同一个 volatile 时间戳，不需要锁。
+	 */
+	public boolean inTransitionSilence() {
+		long until = this.transitionSilenceUntil;
+		return until > 0L && System.currentTimeMillis() < until;
 	}
 
 	/**
