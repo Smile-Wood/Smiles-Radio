@@ -660,6 +660,8 @@ public final class PcmSink {
 		// 而那次开台本来就有自己的窗口。
 		this.transitionSilenceUntil = 0L;
 		this.transitionSilenceCapUntil = 0L;
+		// 关台后不再"连续无数据"，死流计时要归零，否则下次开台一进来就被封顶。
+		this.starvedSinceMs = 0L;
 	}
 
 	/**
@@ -1379,12 +1381,24 @@ public final class PcmSink {
 		} else {
 			this.consecutiveUnderruns = 0;
 		}
+		// 「连续无数据」的起始时刻：只有<b>真的连续</b>才累积。
+		// 抖动型的欠载（有块、没块交替）会在这里被清零，
+		// 所以死流封顶（见 {@link #DEAD_AIR_MUTE_MILLIS}）不会误伤正常卡顿。
+		long nowMs = System.currentTimeMillis();
+		if (this.starved) {
+			if (this.starvedSinceMs == 0L) {
+				this.starvedSinceMs = nowMs;
+			}
+		} else {
+			this.starvedSinceMs = 0L;
+		}
 		// <b>本流还没出过声</b>时，欠载是预热而不是故障：不给它累积的机会。
 		// 只清计数、不动 networkNoise 的增益（那时它本来就是 0）。
 		if (!this.streamFlowing && !this.faultReported) {
 			this.consecutiveUnderruns = 0;
 			this.weakNoiseHeld = false;
 			this.failingNow = false;
+			this.starvedSinceMs = 0L;
 			this.networkNoise.updateTarget(0.0F);
 			return;
 		}
@@ -1405,6 +1419,7 @@ public final class PcmSink {
 			this.weakNoiseHeld = false;
 			this.healthyBlocks = 0;
 			this.failingNow = false;
+			this.starvedSinceMs = 0L;
 			this.networkNoise.updateTarget(0.0F);
 			return;
 		}
@@ -1480,8 +1495,28 @@ public final class PcmSink {
 		// <b>两档</b>：
 		//   卡住（这一块完全没数据）-> 大底噪，填满静音
 		//   不卡但缓冲未恢复      -> 弱底噪，持续提示到恢复为止
+		// <b>死流封顶</b>：连续无数据超过 {@link #DEAD_AIR_MUTE_MILLIS} 之后，
+		// 不再继续发底噪，改为彻底静音。
+		//
+		// <p>「故障期间持续发声」原本是为了让玩家知道设备还在工作，
+		// 但<b>没有时长上限</b>的设计有个致命样本：用户实录 17 秒，
+		// 换曲后底噪<b>连续响了 11.7 秒</b>——RMS 稳定在 -38.4 dBFS，
+		// 谱平坦度 0.23~0.41（音乐通常 <0.05），4~16kHz 只比 100~1000Hz 低 2~4 dB，
+		// 也就是说那是一段几乎纯白的噪声，一直盖在静音上，直到手动切台才消失。
+		//
+		// <p>零星的卡顿要提示，卡死了就不该继续喊：持续几秒连一个音频帧都拿不到，
+		// 说明问题不在"抖一下"而在流真的死了，这时候静音 + 自动重连
+		// （{@code AutoSubscriber} 的静音看门狗）才是对的，
+		// 无穷无尽的嘶声只会让人以为模组坏了。
+		boolean deadAir = failing && this.starvedSinceMs != 0L
+				&& nowMs - this.starvedSinceMs > DEAD_AIR_MUTE_MILLIS;
+
 		float target;
-		if (failing) {
+		if (deadAir) {
+			target = 0.0F;
+			// 粘性弱底噪也要一起撤，否则封顶后它还会以 STUTTER_LEVEL 续命
+			this.weakNoiseHeld = false;
+		} else if (failing) {
 			target = 1.0F;
 		} else if (this.weakNoiseHeld) {
 			target = STUTTER_LEVEL;
@@ -1820,6 +1855,7 @@ public final class PcmSink {
 		this.consecutiveUnderruns = 0;
 		this.failingNow = false;
 		this.faultReported = false;
+		this.starvedSinceMs = 0L;
 		// 卡顿计数也要清：否则「网络恢复」后旧的卡顿历史还会让底噪响一阵
 		this.recentThinnedBlocks = 0;
 		this.thinWindowCounter = 0;
@@ -1852,6 +1888,27 @@ public final class PcmSink {
 	 * 也就是说「窗口到顶」总是早于「客户端判超时」，两者不会打架。
 	 */
 	public static final int TRANSITION_SILENCE_MAX_MILLIS = 3000;
+
+	// ------------------------------------------------------- 死流封顶
+
+	/**
+	 * 连续无数据满这么久之后，底噪<b>停止发声</b>（毫秒）。
+	 *
+	 * <p>取值依据：真实的网络抖动是「一顿一顿」的，最长的一次卡顿
+	 * 在用户录像里也没超过 200ms；而那次「底噪连响 11.7 秒」的样本
+	 * 是一个彻底死掉的流。取 3500ms——比任何正常抖动都长一个数量级，
+	 * 又比客户端判 {@code STALL_TIMEOUT}（8 秒）和静音看门狗（6 秒）短，
+	 * 保证「先闭嘴上噪、再由看门狗重连」的顺序。
+	 */
+	public static final int DEAD_AIR_MUTE_MILLIS = 3500;
+
+	/**
+	 * 本次「连续无数据」的起始时刻（0 表示当前并不处于连续无数据状态）。
+	 *
+	 * <p>每个有数据的块都会把它清零，因此它衡量的是<b>不间断</b>的饥饿时长，
+	 * 而不是累计值——零星卡顿永远不会触发封顶。
+	 */
+	private volatile long starvedSinceMs;
 
 	/**
 	 * 「过渡静音窗」结束时刻（{@link System#currentTimeMillis()} 口径）。
@@ -1928,6 +1985,9 @@ public final class PcmSink {
 		this.recentThinnedBlocks = 0;
 		this.thinWindowCounter = 0;
 		this.failingNow = false;
+		// 切换窗内的「无数据」是我们自己 flush 出来的，不能算进死流计时，
+		// 否则窗一结束就可能已经攒够封顶时长。
+		this.starvedSinceMs = 0L;
 		// <b>立刻收声，不能只 updateTarget(0)</b>：落音步长是 {@code 0.06}/块，
 		// 从满强度走下来要 16 块（约 320ms）——那正好是切换空窗本身，
 		// 等于噪声盖着新节目的开头。reset() 是瞬时归零。
