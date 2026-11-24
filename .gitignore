@@ -42,3 +42,7 @@ replay_*.log
 # local scratch / verification output
 build-verify/audio/OUTPUT.txt
 *.log
+
+# verification scratch (disassembled vanilla classes, compiled probes) - not published
+build-verify/
+.handover-en/

@@ -1,7 +1,7 @@
-# Automatically build the project and run any configured tests for every push
-# and submitted pull request. This can help catch issues that only occur on
-# certain platforms or Java versions, and provides a first line of defence
-# against bad commits.
+# Builds the mod for every push and pull request.
+#
+# The mod does not ship its prerequisite library, so Smile's Lib Box is checked
+# out from its own repository and published to mavenLocal before building.
 
 name: build
 on: [pull_request, push]
@@ -12,6 +12,11 @@ jobs:
     steps:
       - name: checkout repository
         uses: actions/checkout@v6
+      - name: checkout prerequisite library
+        uses: actions/checkout@v6
+        with:
+          repository: Smile-Wood/Smiles-Lib-Box
+          path: .libbox
       - name: validate gradle wrapper
         uses: gradle/actions/wrapper-validation@v6
       - name: setup jdk
@@ -20,7 +25,10 @@ jobs:
           java-version: '25'
           distribution: 'microsoft'
       - name: make gradle wrapper executable
-        run: chmod +x ./gradlew
+        run: chmod +x ./gradlew .libbox/gradlew
+      - name: publish prerequisite library to mavenLocal
+        working-directory: .libbox
+        run: ./gradlew :1.20.1:publishToMavenLocal
       - name: build
         run: ./gradlew build
       - name: capture build artifacts
@@ -28,3 +36,4 @@ jobs:
         with:
           name: Artifacts
           path: build/libs/
+          if-no-files-found: error
