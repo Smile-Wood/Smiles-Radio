@@ -301,11 +301,9 @@ public final class PlaylistTimeline {
 	 * {@link #isPlayableAt(int, int)}</b>，否则会把不可播文件直接推给客户端。
 	 */
 	private static Path streamFileOf(Path source) {
-		String name = source.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
-		// 本身就是 MP3 就不必算整文件哈希去查缓存
-		if (name.endsWith(".mp3")) {
-			return source;
-		}
+		// <b>统一优先用转码产物</b>，MP3 源也不例外：响度均衡就发生在转码这一步
+		// （见 AudioTranscoder），直接推原始 MP3 会绕过均衡，音量差就还在。
+		// 产物尚未就绪时退回源文件——先能放，均衡下次预热后自然生效。
 		Path baked = AudioTranscoder.mp3For(source);
 		return baked != null ? baked : source;
 	}

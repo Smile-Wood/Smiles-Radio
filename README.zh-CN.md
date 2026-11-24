@@ -24,6 +24,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
 | 故障显示 | 红灯闪烁 + 液晶屏 `NOSIGNAL` |
 | 正常显示 | 液晶屏显示频道频率（如 `FM90.7`） |
 | 音效 | 换台调台噪、网络差底噪 |
+| **多曲音量均衡** | 转码时把每首统一到 **-16 LUFS**（EBU R128 两遍法，恒定增益），小声音源与母带级响度的曲子听感一致 |
 
 ---
 
@@ -56,6 +57,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
 ```json
 {
   "ffmpeg": "",
+  "normalize": true,
   "stations": [
     {
       "id": "tiehen",
@@ -90,6 +92,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
 | 字段 | 说明 |
 |---|---|
 | `ffmpeg` | ffmpeg 可执行文件路径。**留空 = 用 PATH 里的 ffmpeg**；仅当 ffmpeg 不在 PATH 或需指定特定版本时填写（如 `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` 或 `/usr/local/bin/ffmpeg`） |
+| `normalize` | 音量均衡，**默认 `true`**：所有音源（含 MP3）都重新编码一次到 -16 LUFS，只改音量不动动态。填 `false` 则保持原文件不动，各曲音量差照旧 |
 
 #### 频道字段
 
@@ -252,6 +255,8 @@ https://example.com/song.mp3
 - 播放列表换曲不是无缝的：解码器重建，两首间有极短空隙
 - 不支持 HLS / HE-AAC 流
 - 直播流**不能**放进 txt 播放列表（无时长，无法参与同步时间轴）
+- 音量均衡会把所有音源（含 MP3）重新编码进 `cache/baked/`：首次开启会重建缓存（每个文件解码两遍），该目录大约会多出一份 128 kbps 的整库拷贝；填 `"normalize": false` 可完全避免
+- 均衡依赖 ffmpeg。没有 ffmpeg 时 MP3 频道照常原样播放，非 MP3 频道仍会被拒绝
 
 ---
 

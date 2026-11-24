@@ -358,6 +358,32 @@ public final class RadioStationRegistry {
 		}
 	}
 
+	/**
+	 * 读取配置顶层的 {@code normalize}（响度均衡开关，默认开启）。
+	 *
+	 * <p>开启时所有音频（含 MP3）都会经 ffmpeg 做一次 EBU R128 两遍均衡，
+	 * 各曲音量被拉到同一响度；关闭后 MP3 源不再重编码（纯 MP3 曲库保持原文件），
+	 * 代价是「有的歌小声、有的歌炸」会原样保留。
+	 *
+	 * <p>字段缺失按<b>开启</b>处理：这正是「多曲音量均衡」要解决的问题，
+	 * 服主没写这个字段说明他没关过，不该让他手动加。
+	 */
+	private static void readTopLevelNormalize(JsonObject root) {
+		if (!root.has("normalize") || root.get("normalize").isJsonNull()) {
+			AudioTranscoder.setNormalizeEnabled(true);
+			return;
+		}
+		try {
+			boolean enabled = root.get("normalize").getAsBoolean();
+			AudioTranscoder.setNormalizeEnabled(enabled);
+			SmileSRadio.LOGGER.info("响度均衡：{}", enabled ? "开" : "关");
+		} catch (Exception e) {
+			SmileSRadio.LOGGER.warn("配置项 normalize 不是布尔值，已按默认值（开）处理：{}",
+					root.get("normalize"));
+			AudioTranscoder.setNormalizeEnabled(true);
+		}
+	}
+
 	private static List<RadioStation> readIndex() {
 		Path index = baseDir.resolve(INDEX_NAME);
 		if (!Files.exists(index)) {
@@ -376,6 +402,7 @@ public final class RadioStationRegistry {
 			// 读不到/为空都表示"用 PATH 里的 ffmpeg"，不影响既有部署。
 			if (root.isJsonObject()) {
 				readTopLevelFfmpeg(root.getAsJsonObject());
+				readTopLevelNormalize(root.getAsJsonObject());
 			}
 
 			JsonArray arr = root.isJsonObject()
@@ -469,6 +496,11 @@ public final class RadioStationRegistry {
 		root.addProperty("_说明_ffmpeg", "ffmpeg 可执行文件的完整路径。留空则使用系统 PATH 里的 ffmpeg；"
 				+ "仅当服务器上 ffmpeg 不在 PATH、或需要指定某个特定版本时才填"
 				+ "（例如 C:\\tools\\ffmpeg\\bin\\ffmpeg.exe 或 /usr/local/bin/ffmpeg）");
+
+		// 响度均衡开关：默认开启，解决「有的歌比别的歌小声」
+		root.addProperty("normalize", true);
+		root.addProperty("_说明_normalize", "响度均衡：true=所有曲目统一响度（默认，MP3 也会重新编码）；"
+				+ "false=保持原文件音量，MP3 不做转码");
 
 		// 配置说明：写进文件本身，服主打开就能看懂，不必回来翻文档。
 		root.addProperty("_说明_播放模式", "mode 可选值见下面的示例条目；"
