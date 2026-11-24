@@ -996,16 +996,19 @@ public final class ClientAudioPlayer {
 			stream.close();
 			STREAMS.remove(key);
 			PcmSink.INSTANCE.flush();
-			// <b>重连恢复用淡出，不用 clearNetworkNoise()（瞬时归零）</b>。
+			// <b>重连恢复：只淡出，不开静音窗、不硬切</b>。
 			//
-			// 会话号变化意味着上游断过、现在接回来了——故障正在「结束」，
-			// 此刻底噪多半还处于满强度。硬归零的听感是噪音戛然而止（用户实测
-			// 「恢复后有没有淡出」）；onLinkRecovered() 让底噪按落音速率
-			// 自然淡出，同时复位故障计数（underruns/weakNoiseHeld/faultReported）。
-			// 换台路径（handleChunk）才用 clearNetworkNoise()——那里上一台必须立刻消失。
+			// 会话号变化意味着上游断过、现在接回来了——故障正在「结束」。
+			// 早期这里还调 beginTransitionSilence()：它内部会 networkNoise.reset()
+			// （瞬时归零）并声明 900ms 数字静音窗——结果淡出从未被听见，
+			// 用户实测「噪声结束了才发声」：噪音硬切 → 干等静音窗 → 才有声音。
+			// 现在 onLinkRecovered() 让底噪按落音速率自然淡出；flush 后的重攒窗口
+			// 由饥饿宽限冻结电平兜底（噪声不跌坑），新音频攒够起播缓冲（约 300ms）
+			// 就直接接上，与噪声淡出<b>重叠</b>，而不是排在它后面。
+			// 换台路径（handleChunk）才用 clearNetworkNoise() + 静音窗——
+			// 那里上一台必须立刻消失，语义不同。
 			PcmSink.INSTANCE.onLinkRecovered();
 			PcmSink.INSTANCE.setNetworkNoiseSource(pos);
-			PcmSink.INSTANCE.beginTransitionSilence();
 			stream = null;
 		}
 		if (stream == null) {
