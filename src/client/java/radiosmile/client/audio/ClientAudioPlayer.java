@@ -347,6 +347,15 @@ public final class ClientAudioPlayer {
 		if (stream == null) {
 			// 收到数据本身就是"玩家想要这个台"的强证据（订阅请求可能来自别的路径）。
 			noteStreamRequested(pos);
+			// <b>清掉这个方块可能残留的推流增益</b>。
+			//
+			// 同一个方块之前放过本地电台时，服务端下发过 outputGain（如 0.25），
+			// 客户端把它记在 streamGains 里；换成网络电台后服务端不再发任何
+			// 增益包（网络电台不走推流），残留值就永远清不掉——整路音频被
+			// 压在 25%，系统音量、收音机音量开到最大也救不回来。
+			// 传 1.0 会让 PcmSink 直接移除表项（满增益不留表）。
+			// 本地电台随后会被服务端的新增益包覆盖，行为不变。
+			PcmSink.INSTANCE.setStreamGain(key, 1.0F);
 			stream = new Stream();
 			stream.trackIndex = trackIndex;
 			stream.sessionId = sessionId;
@@ -620,6 +629,9 @@ public final class ClientAudioPlayer {
 		// 只移除本音源的数据，不能把别的收音机一起静掉
 		PcmSink.INSTANCE.removeSource(pos.asLong());
 		PcmSink.INSTANCE.clearVolumeFor(pos.asLong());
+		// 推流增益一并清掉：下一次在这个方块换台时不能继承旧值
+		//（本地台 0.25 残留会把之后的网络台整路压到 25%，见 handleChunk 说明）。
+		PcmSink.INSTANCE.setStreamGain(pos.asLong(), 1.0F);
 		// 立刻停止，不留任何余音：
 		// 用户明确要求「空选列表后按下就立刻停止播放」，
 		// 那点断电氛围远不如「按了没停」来得困扰。
@@ -1014,6 +1026,10 @@ public final class ClientAudioPlayer {
 		if (stream == null) {
 			// 收到数据本身就是"玩家想要这个台"的强证据
 			noteStreamRequested(pos);
+			// 清掉本地电台可能残留的推流增益（见 handleChunk 内同名说明）：
+			// 方块从本地台换成网络台后，服务端不再发增益包，0.25 残留会把
+			// 网络流整路压到 25%——正是「网络电台声音小」的根因。
+			PcmSink.INSTANCE.setStreamGain(key, 1.0F);
 			// 网络直播流从连上那一刻起播，没有"跳过历史"的概念；
 			// 清掉本地电台握手可能残留的 skip 时长，避免开头被误丢。
 			setPendingMetadata(0L);
