@@ -575,8 +575,6 @@ public final class RadioStationRegistry {
 		Map<String, String> current = new LinkedHashMap<>();
 		// 需要转码预热的源文件（非 MP3，且对应产物尚不存在）
 		List<Path> needBake = new ArrayList<>();
-		// 需要核对响度的源文件（全部曲目）：响度不足的曲目会在这里被重烤补足
-		List<Path> allTracks = new ArrayList<>();
 
 		for (RadioStation station : stations) {
 			if (station.isStreaming()) {
@@ -604,10 +602,6 @@ public final class RadioStationRegistry {
 
 			// 同一趟遍历里收集待转码文件
 			for (Path track : tracks) {
-				// 响度核对要覆盖<b>所有</b>曲目，包括本身就是 MP3 的——
-				// 「不用转码」不等于「电平够」，而 16 dB 的差距正是出在
-				// 一首现成的 MP3 上（见 AudioTranscoder#TARGET_MEAN_DB）。
-				allTracks.add(track);
 				if (AudioTranscoder.needsBake(track)) {
 					needBake.add(track);
 				}
@@ -627,10 +621,6 @@ public final class RadioStationRegistry {
 
 		// 校验完顺手预热：还没转码成 MP3 的文件在这里统一排队
 		AudioTranscoder.preheat(needBake);
-
-		// 响度核对：每次加载配置都过一遍。达标结论记在旁注里，
-		// 所以稳定状态下这里只是一次小文件读取；只有不足的才会重烤。
-		AudioTranscoder.ensureLoudness(allTracks);
 
 		// <b>txt 里的网络地址也要在后台下载</b>：
 		// 上面的 resolveTracks() 用的是 parseCached，首次遇到网络条目会同步下载——
