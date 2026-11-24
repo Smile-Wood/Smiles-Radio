@@ -732,18 +732,19 @@ public final class ClientAudioPlayer {
 	/**
 	 * 多久没收到数据就认为流僵住了（毫秒）。
 	 *
-	 * <p>取 <b>8 秒</b>。这个值必须大于「网络流建连 + 首块缓冲」的总耗时：
+	 * <p>取 <b>4 秒</b>。这个值必须大于「网络流建连 + 首块缓冲」的总耗时：
 	 * <ul>
 	 *   <li>上游 HTTP 握手实测约 1 秒（异步建连）</li>
 	 *   <li>客户端抖动缓冲起播门槛约 0.3 秒</li>
-	 *   <li>再加服务端配速与网络抖动余量</li>
+	 *   <li>再加配速与网络抖动余量</li>
 	 * </ul>
 	 *
 	 * <p>早期取 2.5 秒——比建连还短，于是每次重连刚发起就被判超时、
 	 * 又触发重订阅，形成无限重建连的死循环（实测每秒都在建连）。
-	 * 提高后建连有机会走完。
+	 * 提高后建连有机会走完；用户定为 4 秒——留足建连余量的同时，
+	 * 断流后约 4 秒就能点亮 NOSIGNAL，不用干等更久。
 	 */
-	private static final long STALL_TIMEOUT_MILLIS = 8000L;
+	private static final long STALL_TIMEOUT_MILLIS = 4000L;
 
 	/**
 	 * 彻底停止所有播放。
@@ -881,7 +882,7 @@ public final class ClientAudioPlayer {
 	 * {@link radiosmile.radio.StreamAudioSource}，它不依赖任何服务端类）。
 	 *
 	 * <p>故障表现与用户设定的链路一致：
-	 * 上游断 → 客户端缓冲变薄、底噪抬高 → 8 秒收不到上游数据 →
+	 * 上游断 → 客户端缓冲变薄、底噪抬高 → 4 秒收不到上游数据 →
 	 * NOSIGNAL + 闪灯 + 底噪持续 → 退避重连 → 数据回来 → 底噪随缓冲变厚渐弱。
 	 */
 	private static final Map<Long, StreamFeed> FEEDS = new ConcurrentHashMap<>();
@@ -923,7 +924,7 @@ public final class ClientAudioPlayer {
 	 * 一个方块的网络电台拉流线程。
 	 *
 	 * <p>循环体只做三件事：读上游字节（{@link StreamAudioSource#read} 内部已含
-	 * 退避重连与 ICY 剥离）→ 更新流心跳（供 8 秒超时判定）→ 喂解码器。
+	 * 退避重连与 ICY 剥离）→ 更新流心跳（供 4 秒超时判定）→ 喂解码器。
 	 * 会话号变化（上游重连成功）时重建解码器，避免断线前后的字节被当成连续流。
 	 */
 	private static final class StreamFeed implements Runnable {
@@ -1015,9 +1016,9 @@ public final class ClientAudioPlayer {
 			PcmSink.INSTANCE.setSourcePosition(key, pos);
 			PcmSink.INSTANCE.start();
 		}
-		// 刷新流心跳：isStalled 的 8 秒超时判据统一看 lastChunkAt，
+		// 刷新流心跳：isStalled 的 4 秒超时判据统一看 lastChunkAt，
 		// 本地电台由 S2C_AUDIO_CHUNK 刷新，网络电台由这里（真实上游数据）刷新。
-		// 断流期间 read 一直返回空数组 → 这里不再执行 → 8 秒后判超时。
+		// 断流期间 read 一直返回空数组 → 这里不再执行 → 4 秒后判超时。
 		stream.chunks++;
 		stream.lastChunkAt = System.currentTimeMillis();
 		clearFaultNoiseOnResume(pos);

@@ -363,7 +363,7 @@ public final class AutoSubscriber implements ClientModInitializer {
 			// 整份工程里没有任何地方在恢复时清 clientFaultStatus，
 			// 于是 ERR408 一旦点亮就会留到退出世界——正是用户反馈的「恢复了 err 也不消除」。
 			//
-			// 为什么不在下面写一个 else 分支去清？因为判据本身有 8 秒窗口
+			// 为什么不在下面写一个 else 分支去清？因为判据本身有 4 秒窗口
 			// （ClientAudioPlayer.STALL_TIMEOUT_MILLIS），数据在窗口边缘到达时
 			// stale 会一 tick 真一 tick 假；用它来"灭灯"会让屏幕闪烁。
 			//

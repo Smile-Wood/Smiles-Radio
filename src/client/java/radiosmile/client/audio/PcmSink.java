@@ -1909,7 +1909,7 @@ public final class PcmSink {
 	 * 玩家听到的是无限静音，比听到底噪更糟（无法判断"是在加载还是坏了"）。
 	 *
 	 * <p>取 3000ms：正常换曲空窗（300~900ms）绰绰有余，
-	 * 而且远小于客户端判 {@code STALL_TIMEOUT} 的 8 秒——
+	 * 而且远小于客户端判 {@code STALL_TIMEOUT} 的 4 秒——
 	 * 也就是说「窗口到顶」总是早于「客户端判超时」，两者不会打架。
 	 */
 	public static final int TRANSITION_SILENCE_MAX_MILLIS = 3000;
