@@ -100,7 +100,7 @@ public final class ClientAudioPlayer {
 	 */
 	public static void setPendingMetadata(long skipMillis) {
 		pendingSkipMillis = Math.max(0L, skipMillis);
-		SmileSRadio.LOGGER.info("握手元数据: 跳过={} ms（客户端只解 MP3）", pendingSkipMillis);
+		SmileSRadio.LOGGER.debug("握手元数据: 跳过={} ms（客户端只解 MP3）", pendingSkipMillis);
 	}
 
 	/** 由网络线程调用：只入队，立即返回，不阻塞渲染。 */

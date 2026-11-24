@@ -146,7 +146,7 @@ public final class AudioStreamManager {
 		}
 		SUBSCRIPTIONS.put(key(player, pos), subscription);
 		sendStatus(player, pos, AudioStatus.OK);
-		SmileSRadio.LOGGER.info("玩家 {} 订阅频道 {} @{}（bw={}KB/s）",
+		SmileSRadio.LOGGER.debug("玩家 {} 订阅频道 {} @{}（bw={}KB/s）",
 				player.getName().getString(), stationId, pos, bandwidthKbps);
 		return subscription;
 	}
