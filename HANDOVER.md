@@ -2,9 +2,9 @@
 
 **English** | [简体中文](HANDOVER.zh-CN.md)
 
-> Last updated: 2026-11-23 21:00 (**Round 15** complete; includes the Round 13 pacing root-cause fix)
+> Last updated: 2026-11-24 21:00 (**Round 20** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
 > Project path: `C:\Projects\Smile's Radio mod`
-> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **327 KB**, BUILD SUCCESSFUL)
+> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **353 KB**, BUILD SUCCESSFUL)
 > Version control: git initialised, **one commit per round of fixes**
 > User guide: the full documentation for server owners/players is in [README.md](README.md) (this file is the developer handover)
 
@@ -15,11 +15,11 @@
 | Learn what the project is and how to configure it | [README.md](README.md) |
 | Get up to speed on changing code quickly | Section 10 in this document (resuming work quickly) |
 | **Must read before touching code** | "7. Critical Pitfalls" + section 12 (reminders for the next session) |
-| Look up the historical root cause of a bug | Section 8 (Current State), ordered by round (**15 rounds, A to Y**; later is newer) |
+| Look up the historical root cause of a bug | Section 8 (Current State), ordered by round (**20 rounds, A to AD**; later is newer) |
 | Find where config lives, directory structure | Section 3 in this document, or the README |
 
 > ⚠️ **The easiest pitfall to fall into**: in this codebase **most serious bugs come from "one function/field carrying two meanings"**
-> (see the table in section 12; it has already happened **7 times**, and the seventh broke the timeline of a whole playlist).
+> (see the table in section 12; it has already happened **9 times**, and the ninth silently crushed the internet-radio volume to 25%).
 > Before changing any function, ask: **how many callers with different semantics does it have?**
 
 ---
@@ -183,36 +183,41 @@ Channels defined by `RadioNetworking`:
 |---|---|
 | `s2c_stations` | epoch + JSON list |
 | `s2c_select_ack` | stationId + hash + epoch + volume + formatId + skipMillis |
-| `s2c_icon` | stationId + byte[] |
-| `s2c_audio_chunk` | BlockPos + stationId + trackIndex + formatId + byte[] |
+| `s2c_icon` | stationId + byte[] (downscaled to 32x32 server-side, section Z) |
+| `s2c_audio_chunk` | BlockPos + stationId + trackIndex + sessionId + formatId + byte[] |
 | `s2c_audio_status` | BlockPos + statusCode |
+| `s2c_reloaded` | empty (config reload notice; client plays tuning noise + declares a transition silence window) |
+| `s2c_audio_silence` | BlockPos + stationId + trackIndex + millis (**empty-volume packet**: declares a track-change preload silence window, see AC) |
+| `s2c_output_gain` | BlockPos + gain (stream gain; **for internet radios it is sent along with the subscription OK reply**, section AD) |
 
-`AudioStatus`: 0=OK, 1=UNKNOWN_STATION, 2=NO_AUDIO, 3=TOO_FAR, 4=UNSUPPORTED, 5=STOPPED
+`AudioStatus`: 0=OK, 1=UNKNOWN_STATION, 2=NO_AUDIO, 3=TOO_FAR, 4=UNSUPPORTED, 5=STOPPED, 6=TIMEOUT (408, **determined locally by the client**; the server never announces it)
 
 ---
 
 ## 6. Audio Architecture
 
-### Data flow
+### Data flow (after the Round 19 overhaul)
 
 ```
-Server                                   Client
-─────────────────────────────────────────────────────
+Custom stations (server-pushed):
 FileAudioSource  ──┐
   (local audio/MP3) │
-                   ├→ AudioSubscription ──network──→ ClientAudioPlayer
-StreamAudioSource ─┘   (reader thread+pacing)        (AudioIngest thread)
-  (network stream+ICY strip)                             │
-                                                          ↓
-                                              Mp3StreamDecoder (JLayer)
-                                              OggDecoder (vanilla OggAudioStream)
-                                                          │
-                                                          ↓ PCM
-                                                   PcmSink (mixer)
-                                                          │
-                                                          ↓
-                                              SourceDataLine 48kHz/2ch/16bit
+                   ├→ AudioSubscription ──S2C_AUDIO_CHUNK──→ ClientAudioPlayer
+PlaylistAudioSource┘   (reader thread+pacing)                 (AudioIngest thread)
+                                                               │
+Internet radio (client-direct, since Round 19):                ↓
+Upstream HTTP stream ──→ client StreamFeed puller thread    Mp3StreamDecoder (JLayer)
+                       (reuses StreamAudioSource:              │
+                         ICY strip + exponential-backoff        ↓ PCM
+                         reconnect)                     PcmSink (mixer)
+                       ──→ handleUpstreamChunk ──────────────→ │
+                                                               ↓
+                                                    SourceDataLine 48kHz/2ch/16bit
 ```
+
+> For internet radios the server only maintains a **subscription state machine**
+> (`STREAMING_SUBS`: playing / walked away / block removed); the audio bytes never pass
+> through the server (see AC, which supersedes the server-redistribution design in Z.3).
 
 ### Server-side core classes
 
@@ -222,32 +227,33 @@ StreamAudioSource ─┘   (reader thread+pacing)        (AudioIngest thread)
 | `AudioTranscoder` | Prewarms to MP3 by quickHash (128kbps); **the ffmpeg path is configurable** (section X) |
 | `AudioSource` | Audio source interface (read/durationMillis/format/skipMillis/positionMillis/seekTo/totalBytes) |
 | `FileAudioSource` | Local file; MP3 can be seeked by frame |
-| `StreamAudioSource` | Proxy for internet live streams, including ICY metadata stripping; **does not reconnect** (section O) |
+| `StreamAudioSource` | Internet live-stream client, including ICY metadata stripping; **automatic reconnect with exponential backoff 1s→2s→4s→8s cap, unlimited retries** (restored and improved in Round 19; the "no reconnect" policy in section O is superseded); **reused directly by the client StreamFeed** |
 | `RemoteAudioCache` | Internet audio download, `.proof` checksum bundles, falls back to the cache when the link drops (sections T/U) |
 | `TxtPlaylist` | Parsing of txt redirect lists, shuffle switch, tolerance for BOM/separators |
 | `PlaylistTimeline` | Round-based playback timeline; **accepts MP3 only** (section V) |
-| `AudioSubscription` | Subscription state + reader thread + **closed-loop pacing** (the anchor accumulates over real duration, section W) |
-| `AudioStreamManager` | Subscription management, push thread (decoupled from the game tick), sending packets back on the main thread |
+| `AudioSubscription` | Subscription state + reader thread + **closed-loop pacing** (the anchor accumulates over real duration, section W); used by custom stations only |
+| `AudioStreamManager` | Custom-station subscription management and push thread; for internet radios only registers the **subscription state machine** (sends **gain 1.0 along with the subscription OK reply**, section AD); per-tick checks for walked-away/removed; **the heartbeat mechanism has been removed entirely** (section AC) |
 
 ### Client-side core classes
 
 | Class | Responsibility |
 |---|---|
-| `ClientAudioPlayer` | Maintains a playback stream per block, consumed by the AudioIngest thread |
+| `ClientAudioPlayer` | Maintains a playback stream per block, consumed by the AudioIngest thread; contains the `StreamFeed` puller thread (internet radios connect to the upstream directly; 4s with no data counts as stalled) |
 | `Mp3StreamDecoder` | Streaming MP3 decoding with JLayer (**the only decode path**; OggDecoder has been deleted) |
-| `PcmSink` | **Single sound-card mixer**, fixed 48kHz/2ch, device kept open; includes tuning noise, network noise floor, jitter buffer |
-| `TuningNoise` / `NetworkNoise` | Two effect-sound generators (station-change noise / weak-network hiss) |
+| `PcmSink` | **Single sound-card mixer**, fixed 48kHz/2ch, device kept open; includes tuning noise, network noise floor, jitter buffer, transition silence window, fault latch |
+| `TuningNoise` | Station-change noise (**triggered the instant you pick a station**, HOLD 0.25 at program level, follows the silence window; finalised in AD) |
+| `NetworkNoise` | Weak-network hiss (PEAK 0.12 at program level, attack 250ms / release 1.5s, latched at full level during a fault) |
 | `RadioBlockEntityRenderer` | LCD showing rate/NOSIGNAL, blinking red light (sections G/J) |
-| `AutoSubscriber` | Scans a 52-block radius every 10 ticks, subscribes/unsubscribes automatically; **no longer performs network reconnects** (section O) |
+| `AutoSubscriber` | Scans a 52-block radius every 10 ticks, subscribes/unsubscribes automatically; starts the puller only after the subscription replies OK |
 | `BgmSuppressor` | Suppresses the vanilla BGM while playing |
-| `AudioLifecycleHooks` | Releases the sound card when the connection drops |
+| `AudioLifecycleHooks` | Releases the sound card when the connection drops; requests the station list on JOIN |
 | `VanillaVolumeTracker` | Tracks BLOCKS + MASTER volume on the main thread |
 
 ### Volume and spatialization
 
 Final gain chain:
 ```
-per-block volume × vanilla BLOCKS × vanilla MASTER × distance attenuation × left/right pan
+per-block volume × vanilla BLOCKS × vanilla MASTER × distance attenuation × stream gain × left/right pan
 ```
 
 Spatialization:
@@ -1325,6 +1331,12 @@ Three hard reasons:
 
 Cost: server upstream = bitrate x listener count; if the upstream dies, every player loses sound at once (this is the division of responsibility set out in Section O).
 
+> ⚠️ **This subsection was superseded wholesale by section AC (Round 19, 2026-11-24)**:
+> after the user clarified the intended design, the architecture became **client-direct** — audio bytes never pass
+> through the server, which only maintains a subscription state machine. The three "hard reasons" held within the
+> old architecture, and "no internet needed on the client" became an explicit precondition the user accepted
+> (players must be able to reach the upstream). Kept for historical reference only — **do not build on it**.
+
 #### AA. Round 17: shuffle mode "the first track is always the same"
 
 **Symptom**: the user reported "with shuffle playback, the first track is always the same audio".
@@ -1361,8 +1373,8 @@ The timeline instance bakes in `roundOffset`, so reusing the old instance would 
 
 ##### Architecture question verified along the way
 
-The user asked "why does network radio feel like server-side redistribution rather than a direct client connection" — **the feeling is correct**,
-see Section Z part 3 (three hard reasons: multi-player sync / ICY stripping / no internet needed on the client).
+The user asked "why does network radio feel like server-side redistribution rather than a direct client connection" — **the feeling was correct at the time**,
+see Section Z part 3 (**superseded by section AC**: the architecture is now client-direct).
 
 #### AB. Round 18: volume slider occluded at the bottom
 
@@ -1390,59 +1402,127 @@ Tested at four window heights (240 / 300 / 480 / 720), all satisfied:
 The click/drag hit area (`mouseY <= volumeBottom`) and the volume mapping (`volumeBottom - 12`)
 use the same field, so they stay consistent automatically with no separate change needed.
 
+#### AC. Round 19: network-radio architecture overhaul — client-direct streaming (2026-11-24, the most important change this day)
+
+##### The user's clarified end-to-end design (the basis for every change in this round)
+
+> Join game → connect to the server → switch to an internet station → **lose the internet**
+> (the upstream internet drops; the connection to the server stays fine the whole time) →
+> the client buffer thins while the noise floor rises → after 4 seconds NOSIGNAL + blinking light
+> + sustained noise floor → automatic reconnect to the upstream stream → network returns →
+> the client reconnects the audio stream → the noise floor fades as the buffer refills → everything is normal again.
+
+Key constraints (corrected by the user one by one; must be followed):
+- **The server neither knows nor controls the client's light/NOSIGNAL** — it does not check the network and never announces TIMEOUT
+- **To the server, an internet radio is just a subscription state machine** — audio bytes never pass through it
+- **There are no heartbeat packets**; **the buffer lives on the client**
+- The empty-volume packet (S2C_AUDIO_SILENCE) exists **to keep the client from misreading the preload gap as a fault**;
+  it must **never trigger tuning noise** (an early change mistakenly wired it there; it was reverted)
+
+##### Changes landed
+
+| Item | Change |
+|---|---|
+| Server | Internet-radio subscribe only registers `STREAMING_SUBS` and replies OK (idempotent reuse keeps the same semantics); per-tick checks mark walked-away→TOO_FAR, removed→STOPPED; **the heartbeat mechanism was removed entirely** (Z.1's empty heartbeat chunks were superseded by S2C_AUDIO_SILENCE empty-volume packets, throttled at 200ms) |
+| Client puller | New `ClientAudioPlayer.StreamFeed` puller thread: starts on subscription OK, connects to the upstream directly, **reusing `StreamAudioSource`** (ICY strip + exponential-backoff reconnect 1s→2s→4s→**8s cap**, unlimited retries, `sessionId++`) |
+| Decoder rebuild | A session-id change = the upstream dropped and came back: the byte stream is not continuous, so the decoder must be rebuilt; the recovery path calls `onLinkRecovered()` (the noise floor fades out at its release rate) and **no longer** `beginTransitionSilence()` (otherwise: "noise cuts hard → wait through the silence window → sound returns") |
+| Timeout | Client stall detection `STALL_TIMEOUT_MILLIS` 8s → **4s** (the user's chosen value) |
+| Buffer depth | `DEPTH_SMOOTH_ALPHA` 0.02→**0.1** (TC 1s→200ms; otherwise the drain is only detected after silence has started); `BUFFER_THIN_PERMILLE` 550→**650** |
+| Weak noise | **The sticky-trio was removed wholesale** (weakNoiseHeld etc.) + a **hunger gate**: the weak tier is only allowed "a real starvation in the last 3 seconds, or the buffer is absolutely bottomed out" — root cause below, "the eighth two-meanings bug" |
+| Fault latch | `faultLatched`: still no data after the grace period → the level **locks at 1.0** (fixes "0.4-0.6-1.0-0.3 wandering during NOSIGNAL"); unlock = 25 consecutive healthy blocks or an explicit recovery entry |
+| Starvation grace | Changed from "reset to zero" to "**freeze at the current gain**" (0.4 → hold → smooth climb to 1.0, no more 0.4→0→1.0 jump) |
+| Light clearing | `clearClientFaultOnResume` also hooked into `handleUpstreamChunk` (internet stations never cleared the on-screen fault before); AutoSubscriber's stale lighting path now registers the PcmSink fault |
+| Noise level | `NetworkNoise` PEAK **0.12** (the user rejected 0.25: "raising it would drown other stations; at most down to the stations' own tier") |
+
+##### The eighth "one meaning, two implementations": the sticky weak noise floor
+
+The user's measurement: "after 1.0 it just stays at 0.3 — you fixed the wrong thing entirely". The real root cause was the
+**steady-state baseline ratchet misfiring forever**: a client-direct stream is 1:1 real-time; at connect time TCP dumps its
+backlog at once, the ratcheted baseline jumps to that peak, and from then on real-time pacing keeps the buffer far below
+that peak → the "relatively thinned" test is **permanently true**, and stickiness pins 0.4 forever.
+The fix: relative thinning alone does not alarm — **it only alarms once it has actually caused starvation**.
+
+#### AD. Round 20: gain delivered with the subscription + tuning-noise / fault-noise timing and loudness (evening of 2026-11-24)
+
+##### 1. Internet radio too quiet → residual streamGains entry (the ninth two-meanings bug)
+
+**Symptom**: internet radio plays far too quietly (both system volume and radio volume maxed).
+Investigation: the `outputGain` config does not apply to internet radios; `convert()` has no attenuation — the gain chain is clean.
+**The culprit**: while the block played a local station, the server had sent `outputGain=0.25`, which the client stored in
+`streamGains`; after switching to an internet station **the server never sends another gain packet** (an internet station has
+no audio chunks, so the pump's "send only on change" path can never fire for it) → 0.25 remains forever and the whole
+signal chain is crushed to 25%.
+
+Fix (two layers):
+- **The server delivers the gain with the subscription reply** (the user's proposal; protocol-level root fix): in
+  `subscribe()`, the internet-radio branch (both the new registration and the idempotent-reuse paths) sends
+  `S2C_OUTPUT_GAIN` right after OK (`STREAM_GAIN=1.0`; a pass-through stream is never compressed)
+- Client-side backstop: on stream creation in `handleChunk`/`handleUpstreamChunk` and on teardown in `stopInternal`,
+  call `setStreamGain(key, 1.0)` to clear the residue (full gain triggers removal)
+
+##### 2. Tuning noise finalised (user measurements: "the noise only starts after the sound is gone", "peak loudness too low", "the fade-in is still too late")
+
+| Item | Change |
+|---|---|
+| Trigger point | Moved from `S2C_SELECT_ACK` to **the instant the player picks a station** (before `selectStation` sends its packet): the static starts the moment you turn the knob, overlapping the still-playing old station; if the selection fails, the old audio keeps feeding and the noise fades naturally via the "stably connected" test |
+| Loudness | `TuningNoise.HOLD_LEVEL` 0.075 → **0.25** (program tier): the old value was a tier below the program and could only fill silence, masking nothing |
+| Deduplication | Repeat triggers inside the window changed from "ignore" to **`retrigger()`** (clears the stable counter and observation window, refreshes startedAt, **does not reset gain/filters**): under high ping the ACK can arrive later than the stable-connection window (~300ms), and the old station's residual audio fills the "connected" counter, retiring the noise early — the other half of "the noise only starts after the sound is gone" |
+
+##### 3. Fault noise starts sooner (user measurement: "the disconnection noise also starts too late")
+
+Old sequence: program stops → 600ms grace freeze → latch to full → 600ms attack —
+nearly 1.2s of silence after the program stops before the noise is in place.
+
+- `STARVE_GRACE_MILLIS` 600 → **300**: normal startup/track-change gaps are already covered by the explicit transition
+  silence window and never reach the grace; whatever genuine starvation still lands here should not cost the player
+  another 600ms of silence
+- `NetworkNoise.ATTACK` 0.033 → **0.08** (0→full in about 250ms): still a perceivable ramp (not an instant jump);
+  the total delay from silence to a full-level warning is pressed to about half a second; the release (1.5s fade on
+  recovery) is untouched
+- In the last ~125ms before the buffer bottoms out (the absolute-thin line) the weak noise already starts seeping in;
+  with the faster attack, the noise is already rising before the program has fully stopped
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 330 KB**
-- `gradlew clean build` → BUILD SUCCESSFUL
-- **git is initialized** (a single initial commit containing all the fixes from this round)
+- **`build/libs/radio-smile-1.0.0.jar`, about 353 KB**
+- `gradlew build` → BUILD SUCCESSFUL
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (`7a6aa98`)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
 
-**Round 16 (heartbeat / icons / architecture)**:
-- ⚠️ **NOSIGNAL + noise floor should no longer appear when changing track** — the main verification point this round.
-  When one track ends and the next starts, or the playlist wraps, the screen should not flash a fault and no noise floor should play.
-  (The server now sends an empty heartbeat every 1 second to keep the connection alive)
-- ⚠️ **Icon sharpness** — icons should still be sharp after the automatic downscale to 32x32;
-  if they are visibly blurry, raise `ICON_TARGET_PX` (at the cost of bandwidth).
-- ⚠️ **Icon bandwidth** — a 500x500 icon now transfers only ~566 B, so opening the UI should be faster.
+**Round 20 (evening of 2026-11-24)**:
+- ⚠️ **Is the internet-radio volume back to full** — it used to be crushed to 25% by a residual 0.25 stream gain;
+  the server now sends 1.0 with the subscription reply. Focus on the switch path (local station → internet station).
+- ⚠️ **Tuning-noise feel** — the static should start the instant you pick a station and mask both the old station's
+  fade-out and the new station's entrance (HOLD 0.25, program tier); if the peak feels too loud, it can be lowered.
+- ⚠️ **Is the fault noise fast enough** — after the upstream drops, program-stop → noise at full should take about
+  half a second; the NOSIGNAL light still follows the 4s stall timeout (the user's chosen value); confirm separately
+  if the light should move with the sound.
 
-**Highest priority (Round 13 pacing fix, your last feedback on 2026-11-23)**:
-- ⚠️ **Has "dropping half the packets" actually gone away** — previously, playing 320kbps tracks sent 1.85x real time and
-  the client buffer hit the 3-second cap and dropped the oldest data; at 128kbps only 74% was sent and the buffer starved into noise.
-  The anchor now accumulates by **each chunk's real duration**. **How to judge**:
-  listening through a whole track normally should no longer produce a "regular chunk cut out + spliced on";
-  if it still does, the log will show the newly added "jitter buffer overflow, dropping N ms of oldest audio" warning
-  — which means some other path is still feeding data too fast (that warning was added this round specifically to pin this down).
-
-**Rest of Round 13**:
-- ⚠️ **Volume moves 5% per step** — dragging should land on 0/5/10/.../100%, 21 positions in total.
-- ⚠️ **txt first-line boolean** — `true` shuffles, `false`/omitted keeps order; the old `random`/`sequence` spellings still work.
-
-**Round 14**:
-- ⚠️ **ffmpeg path** — with the top-level `ffmpeg` in `stations.json` left empty it should fall back to PATH;
-  with a **non-existent path**, the log should have a WARN line explicitly saying "falling back to PATH, and if it is not there either, transcoding is impossible".
-
-**Round 15 (Linux)**:
-- ⚠️ If deploying on Linux: paths written with `\` in the config should still work (separator normalization is in place);
-  the first-line switch in a txt saved by Windows Notepad (with BOM) should take effect.
+**Round 19 (architecture overhaul)**:
+- ⚠️ **Full disconnection chain** — switch to an internet station → drop the internet: the noise floor rises as the
+  buffer thins, after 4 seconds the light blinks NOSIGNAL with a sustained noise floor (level constant at 1.0, no
+  wandering) → on recovery the noise fades over 1.5s, the light clears, the LCD returns to rate, playback resumes,
+  with no loudness jumps anywhere.
+- ⚠️ **No more false alarms on track change** — custom-station track changes are declared by empty-volume packets
+  (heartbeats removed); changing tracks should not flash NOSIGNAL or play the noise floor.
 
 **Historical verification (passed, recorded for reference)**:
 - ✅ Fault display position, black text, LCD background unchanged (Round 3)
 - ✅ Selection box hugs the body, entities can pass through (Round 9)
 - ✅ LCD shows the frequency during normal playback (Round 8)
 - ✅ Logs no longer spam (Round 7, "audio recovered" only logs once on a real recovery)
-
-**Still unconfirmed by the user but not blocking use**:
-- Whether the tuning-noise overlap is truly seamless
-- Start-up latency (about `bufferMillis`, can be lowered)
-- Whether it self-heals after a long disconnection (>2 minutes)
-
+- ✅ "Dropping half the packets" is gone (Round 13 pacing fix, confirmed by the user)
+- ✅ Volume 5% steps / txt first-line boolean / ffmpeg path config (Rounds 13-14)
+- ✅ The jump/pop at the station switch is gone (Round 20 digital-silence fix, confirmed by the user)
 
 ### Known limitations
 
 - Network radio (live streams) **must be MP3**, and cannot be seeked precisely; it can only play sequentially from the moment of connection
+- **Internet radios are streamed client-direct** (since section AC): **the player's client must be able to reach the upstream**,
+  and a direct connection fails on restricted networks (the server-proxy design was retired through the Z.3 → AC evolution)
 - **Live streams cannot go into txt**: without `Content-Length` they cannot be cached or transcoded,
   and if written they are auto-commented out (see Section T). A live stream should be configured directly as the station's `file`
 - **Transcoding depends hard on ffmpeg**: without it, every non-MP3 station is refused (no silent downgrade)
@@ -1503,6 +1583,9 @@ Client config: `maxBandwidthKbps=1024`, `maxChunkBytes=8192`, `bufferMillis=1000
    | transcode preheat | ffmpeg preheat progress; "ffmpeg unavailable" means the dependency is missing |
    | ffmpeg specified by config | Whether the top-level `ffmpeg` path took effect |
    | connected to network radio | Live stream connection established |
+   | client started pulling internet-radio stream | The **client-direct** puller thread started (section AC) |
+   | network stream reconnected | The upstream dropped and came back; the decoder was rebuilt (sessionId changed) |
+   | internet-radio subscription registered | The server's subscription state machine registered (no streaming) |
    | network audio cached locally | Network file download complete |
    | txt playlist preheated | Number of network entries in the txt |
    | MP3 seek to + playlist seek | The exact seek on subscription (the basis of multi-player sync) |
@@ -1520,8 +1603,9 @@ Client config: `maxBandwidthKbps=1024`, `maxChunkBytes=8192`, `bufferMillis=1000
 
 | Priority | Item | Notes |
 |---|---|---|
-| **High** | Verify "dropping half the packets" is really gone | Round 13 pacing fix, the largest impact; see the "Awaiting verification" section |
+| **High** | Re-verify the disconnection chain and internet-radio volume | Rounds 19-20 changed a lot; see the "Awaiting verification" section |
 | High | Verify long-run playback continuity | Across tracks, long unattended runs, network jitter |
+| Medium | (Proposed earlier, not yet done) `v1.0.0` tag / GitHub Release / README Credits section | Do it whenever the user agrees |
 | Medium | Optimize AutoSubscriber scan cost | Currently scans 81 chunks every 0.5s |
 | Medium | Playback progress UI | The current UI has no progress indicator |
 | Medium | Fault display font size | The green area is 46x13 pixels, and `NOSIGNAL` (8 chars) is already at the width limit; |
@@ -1534,7 +1618,7 @@ Client config: `maxBandwidthKbps=1024`, `maxChunkBytes=8192`, `bufferMillis=1000
 
 ## 12. Reminders for the Next Session
 
-**This project's bugs share one common pattern: a single function or field carries two meanings.** This has already been fixed 7 times:
+**This project's bugs share one common pattern: a single function or field carries two meanings.** This has already been fixed 9 times:
 
 | Function | Confused meanings | Consequence |
 |---|---|---|
@@ -1545,17 +1629,23 @@ Client config: `maxBandwidthKbps=1024`, `maxChunkBytes=8192`, `bufferMillis=1000
 | `PcmSink.stop()` | "the user no longer wants it" vs "fault mute" | The unfinished second half of Section D |
 | `ClientAudioPlayer.STREAMS` | "actually receiving a stream" vs "the player clicked confirm" | Fails silently before the first chunk / lit up by late packets after switching off |
 | Track list in `PlaylistTimeline` | "playable" vs "configured" | Untranscoded files enter the timeline → **the whole playlist's timing goes wrong** (Section V) |
+| `S2C_AUDIO_SILENCE` receiver | "declare silence to prevent misjudgment" vs "mask the track-change jump with noise" | The empty-volume packet falsely triggered tuning noise; reverted (section AC) |
+| Lifetime of `streamGains` entries | "the server keeps sending the gain with every chunk" vs "an internet station never gets another packet" | A local station's 0.25 residue silently crushed the internet-radio volume to 25% (section AD) |
 
-> The seventh (Section V) was the costliest: a "can it play" check was not done at the timeline entry point,
-> so durations were computed as 1ms and every later track's start point was wrong, presenting as "the timing is completely broken" —
-> with the root cause hidden behind a tiny oversight: "untranscoded files got mixed into the playlist".
+> The eighth and ninth both happened on 2026-11-24: the first made the level sit at "0.3 forever after 1.0" during
+> NOSIGNAL, the second silently crushed the internet-radio volume to 25% — both were corrected by a single sentence
+> from the user. **Read the code and confirm the lifetime before changing anything; never fix on a guess.**
 
 **Before changing anything, ask: how many places with different meanings call this function?**
 If the answer is not 1, split the entry point first, rather than adding conditionals inside the function.
 
-Two more hard constraints:
+Three more hard constraints:
 1. **Do not touch the relationship between sound effects and the buffer** — see the three pitfalls in Section B
 2. **Do not verify with any build method other than gradle** — an ad-hoc javac classpath does not match loom's, and easily produces false positives
+3. **Internet-radio architecture convention (section AC, explicit from the user)** — audio never passes through the server;
+   the server only maintains a subscription state machine and neither knows nor controls the client's light/NOSIGNAL;
+   there are no heartbeat packets; the buffer lives on the client.
+   Any design that puts "checking the upstream network" back on the server violates this
 
 The verification scripts live in `build-verify/` (including REPORT.md and sim/) and are repeatable.
 This round added `build-verify/audio/` (noise floor / ERR state machine simulation, `run-verify.ps1` → `VERIFY_EXIT=0`)
@@ -1563,10 +1653,10 @@ and `build-verify/geom/` (decompiled output of the vanilla jar, used to verify U
 
 ### Version control (since 2026-11-23)
 
-`git` is initialized, with **one commit per round of fixes** (commit messages in English, for easier searching). Common commands:
+`git` is initialized, with **one commit per round of fixes** (English early on, Chinese recently). Common commands:
 
 ```powershell
-git log --oneline                  # history of the fifteen rounds of fixes
+git log --oneline                  # history of the twenty rounds of fixes
 git log --oneline -S "keyword"     # find when a function/field was introduced
 git diff                           # view uncommitted changes
 git show <sha> --stat              # see which files a commit changed
