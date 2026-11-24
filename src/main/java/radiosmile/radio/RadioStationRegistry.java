@@ -104,6 +104,81 @@ public final class RadioStationRegistry {
 		return startEpochMillis;
 	}
 
+	/**
+	 * 频道级的额外播放偏移（毫秒）。
+	 *
+	 * <p>由 {@code /radio play <频道> <序号>} 设定：把该频道「此刻该播到哪」整体挪一段，
+	 * 于是这个频道的所有听众同时跳到目标曲目开头，其他频道不受影响。
+	 * 重载配置时清空——那时计时基准也会重置，旧偏移没有意义。
+	 */
+	private static final Map<String, Long> stationShifts = new java.util.concurrent.ConcurrentHashMap<>();
+
+	/**
+	 * 重载瞬间各频道「正在播」的曲目。
+	 *
+	 * <p>重建时间轴时要避开它，否则重载后第一首还是刚才那首。
+	 * 取值在 {@link #load} 清缓存之前抓取，只在下次构建时间轴时使用。
+	 */
+	private static final Map<String, Path> headsBeforeReload = new java.util.concurrent.ConcurrentHashMap<>();
+
+	/** 取某频道的额外播放偏移（毫秒），未设定时为 0。 */
+	public static long stationShiftMillis(String stationId) {
+		Long shift = stationId == null ? null : stationShifts.get(stationId);
+		return shift == null ? 0L : shift;
+	}
+
+	/** 设定某频道的额外播放偏移（毫秒）。 */
+	public static void setStationShiftMillis(String stationId, long millis) {
+		if (stationId != null) {
+			stationShifts.put(stationId, millis);
+		}
+	}
+
+	/** 清空所有频道的额外播放偏移。 */
+	public static void clearStationShifts() {
+		stationShifts.clear();
+	}
+
+	/**
+	 * 只刷新一个频道（{@code /radio reload <频道>}）。
+	 *
+	 * <p>与 {@link #load} 的区别：<b>不动计时基准、不清其他频道的缓存</b>。
+	 * 因此其他频道正在播的内容完全不受影响，只有目标频道的订阅会被重建
+	 * （重建由 {@code AudioStreamManager.rebuildStation} 完成）。
+	 *
+	 * <p>做三件事：记住它此刻播的是哪首（新时间轴要避让）、清掉它自己的
+	 * 时间轴缓存（这样曲目列表变化会立刻生效）、清掉偏移（回到统一基准）。
+	 *
+	 * @param stationId 目标频道 id
+	 * @return 该频道是否存在
+	 */
+	public static synchronized boolean reloadStation(String stationId) {
+		RadioStation target = null;
+		for (RadioStation station : stations) {
+			if (station.id().equals(stationId)) {
+				target = station;
+				break;
+			}
+		}
+		if (target == null) {
+			return false;
+		}
+		long elapsed = Math.max(0L, System.currentTimeMillis() - startEpochMillis);
+		headsBeforeReload.clear();
+		captureHead(target, elapsed);
+		// txt 重定向列表可能被改过，一并清掉；它按内容哈希缓存，重算成本很低。
+		TxtPlaylist.clearCache();
+		PlaylistTimeline.clearCacheFor(stationId);
+		stationShifts.remove(stationId);
+		SmileSRadio.LOGGER.info("频道 {}：已单独刷新（计时基准不变）", stationId);
+		return true;
+	}
+
+	/** 重载瞬间该频道正在播的曲目（实际推流的 MP3），没有则为 {@code null}。 */
+	public static Path headBeforeReload(String stationId) {
+		return stationId == null ? null : headsBeforeReload.get(stationId);
+	}
+
 	/** 配置根目录名。 */
 	private static final String CONFIG_DIR_NAME = "radio-smile";
 
@@ -208,8 +283,12 @@ public final class RadioStationRegistry {
 		// 配置重载：清掉各层缓存，保证内容变更立即生效。
 		// PlaylistTimeline 也要清：它固化了「起点轮次随机偏移」，
 		// 复用旧实例会导致重载后打乱模式的第一首仍然是同一首。
+		// 顺序很重要：必须在清缓存<b>之前</b>抓取「此刻正在播哪首」，
+		// 新时间轴据此避开它（否则重载后第一首还是刚才那首）。
+		captureHeadsBeforeReload();
 		TxtPlaylist.clearCache();
 		radiosmile.radio.PlaylistTimeline.clearCache();
+		clearStationShifts();
 		clearIconCache();
 
 		List<RadioStation> all = readIndex();
@@ -240,6 +319,43 @@ public final class RadioStationRegistry {
 		startEpochMillis = System.currentTimeMillis();
 		SmileSRadio.LOGGER.info("电台配置已加载：{} 个频道（另有 {} 个配置无效已隐藏），计时基准 {}",
 				stations.size(), invalid.size(), startEpochMillis);
+	}
+
+	/**
+	 * 记录各频道在重载瞬间正在播的曲目。
+	 *
+	 * <p>用<b>旧</b>计时基准算位置，并且刻意走 {@link PlaylistTimeline#of} 取缓存实例
+	 * （此时缓存还没清），因此不会额外扫一遍时长。
+	 * 非播放列表频道、曲池只有一首的频道不需要避让，直接跳过。
+	 */
+	private static void captureHeadsBeforeReload() {
+		headsBeforeReload.clear();
+		long elapsed = Math.max(0L, System.currentTimeMillis() - startEpochMillis);
+		for (RadioStation station : stations) {
+			captureHead(station, elapsed);
+		}
+	}
+
+	/** 记录单个频道在这一刻正在播的曲目（见 {@link #captureHeadsBeforeReload()}）。 */
+	private static void captureHead(RadioStation station, long elapsed) {
+		if (station == null || !station.isPlaylist()) {
+			return;
+		}
+		List<Path> tracks = resolveTracks(station);
+		if (tracks.size() <= 1) {
+			return;
+		}
+		PlaylistTimeline timeline = PlaylistTimeline.of(
+				station.id(), tracks, station.isRandom(), station.seed(), null);
+		if (timeline == null) {
+			return;
+		}
+		int round = timeline.roundOf(elapsed);
+		long[] located = timeline.locate(round, timeline.positionInRound(elapsed));
+		Path head = timeline.fileAt(round, (int) located[0]);
+		if (head != null) {
+			headsBeforeReload.put(station.id(), head);
+		}
 	}
 
 	private static List<RadioStation> readIndex() {

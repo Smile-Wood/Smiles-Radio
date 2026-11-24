@@ -31,8 +31,15 @@
 	"config.radio-smile.hint.bandwidth": "提示：带宽上限是期望值，实际分块会随网络状况自动调整；块大小不会超过上面的「单块上限」。",
 
 	"command.radio-smile.reloaded": "电台配置已重新加载：%s 个频道，播放进度已重置（计时基准 %s）",
-	"command.radio-smile.status": "当前 %s 个频道，计时基准 %s"
-,
+	"command.radio-smile.status": "当前 %s 个频道，计时基准 %s",
+
+	"command.radio-smile.reloaded_station": "频道 %s 已刷新，重建 %s 个订阅",
+
+	"command.radio-smile.play.started": "频道 %s：正在播放第 %s/%s 首（%s），重建 %s 个订阅",
+	"command.radio-smile.play.unknown": "频道不存在：%s",
+	"command.radio-smile.play.not_playlist": "频道 %s 不是播放列表（单文件或直播流），无法跳曲",
+	"command.radio-smile.play.no_audio": "频道 %s 没有可播曲目",
+	"command.radio-smile.play.bad_track": "曲目序号超出范围（1-%s）",
 
 	"gui.radio-smile.status.ok": "正常播放",
 	"gui.radio-smile.status.unknown_station": "频道不存在",

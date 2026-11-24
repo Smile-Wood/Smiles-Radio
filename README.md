@@ -237,7 +237,11 @@ On a fault the LCD shows `NOSIGNAL` and the red light blinks:
 | Command | Permission | Description |
 |---|---|---|
 | `/radio reload` | 2 | Reloads the config and rebuilds all subscriptions (progress reset) |
+| `/radio reload <station>` | 2 | Refreshes one station only; other stations keep playing. The reshuffled round never starts with the track that was playing |
+| `/radio play <station> <track>` | 2 | Jumps the station to track `n` of the round it is currently playing (also works for shuffled stations; `n` is the position in that round's order) |
 | `/reload` | 2 | Also reloads the station config |
+
+Both `<station>` and `<track>` are tab-completable: station ids come from `stations.json`, track numbers from the station's actual track count.
 
 ---
 

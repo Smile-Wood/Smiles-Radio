@@ -85,7 +85,7 @@ public final class PlaylistTimeline {
 	private record Round(int index, List<Track> order, long[] cumulative) {
 	}
 
-	private PlaylistTimeline(List<Track> pool, boolean random, long seed) {
+	private PlaylistTimeline(List<Track> pool, boolean random, long seed, Path avoidHead) {
 		this.pool = List.copyOf(pool);
 		this.random = random;
 		this.seed = seed;
@@ -99,8 +99,9 @@ public final class PlaylistTimeline {
 		// <p>旧实现取 {@code now / 一小时} 再乘大奇数散开：它只能保证「不同小时」不同，
 		// <b>一小时之内连续 /radio reload 抽到的起点轮次完全相同</b>，
 		// 于是重载后顺序没变、第一首还是刚才那首——这正是玩家反馈的现象。
-		// 现在改为每次构建现抽一个，并校验首曲确实与上次不同（见 pickFreshRoundOffset）。
-		this.roundOffset = this.random ? pickFreshRoundOffset() : 0;
+		// 现在改为每次构建现抽一个，并要求首曲避开「当前正在播的那首」
+		// （见 pickFreshRoundOffset）。
+		this.roundOffset = this.random ? pickFreshRoundOffset(avoidHead) : 0;
 		long total = 0L;
 		for (Track track : this.pool) {
 			// 防御：时长未知（<=0）时给最小正数，否则整轮时长会变成 0、除零卡死。
@@ -110,25 +111,28 @@ public final class PlaylistTimeline {
 	}
 
 	/**
-	 * 选一个「首曲与上一次构建不同」的起点轮次。
+	 * 选一个「首曲不是指定那一首」的起点轮次。
 	 *
 	 * <p>只把轮次号换掉并不足以保证第一首变化：不同轮次仍可能抽出同一个第一首
 	 * （概率约 1/曲池大小，小曲池上很容易撞）。因此抽到候选后直接算出该轮
 	 * <b>实际播放顺序</b>（含跨轮冷却修正），比对首曲；相同就重抽，最多 32 次。
 	 *
-	 * <p>只关心「本次构建」与「上次构建」的差异：同一实例内的结果被固化下来，
-	 * 多个订阅共享同一份顺序，多人同步不受影响（时间轴只存在于服务端）。
+	 * <p>避让目标由 {@code avoidHead} 给出——重载时就是「此刻正在播的那一首」，
+	 * 这样玩家听到的第一首一定换了；没有该信息（冷启动）时退回「上一次构建的首曲」。
+	 * 同一实例内的结果被固化下来，多个订阅共享同一份顺序，多人同步不受影响。
 	 */
-	private int pickFreshRoundOffset() {
+	private int pickFreshRoundOffset(Path avoidHead) {
 		if (this.pool.size() <= 1) {
 			return ThreadLocalRandom.current().nextInt(ROUND_OFFSET_MODULUS);
 		}
+		// 有「当前正在播」就用它，否则退回「上一次构建的首曲」。
+		Path forbidden = avoidHead != null ? avoidHead : lastFirstTrack;
 		int candidate = 0;
 		for (int attempt = 0; attempt < 32; attempt++) {
 			candidate = ThreadLocalRandom.current().nextInt(ROUND_OFFSET_MODULUS);
 			Path head = round(candidate).order().get(0).file();
 			synchronized (PlaylistTimeline.class) {
-				if (!head.equals(lastFirstTrack)) {
+				if (!head.equals(forbidden)) {
 					lastFirstTrack = head;
 					return candidate;
 				}
@@ -142,16 +146,23 @@ public final class PlaylistTimeline {
 	/**
 	 * 由曲池构建按轮时间轴。
 	 *
-	 * @param files  曲池源文件（顺序只在无随机时作为基准）
-	 * @param random 是否随机（{@code mode=random} 为 true）
-	 * @param seed   随机种子；相同种子下所有客户端算出相同顺序
+	 * <p>{@code stationId} 参与缓存键：<b>每个频道各有一份时间轴</b>。
+	 * 早期不区分频道，同一份目录被两个频道引用时会共用同一个实例
+	 * （同一个起点轮次、同一份顺序），而且「单独刷新某个频道」也无法只清它自己。
+	 *
+	 * @param stationId 频道 id（缓存键的一部分，仅用于隔离，不参与顺序计算）
+	 * @param files     曲池源文件（顺序只在无随机时作为基准）
+	 * @param random    是否随机（{@code mode=random} 为 true）
+	 * @param seed      随机种子；相同种子下所有客户端算出相同顺序
+	 * @param avoidHead 需要避开的首曲（重载瞬间正在播的那首），可为 {@code null}
 	 * @return 时间轴；曲池为空返回 {@code null}
 	 */
-	public static PlaylistTimeline of(List<Path> files, boolean random, long seed) {
+	public static PlaylistTimeline of(String stationId, List<Path> files, boolean random, long seed,
+			Path avoidHead) {
 		if (files == null || files.isEmpty()) {
 			return null;
 		}
-		String key = cacheKey(files, random, seed);
+		String key = cacheKey(stationId, files, random, seed);
 		PlaylistTimeline cached = CACHE.get(key);
 		if (cached != null) {
 			return cached;
@@ -198,7 +209,7 @@ public final class PlaylistTimeline {
 		if (dropped > 0) {
 			SmileSRadio.LOGGER.debug("播放列表去重：{} 个源文件指向同一份音频，已合并", dropped);
 		}
-		PlaylistTimeline timeline = new PlaylistTimeline(tracks, random, seed);
+		PlaylistTimeline timeline = new PlaylistTimeline(tracks, random, seed, avoidHead);
 		CACHE.put(key, timeline);
 		SmileSRadio.LOGGER.debug("播放列表：{} 首，每轮 {} ms，随机={} 冷却={} 首",
 				tracks.size(), timeline.roundTotalMillis, random, timeline.cooldownSize());
@@ -243,8 +254,26 @@ public final class PlaylistTimeline {
 		CACHE.clear();
 	}
 
-	private static String cacheKey(List<Path> files, boolean random, long seed) {
+	/**
+	 * 只清掉某个频道的时间轴缓存（{@code /radio reload <频道>} 使用）。
+	 *
+	 * <p>单频道刷新不能动全局缓存：其他频道仍在用旧实例播放，
+	 * 缓存被清后它们的新订阅会拿到「另一轮」的顺序，与正在听的玩家对不上。
+	 *
+	 * @param stationId 频道 id
+	 */
+	public static void clearCacheFor(String stationId) {
+		if (stationId == null) {
+			return;
+		}
+		String prefix = stationId + "@";
+		CACHE.keySet().removeIf(key -> key.startsWith(prefix));
+	}
+
+	private static String cacheKey(String stationId, List<Path> files, boolean random, long seed) {
 		StringBuilder sb = new StringBuilder();
+		// 频道 id 作为前缀：clearCacheFor() 靠它做前缀匹配。
+		sb.append(stationId == null ? "" : stationId).append('@');
 		sb.append(random ? "R" : "S").append(seed).append('#');
 		for (Path file : files) {
 			sb.append(file).append('|');
@@ -522,8 +551,28 @@ public final class PlaylistTimeline {
 		return Math.max(1L, order.get(Math.floorMod(index, order.size())).durationMillis());
 	}
 
-	/** 某轮某首是否可推流（即已有 MP3 转码产物）。 */
-	public boolean isPlayableAt(int roundIndex, int index) {
+	/**
+	 * 某轮某首的起始位置（本轮内毫秒）。
+	 *
+	 * <p>与 {@link #locate} 互逆：给 {@code index} 求「本轮内从第几毫秒开始是这首」。
+	 * 供外部跳曲使用（{@code /radio play <频道> <序号>}）：把该值当成目标位置，
+	 * 反算出计时偏移即可让所有人同时从这一首的开头开始。
+	 *
+	 * @param roundIndex 轮次
+	 * @param index      曲目序号（超出范围按取模处理）
+	 * @return 本轮内起始毫秒；曲池为空返回 0
+	 */
+	public long trackStartMillis(int roundIndex, int index) {
+		Round current = round(roundIndex);
+		long[] cumulative = current.cumulative();
+		int n = cumulative.length - 1;
+		if (n <= 0) {
+			return 0L;
+		}
+		return cumulative[Math.floorMod(index, n)];
+	}
+
+	/** 某轮某首是否可推流（即已有 MP3 转码产物）。 */	public boolean isPlayableAt(int roundIndex, int index) {
 		Path file = fileAt(roundIndex, index);
 		return file != null && file.getFileName().toString()
 				.toLowerCase(java.util.Locale.ROOT).endsWith(".mp3");

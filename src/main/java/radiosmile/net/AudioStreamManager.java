@@ -187,11 +187,12 @@ public final class AudioStreamManager {
 			// 播放列表：定位到「第几轮、本轮第几首、歌内第几毫秒」
 			if (station.isPlaylist() && tracks.size() > 1) {
 				radiosmile.radio.PlaylistTimeline timeline =
-						radiosmile.radio.PlaylistTimeline.of(tracks, station.isRandom(), station.seed());
+						radiosmile.radio.PlaylistTimeline.of(station.id(), tracks, station.isRandom(),
+								station.seed(), RadioStationRegistry.headBeforeReload(station.id()));
 				if (timeline != null) {
 					// 轮次与轮内位置都由统一的计时基准算出，因此任何时刻加入的玩家
 					// 都会落在同一轮、同一首、同一位置（多人同步的前提）。
-					long position = currentPlaybackOffsetMillis();
+					long position = currentPlaybackOffsetMillis(station.id());
 					int round = timeline.roundOf(position);
 					long positionInRound = timeline.positionInRound(position);
 					long[] located = timeline.locate(round, positionInRound);
@@ -213,7 +214,7 @@ public final class AudioStreamManager {
 			}
 
 			Path original = tracks.get(0);
-			return openTrack(original, currentPlaybackOffsetMillis(), 0);
+			return openTrack(original, currentPlaybackOffsetMillis(station.id()), 0);
 		} catch (IOException e) {
 			SmileSRadio.LOGGER.warn("打开音频源失败：{}", station.file(), e);
 			return null;
@@ -287,12 +288,15 @@ public final class AudioStreamManager {
 	 *
 	 * @return 播放位置毫秒；时长未知或基准缺失时返回 0（从头播放）
 	 */
-	private static long currentPlaybackOffsetMillis() {
+	private static long currentPlaybackOffsetMillis(String stationId) {
 		long epoch = RadioStationRegistry.startEpochMillis();
 		if (epoch <= 0) {
 			return 0L;
 		}
-		return Math.max(0L, System.currentTimeMillis() - epoch);
+		// 频道级偏移：/radio play 用它把某个频道整体挪到目标曲目，
+		// 其他频道偏移恒为 0，互不影响。
+		return Math.max(0L, System.currentTimeMillis() - epoch)
+				+ RadioStationRegistry.stationShiftMillis(stationId);
 	}
 
 	/**
@@ -687,6 +691,54 @@ public final class AudioStreamManager {
 		return new UUID(
 				player.getUUID().getMostSignificantBits() ^ mix,
 				player.getUUID().getLeastSignificantBits() ^ Long.rotateLeft(mix, 32) ^ 0x5DEECE66DL);
+	}
+
+	/**
+	 * 只重建某一个频道的订阅（{@code /radio play} 跳曲后使用）。
+	 *
+	 * <p>跳曲只影响一个频道，没必要把全服订阅都拆掉重连——
+	 * 那会让听其他频道的玩家也经历一次无谓的断流。
+	 *
+	 * @param stationId 目标频道 id
+	 * @return 重建成功的订阅数
+	 */
+	public static int rebuildStation(String stationId) {
+		List<SubscriptionSnapshot> snapshots = new ArrayList<>();
+		for (AudioSubscription sub : SUBSCRIPTIONS.values()) {
+			if (sub.station().id().equals(stationId)) {
+				snapshots.add(new SubscriptionSnapshot(
+						sub.player(), sub.pos(), sub.station().id(),
+						sub.bandwidthKbps(), sub.clientMaxChunk()));
+			}
+		}
+		if (snapshots.isEmpty()) {
+			return 0;
+		}
+		for (SubscriptionSnapshot snap : snapshots) {
+			AudioSubscription sub = SUBSCRIPTIONS.remove(key(snap.player(), snap.pos()));
+			if (sub != null) {
+				// 先让客户端播一段调台噪，把随后的跳变盖住（与全量重载一致）。
+				if (ServerPlayNetworking.canSend(snap.player(), RadioNetworking.S2C_RELOADED)) {
+					ServerPlayNetworking.send(snap.player(), RadioNetworking.S2C_RELOADED,
+							new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer()));
+				}
+				sub.deactivate();
+				sub.closeSource();
+			}
+		}
+		int rebuilt = 0;
+		for (SubscriptionSnapshot snap : snapshots) {
+			ServerPlayer player = snap.player();
+			if (player == null || player.hasDisconnected()) {
+				continue;
+			}
+			if (subscribe(player, snap.pos(), snap.stationId(),
+					snap.bandwidthKbps(), snap.clientMaxChunk()) != null) {
+				rebuilt++;
+			}
+		}
+		SmileSRadio.LOGGER.info("频道 {}：已按新的播放位置重建 {} 个订阅", stationId, rebuilt);
+		return rebuilt;
 	}
 
 	/**

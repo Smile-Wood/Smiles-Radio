@@ -32,8 +32,15 @@
 ,
 
 	"command.radio-smile.reloaded": "Radio config reloaded: %s station(s), playback progress reset (epoch %s)",
-	"command.radio-smile.status": "Current: %s station(s), epoch %s"
-,
+	"command.radio-smile.status": "Current: %s station(s), epoch %s",
+
+	"command.radio-smile.reloaded_station": "Station %s reloaded, %s subscription(s) resynced",
+
+	"command.radio-smile.play.started": "Station %s: now playing track %s/%s (%s), %s subscription(s) resynced",
+	"command.radio-smile.play.unknown": "Unknown station: %s",
+	"command.radio-smile.play.not_playlist": "Station %s is not a playlist (single file or live stream)",
+	"command.radio-smile.play.no_audio": "Station %s has no playable tracks",
+	"command.radio-smile.play.bad_track": "Track number out of range (1-%s)",
 
 	"gui.radio-smile.status.ok": "Playing",
 	"gui.radio-smile.status.unknown_station": "Station not found",
