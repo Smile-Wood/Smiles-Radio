@@ -1022,6 +1022,15 @@ public final class ClientAudioPlayer {
 		stream.chunks++;
 		stream.lastChunkAt = System.currentTimeMillis();
 		clearFaultNoiseOnResume(pos);
+		// <b>真实数据回来了：清掉屏幕上的 NOSIGNAL 与红灯</b>（切回正常 rate 显示）。
+		//
+		// 这一步曾漏掉：clearClientFaultOnResume 早期只挂在 handleChunk
+		// （服务端推流路径）上，而网络电台改为客户端直连后数据走本方法——
+		// 于是恢复后 clientFaultStatus 永远停在 TIMEOUT：声音有了，
+		// 灯还在闪、屏幕还是 NOSIGNAL（用户实测）。
+		// clearClientFaultOnResume 内部自带 faultShown 门（没亮灯直接 return，
+		// 不会每块都往主线程塞任务）、主线程 hop 与代际保护，从拉流线程调用是安全的。
+		clearClientFaultOnResume(pos);
 		if (!stream.feed(radiosmile.radio.AudioFormat.MP3, data)) {
 			// 数据不可解码：保留 rejected 流（防止重建风暴），只把混音器里的残留清掉
 			PcmSink.INSTANCE.removeSource(key);
