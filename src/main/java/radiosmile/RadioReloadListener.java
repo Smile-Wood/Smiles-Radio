@@ -55,6 +55,17 @@ public final class RadioReloadListener implements SimpleSynchronousResourceReloa
 		server = running;
 	}
 
+	/**
+	 * 当前运行中的服务端（未运行时为 {@code null}）。
+	 *
+	 * <p>给后台线程用：转码 / 响度补足这类工作跑在独立线程上，
+	 * 没有玩家对象可以 {@code getServer()}，只能从这里拿。
+	 * <b>调用方必须自己用 {@code server.execute(...)} 跳回主线程</b>再碰游戏状态。
+	 */
+	public static net.minecraft.server.MinecraftServer currentServer() {
+		return server;
+	}
+
 	@Override
 	public ResourceLocation getFabricId() {
 		return ID;
