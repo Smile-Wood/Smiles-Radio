@@ -196,16 +196,12 @@ public final class AudioSubscription {
 					// 若把空数组也当成 EOF，订阅会在连上之前就被判死——正是「切到网络电台
 					// 要等很久 / 有时干脆没声」的一个原因。
 					//
-					// <b>但「源已彻底结束」必须能退出这个循环</b>（本轮新增）：
-					// 按新的职责划分，服务端<b>不重连</b>网络电台——上游断了就永久结束，
-					// 之后 read() 一直返回空数组。若不在这里退出，读线程会每 50ms 空转，
-					// 订阅也一直挂着占名额，直到玩家下线才清理。
-					//
-					// 退出后订阅仍是 active 的（服务端不主动踢），只是不再产生数据：
-					// 客户端表现为底噪 + NOSIGNAL，玩家重连服务器时 DISCONNECT/JOIN 会清掉它。
+					// <b>「源已彻底结束」= 订阅被拆除（closed）</b>：
+					// 网络电台断线现在走 StreamAudioSource 的自动重连（指数退避），
+					// read() 断线期间返回空数组、读线程保持轮询，不再退出循环。
+					// 所以这里只有真正的拆除才退出；空数组一律 wait 后继续。
 					if (this.source.isFinished()) {
-						SmileSRadio.LOGGER.info("音频源已结束，停止读取（订阅保留待玩家重连）：{}",
-								this.station.id());
+						SmileSRadio.LOGGER.info("音频源已结束，停止读取：{}", this.station.id());
 						synchronized (this.queue) {
 							this.queue.notifyAll();
 						}
@@ -244,6 +240,9 @@ public final class AudioSubscription {
 				// 曲目序号在「读到这块数据的那一刻」就冻结下来，随数据一起入队。
 				// 换曲后读到的第一块新数据才带新序号，与字节流严格对应。
 				int chunkTrackIndex = this.source.trackIndex();
+				// <b>上游确实在供数</b>：刷新「上游数据流动」时钟。
+				// 心跳（见 upstreamFlowing）依据它区分「订阅活着」和「上游活着」。
+				this.lastUpstreamDataAt = System.currentTimeMillis();
 				synchronized (this.queue) {
 					while (this.queuedBytes + data.length > MAX_QUEUED_BYTES && !this.closed) {
 						this.queue.wait(200);
@@ -356,6 +355,35 @@ public final class AudioSubscription {
 	/** 记录一次发包（音频块或心跳），用于心跳判定。 */
 	public void markHeartbeatSent(long now) {
 		this.lastSendAt = now;
+	}
+
+	/**
+	 * 上游「还有数据流」的判定窗口（毫秒）。
+	 *
+	 * <p>取 <b>5000ms</b>：远大于换曲/轮转的正常空窗（几百毫秒），
+	 * 又明显小于客户端判 {@code STALL_TIMEOUT} 的 8 秒——保证
+	 * 「上游断了 → 心跳停发 → 客户端判超时点 NOSIGNAL」这条链路一定走得完。
+	 */
+	private static final long UPSTREAM_FLOW_WINDOW_MILLIS = 5000L;
+
+	/** 上游最后一次真正供数的时刻（读线程每读到一块非空数据就刷新）。 */
+	private volatile long lastUpstreamDataAt = System.currentTimeMillis();
+
+	/**
+	 * 上游现在是否还有数据在流动。
+	 *
+	 * <h2>为什么心跳不能只看「订阅活着」</h2>
+	 * 心跳空包的语义是「我还活着，只是这段没数据」，它存在的目的是挡住
+	 * 换曲空窗的误报。但断网时订阅对象同样是「活着」的——
+	 * 若心跳照发，客户端的 8 秒超时（{@code lastChunkAt}）会被永远刷新，
+	 * NOSIGNAL 永远不亮、底噪也不会保持，玩家看到的是无提示的永久静音。
+	 *
+	 * <p>所以心跳必须绑定「上游确实在供数」：上游断流超过
+	 * {@link #UPSTREAM_FLOW_WINDOW_MILLIS} 就停发心跳，把故障判定
+	 * 完整交还给客户端；重连成功后数据恢复，心跳与音频自然回来。
+	 */
+	public boolean upstreamFlowing(long now) {
+		return now - this.lastUpstreamDataAt < UPSTREAM_FLOW_WINDOW_MILLIS;
 	}
 
 	/**

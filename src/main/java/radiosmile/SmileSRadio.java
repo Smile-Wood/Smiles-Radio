@@ -60,14 +60,15 @@ public class SmileSRadio implements ModInitializer {
 
 		// ---------------------------------------------------------------- 连接生命周期
 		//
-		// <b>服务端只对"连接"负责，不对"上游网络电台"负责</b>（本轮架构调整）：
+		// <b>服务端只对"连接"负责</b>：
 		//
 		//   玩家掉线 / 退出游戏 / 断网被判定为下线  → DISCONNECT → 清空该玩家全部订阅
 		//   玩家重新连回服务器（算重新上线）        → JOIN       → 一切从零，客户端重新订阅
 		//
 		// 这里"清空订阅"是<b>唯一</b>的重置入口。它同时带来一个重要性质：
 		// 玩家只要还连着服务器，就不会因为偶尔收不到上游音频而被踢掉订阅——
-		// 那种情况客户端只显示底噪 + NOSIGNAL，等网好或等玩家重连。
+		// 那种情况客户端显示底噪 + NOSIGNAL；上游断流由 StreamAudioSource
+		// 自动重连（指数退避）恢复，恢复后故障显示自动熄灭。
 		net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.DISCONNECT.register(
 				(handler, server) -> {
 					var player = handler.getPlayer();

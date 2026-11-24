@@ -397,28 +397,33 @@ public final class AudioStreamManager {
 				dead.add(sub);
 				continue;
 			}
-			if (!sub.isDue(now)) {
-				// <b>还没到发送节拍，但可能已经很久没发过任何东西了。</b>
-				//
-				// 这是换曲场景下很容易漏掉的一条：{@code isDue()} 由配速锚点决定，
-				// 换曲/轮转时锚点可能被推到较远的未来，于是这里一路 {@code continue}，
-				// 客户端那边长时间收不到包 → 误判超时 → 点 NOSIGNAL + 响底噪。
-				//
-				// 因此补一条<b>与配速无关</b>的心跳路径：只要距上次发包超过
-				// {@link #HEARTBEAT_INTERVAL_MILLIS}，就发一个空包维持连接。
-				// 它不参与配速（不调 markSent），所以不会影响正常音频的节奏。
-				if (sub.isHeartbeatDue(now) && !sub.source().isFinished()) {
-					sendHeartbeat(sub);
+			if (sub.isDue(now)) {
+				// 到发送节拍：走正常推送路径
+				try {
+					pump(sub, now);
+				} catch (IOException e) {
+					SmileSRadio.LOGGER.warn("[停止原因B] 推送音频失败：{} @{}", sub.station().id(), sub.pos(), e);
+					sendStatus(sub.player(), sub.pos(), AudioStatus.STOPPED);
+					sub.deactivate();
+					dead.add(sub);
 				}
 				continue;
 			}
-			try {
-				pump(sub, now);
-			} catch (IOException e) {
-				SmileSRadio.LOGGER.warn("[停止原因B] 推送音频失败：{} @{}", sub.station().id(), sub.pos(), e);
-				sendStatus(sub.player(), sub.pos(), AudioStatus.STOPPED);
-				sub.deactivate();
-				dead.add(sub);
+			// <b>还没到发送节拍，但可能已经很久没发过任何东西了。</b>
+			//
+			// 这是换曲场景下很容易漏掉的一条：{@code isDue()} 由配速锚点决定，
+			// 换曲/轮转时锚点可能被推到较远的未来，于是这里一路 {@code continue}，
+			// 客户端那边长时间收不到包 → 误判超时 → 点 NOSIGNAL + 响底噪。
+			//
+			// 因此补一条<b>与配速无关</b>的心跳路径：只要距上次发包超过
+			// {@link #HEARTBEAT_INTERVAL_MILLIS}，就发一个空包维持连接。
+			// 它不参与配速（不调 markSent），所以不会影响正常音频的节奏。
+			//
+			// 心跳与 pump 主路径同一套双重判据：订阅未拆除 + 上游仍在供数。
+			// 上游断流时停发，让客户端按 8 秒超时点亮 NOSIGNAL（详见 pump 内说明）。
+			if (sub.isHeartbeatDue(now)
+					&& !sub.source().isFinished() && sub.upstreamFlowing(now)) {
+				sendHeartbeat(sub);
 			}
 		}
 
@@ -542,10 +547,16 @@ public final class AudioStreamManager {
 			// 天然不会刷屏；空包只有十几个字节。
 			//
 			// <h2>但不能无限发</h2>
-			// 若上游真的死了（{@code source.isFinished()}），读线程会退出，
-			// 这时继续发空包只会让客户端以为"一切正常"而永远不报故障。
-			// 因此只在<b>流还没结束</b>时发；真结束时不发，让客户端按既有逻辑判超时。
-			if (!sub.source().isFinished()) {
+			// 若上游真的死了，继续发空包只会让客户端以为"一切正常"而永远不报故障。
+			// 因此判据是<b>双重的</b>：
+			//   1) {@code source.isFinished()}：订阅已拆除（不再有意义）；
+			//   2) {@code upstreamFlowing}：上游最近确实在供数。
+			// 第 2 条是关键：断网/重连期间订阅对象同样是"活着"的，
+			// 若只看第 1 条，心跳会一直发、客户端的 8 秒超时被永远刷新，
+			// NOSIGNAL 永远不亮、底噪也不保持（用户实测：断网无任何提示）。
+			// 停发后客户端按自己的节奏判超时 → 点亮 NOSIGNAL + 底噪；
+			// 服务端那边 StreamAudioSource 的自动重连把流接回来后一切恢复。
+			if (!sub.source().isFinished() && sub.upstreamFlowing(now)) {
 				// <b>换曲预载期间发「空音量包」，而不是普通心跳。</b>
 				//
 				// 两者都带 0 字节音频，差别只在语义与客户端的处置：

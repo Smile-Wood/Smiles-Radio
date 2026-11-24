@@ -1445,7 +1445,7 @@ public final class PcmSink {
 		}
 		// 「连续无数据」的起始时刻：只有<b>真的连续</b>才累积。
 		// 抖动型的欠载（有块、没块交替）会在这里被清零，
-		// 所以死流封顶（见 {@link #DEAD_AIR_MUTE_MILLIS}）不会误伤正常卡顿。
+		// 所以饥饿宽限（见 {@link #STARVE_GRACE_MILLIS}）不会误伤正常卡顿。
 		long nowMs = System.currentTimeMillis();
 		if (this.starved) {
 			if (this.starvedSinceMs == 0L) {
@@ -1564,22 +1564,16 @@ public final class PcmSink {
 		// <b>两档</b>：
 		//   卡住（这一块完全没数据）-> 大底噪，填满静音
 		//   不卡但缓冲未恢复      -> 弱底噪，持续提示到恢复为止
-		// <b>死流封顶</b>：连续无数据超过 {@link #DEAD_AIR_MUTE_MILLIS} 之后，
-		// 不再继续发底噪，改为彻底静音。
 		//
-		// <p>「故障期间持续发声」原本是为了让玩家知道设备还在工作，
-		// 但<b>没有时长上限</b>的设计有个致命样本：用户实录 17 秒，
-		// 换曲后底噪<b>连续响了 11.7 秒</b>——RMS 稳定在 -38.4 dBFS，
-		// 谱平坦度 0.23~0.41（音乐通常 <0.05），4~16kHz 只比 100~1000Hz 低 2~4 dB，
-		// 也就是说那是一段几乎纯白的噪声，一直盖在静音上，直到手动切台才消失。
+		// <b>故障噪音没有时长上限</b>（用户明确要求「断网要保持噪音」）。
 		//
-		// <p>零星的卡顿要提示，卡死了就不该继续喊：持续几秒连一个音频帧都拿不到，
-		// 说明问题不在"抖一下"而在流真的死了，这时候静音 + 自动重连
-		// （{@code AutoSubscriber} 的静音看门狗）才是对的，
-		// 无穷无尽的嘶声只会让人以为模组坏了。
-		boolean deadAir = failing && this.starvedSinceMs != 0L
-				&& nowMs - this.starvedSinceMs > DEAD_AIR_MUTE_MILLIS;
-
+		// 曾经加过一道「死流封顶」（连续无数据 3.5 秒后强制静音），当时是为了
+		// 压制一段常驻白噪；后来查明那段白噪的真正根因是缓冲水位锯齿骗过
+		// 瞬时判据（见 {@link #isBufferUnhealthy()}），平滑水位修复后误报消失，
+		// 封顶反而把真实断网的提示音也在 3.5 秒后掐掉了——玩家无法判断
+		// 「是还在重连、还是彻底坏了」。所以撤掉封顶：故障噪音一直响到
+		// 数据恢复或玩家操作为止。
+		//
 		// <b>饥饿宽限</b>：刚开始掉数据的那 {@link #STARVE_GRACE_MILLIS}，
 		// 一律按数字静音处理——起播、换曲、重连的空窗都落在这个区里，
 		// 一饿就响底噪等于把正常空窗也判成故障（详见该常量的说明）。
@@ -1589,11 +1583,7 @@ public final class PcmSink {
 				&& nowMs - this.starvedSinceMs < STARVE_GRACE_MILLIS;
 
 		float target;
-		if (deadAir) {
-			target = 0.0F;
-			// 粘性弱底噪也要一起撤，否则封顶后它还会以 STUTTER_LEVEL 续命
-			this.weakNoiseHeld = false;
-		} else if (starveGrace) {
+		if (starveGrace) {
 			target = 0.0F;
 		} else if (failing) {
 			target = 1.0F;
@@ -1923,19 +1913,6 @@ public final class PcmSink {
 	 * 也就是说「窗口到顶」总是早于「客户端判超时」，两者不会打架。
 	 */
 	public static final int TRANSITION_SILENCE_MAX_MILLIS = 3000;
-
-	// ------------------------------------------------------- 死流封顶
-
-	/**
-	 * 连续无数据满这么久之后，底噪<b>停止发声</b>（毫秒）。
-	 *
-	 * <p>取值依据：真实的网络抖动是「一顿一顿」的，最长的一次卡顿
-	 * 在用户录像里也没超过 200ms；而那次「底噪连响 11.7 秒」的样本
-	 * 是一个彻底死掉的流。取 3500ms——比任何正常抖动都长一个数量级，
-	 * 又比客户端判 {@code STALL_TIMEOUT}（8 秒）和静音看门狗（6 秒）短，
-	 * 保证「先闭嘴上噪、再由看门狗重连」的顺序。
-	 */
-	public static final int DEAD_AIR_MUTE_MILLIS = 3500;
 
 	/**
 	 * 刚开始掉数据时，先<b>闭着嘴</b>忍这么久（毫秒），之后才允许响底噪。
