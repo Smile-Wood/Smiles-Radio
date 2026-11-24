@@ -1511,11 +1511,21 @@ public final class PcmSink {
 		boolean deadAir = failing && this.starvedSinceMs != 0L
 				&& nowMs - this.starvedSinceMs > DEAD_AIR_MUTE_MILLIS;
 
+		// <b>饥饿宽限</b>：刚开始掉数据的那 {@link #STARVE_GRACE_MILLIS}，
+		// 一律按数字静音处理——起播、换曲、重连的空窗都落在这个区里，
+		// 一饿就响底噪等于把正常空窗也判成故障（详见该常量的说明）。
+		// 注意这里连「弱底噪」一起压掉：宽限期内 `healthy` 必然为 false，
+		// 只压大底噪的话 STUTTER_LEVEL 还会接着响。
+		boolean starveGrace = failing && this.starvedSinceMs != 0L
+				&& nowMs - this.starvedSinceMs < STARVE_GRACE_MILLIS;
+
 		float target;
 		if (deadAir) {
 			target = 0.0F;
 			// 粘性弱底噪也要一起撤，否则封顶后它还会以 STUTTER_LEVEL 续命
 			this.weakNoiseHeld = false;
+		} else if (starveGrace) {
+			target = 0.0F;
 		} else if (failing) {
 			target = 1.0F;
 		} else if (this.weakNoiseHeld) {
@@ -1901,6 +1911,27 @@ public final class PcmSink {
 	 * 保证「先闭嘴上噪、再由看门狗重连」的顺序。
 	 */
 	public static final int DEAD_AIR_MUTE_MILLIS = 3500;
+
+	/**
+	 * 刚开始掉数据时，先<b>闭着嘴</b>忍这么久（毫秒），之后才允许响底噪。
+	 *
+	 * <h2>为什么必须先静音，而不是一饿就响</h2>
+	 * 用户实录（14:15:08 起 17.5 秒）里那 850ms 底噪是硬证据：
+	 * 10.93s 起 4~16kHz 噪声底在 50ms 内从 -22 dB 跳到 -8.5 dB，
+	 * 之后 11.00~11.80s 一直死平在 -8.5±0.5 dB，11.85s 开始淡出、11.90s 归零。
+	 * 而服务端日志在 14:15:18~19（对应 10.9~11.9s）<b>一条事件都没有</b>——
+	 * 没有切曲、没有换台，纯客户端饿出来的。清理它的是玩家在 14:15:20
+	 * 手动 {@code radio reload}。
+	 *
+	 * <p>也就是说「起播/换曲的空窗」和「网络真的坏了」在头几百毫秒里
+	 * 根本没法区分，而现在一饿就按满强度响，等于把前者也当成后者。
+	 * 真实故障是持续几秒的，600ms 的宽限不会漏报，却能让切曲空窗保持干净。
+	 *
+	 * <p>取值 600ms：比实测空窗（约 300~900ms）略短，保证
+	 * 「真空窗跨完还不恢复」时仍会响；又明显长于单块抖动（20ms）与
+	 * 欠载计数阈值（{@link #UNDERRUN_ALERT_BLOCKS} 约 160ms）。
+	 */
+	public static final int STARVE_GRACE_MILLIS = 600;
 
 	/**
 	 * 本次「连续无数据」的起始时刻（0 表示当前并不处于连续无数据状态）。
