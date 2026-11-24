@@ -117,7 +117,8 @@ public final class ClientRadioNetwork {
 					radiosmile.client.audio.PcmSink.INSTANCE.setStreamGain(pos.asLong(), gain);
 				});
 
-		// 「空音量包」：服务端声明「接下来这段是换曲预载/重载，请输出数字静音」。		//
+		// 「空音量包」：服务端声明「接下来这段是换曲预载/重载，请输出数字静音」。
+		//
 		// <b>它不带任何音频字节</b>，绝不能被喂给解码器；作用只有一个——
 		// 把混音器的过渡静音窗往后铺，让它在预载期间不把「没有任何音源供数」
 		// 当成弱网去响底噪（见 PcmSink#beginTransitionSilence）。
@@ -127,19 +128,14 @@ public final class ClientRadioNetwork {
 		// 这个方法只写 volatile 时间戳与混音线程独占的计数器，可以在网络线程直接调。
 		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_AUDIO_SILENCE,
 				(Minecraft client, ClientPacketListener handler, FriendlyByteBuf buf, PacketSender sender) -> {
-					net.minecraft.core.BlockPos pos = buf.readBlockPos();
+					buf.readBlockPos();          // 方块坐标：目前不参与判定，读掉以免字节错位
 					buf.readUtf();               // 频道 id：同上，为日志对齐预留
 					buf.readVarInt();            // 曲目序号：换曲仍以数据块为准
 					int millis = buf.readVarInt();
-					// <b>调台噪提前到空窗的开头</b>（用户反馈：换台时先有一小段数字静音）。
-					//
-					// 服务端在换曲/命令切歌的空窗一开始就发本包，但客户端此前要等到
-					// 新曲目的第一块数据抵达（handleChunk）才触发调台噪——
-					// 这中间几百毫秒没有任何音源供数、噪声又还没起，输出就是纯数字 0，
-					// 听感是「先哑一下，再沙沙」。现在包一到就起噪，噪声抢在空窗
-					// 前面铺开，与换台回执（S2C_SELECT_ACK）的行为对齐。
-					// 400ms 去重窗保证预载期每 200ms 一包的重复触发不会反复重启噪声。
-					radiosmile.client.audio.PcmSink.INSTANCE.playTuningNoise(pos);
+					// <b>这里绝不触发调台噪</b>：本包的职责就是「声明静音、防止客户端
+					// 把预载空窗误判成服务器故障而去响底噪」。换曲是台内正常衔接，
+					// 不是调台跳变，不该有噪声盖在上面；调台噪只在真正的换台
+					// （S2C_SELECT_ACK / handleChunk 换台路径）触发。
 					radiosmile.client.audio.PcmSink.INSTANCE.beginTransitionSilence(millis);
 				});
 
