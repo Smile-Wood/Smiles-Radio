@@ -289,19 +289,9 @@ public final class AudioTranscoder {
 	/** 响度核对结果的旁注文件后缀（与 MP3 同目录、同名前缀）。 */
 	private static final String LEVEL_SUFFIX = ".loud";
 
-	/**
-	 * 一次测量的结果。
-	 *
-	 * @param mean   平均电平（dBFS）
-	 * @param peak   峰值（dBFS）
-	 * @param gain   实际补偿的增益；{@link #GIVE_UP_GAIN} 表示"量过了，抬不动"
-	 * @param target 测量时使用的目标电平：目标改了，旧结论自动作废
-	 */
-	private record Level(float mean, float peak, float gain, float target) {
+	/** 一次测量的结果。 */
+	private record Level(float mean, float peak, float gain) {
 	}
-
-	/** 旁注里 {@code gain} 取这个值 = 源文件没有可抬的余量，别再重复试。 */
-	private static final float GIVE_UP_GAIN = -1.0F;
 
 	/**
 	 * 核对并补足给定源文件的响度<b>（服务端启动 / 每次重载配置时调用）</b>。
@@ -352,10 +342,6 @@ public final class AudioTranscoder {
 				applyNow(fixed);
 			} else {
 				SmileSRadio.LOGGER.debug("[响度] 核对 {} 首，全部达标", checked);
-				// 这一轮没有要刷的东西：解除「本会话已自动刷新」的锁，
-				// 这样以后新增 / 换了曲目再补足时，"立即生效"仍然会执行。
-				// 它只用来打断「补→刷→补」的紧循环，不该永久失效。
-				AUTO_APPLIED.set(false);
 			}
 		}, "RadioSmile-Loudness");
 		worker.setDaemon(true);
@@ -433,9 +419,7 @@ public final class AudioTranscoder {
 		if (cached != null && cached.gain() > 0F && !Files.isRegularFile(target)) {
 			cached = null;
 		}
-		// 达标，或已经试过并确认没有余量（见 GIVE_UP_GAIN）：都不必再动
-		if (cached != null
-				&& (cached.gain() < 0F || cached.mean() >= TARGET_MEAN_DB - LOUDNESS_TOLERANCE_DB)) {
+		if (cached != null && cached.mean() >= TARGET_MEAN_DB - LOUDNESS_TOLERANCE_DB) {
 			return false;
 		}
 
@@ -474,19 +458,7 @@ public final class AudioTranscoder {
 			probe = fresh;
 		}
 
-		// 没烤过有两种可能：本来就够响（记 gain=0），或者根本没余量可抬（记"尽力"）。
-		// 后者必须单独标出来，否则每次加载都会为它白跑一遍 volumedetect。
-		float recorded;
-		if (rebaked) {
-			recorded = applied;
-		} else if (probe.mean() >= TARGET_MEAN_DB - LOUDNESS_TOLERANCE_DB) {
-			recorded = 0F;
-		} else {
-			recorded = GIVE_UP_GAIN;
-			SmileSRadio.LOGGER.debug("[响度] {} 平均 {} dBFS 但峰值已到 {} dBFS，没有可抬的余量",
-					source.getFileName(), probe.mean(), probe.peak());
-		}
-		writeLevel(sidecar, probe, recorded);
+		writeLevel(sidecar, probe, applied);
 		return rebaked;
 	}
 
@@ -541,7 +513,7 @@ public final class AudioTranscoder {
 			if (Float.isNaN(mean)) {
 				return null;
 			}
-			return new Level(mean, Float.isNaN(peak) ? mean : peak, 0F, TARGET_MEAN_DB);
+			return new Level(mean, Float.isNaN(peak) ? mean : peak, 0F);
 		} catch (IOException e) {
 			return null;
 		} catch (InterruptedException e) {
@@ -583,7 +555,6 @@ public final class AudioTranscoder {
 			float mean = Float.NaN;
 			float peak = Float.NaN;
 			float gain = 0F;
-			float target = Float.NaN;
 			for (String part : text.split("\\s+")) {
 				int eq = part.indexOf('=');
 				if (eq <= 0) {
@@ -596,7 +567,6 @@ public final class AudioTranscoder {
 						case "mean" -> mean = Float.parseFloat(v);
 						case "peak" -> peak = Float.parseFloat(v);
 						case "gain" -> gain = Float.parseFloat(v);
-						case "target" -> target = Float.parseFloat(v);
 						default -> { }
 					}
 				} catch (NumberFormatException ignored) {
@@ -606,11 +576,7 @@ public final class AudioTranscoder {
 			if (Float.isNaN(mean)) {
 				return null;
 			}
-			// 目标电平改过：旧结论不再成立，当成没做过
-			if (!Float.isNaN(target) && Math.abs(target - TARGET_MEAN_DB) > 0.05F) {
-				return null;
-			}
-			return new Level(mean, Float.isNaN(peak) ? mean : peak, gain, TARGET_MEAN_DB);
+			return new Level(mean, Float.isNaN(peak) ? mean : peak, gain);
 		} catch (IOException e) {
 			return null;
 		}
