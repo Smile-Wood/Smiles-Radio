@@ -996,7 +996,14 @@ public final class ClientAudioPlayer {
 			stream.close();
 			STREAMS.remove(key);
 			PcmSink.INSTANCE.flush();
-			PcmSink.INSTANCE.clearNetworkNoise();
+			// <b>重连恢复用淡出，不用 clearNetworkNoise()（瞬时归零）</b>。
+			//
+			// 会话号变化意味着上游断过、现在接回来了——故障正在「结束」，
+			// 此刻底噪多半还处于满强度。硬归零的听感是噪音戛然而止（用户实测
+			// 「恢复后有没有淡出」）；onLinkRecovered() 让底噪按落音速率
+			// 自然淡出，同时复位故障计数（underruns/weakNoiseHeld/faultReported）。
+			// 换台路径（handleChunk）才用 clearNetworkNoise()——那里上一台必须立刻消失。
+			PcmSink.INSTANCE.onLinkRecovered();
 			PcmSink.INSTANCE.setNetworkNoiseSource(pos);
 			PcmSink.INSTANCE.beginTransitionSilence();
 			stream = null;

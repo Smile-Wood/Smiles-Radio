@@ -20,8 +20,8 @@ import java.util.Random;
  * </ul>
  *
  * <p>用连续渐变而不是「好/坏」两档，避免在阈值附近反复开关造成听感上的抖动。
- * 另外加了<b>迟滞</b>（起音快、落音慢），网络瞬时就恢复时底噪不会立刻消失，
- * 否则会变成一喘一喘的「噗噗」声。
+ * 档位之间的过渡也必须是<b>可听见的渐变</b>（起音约 600ms、落音约 1.5 秒）：
+ * 缓存变薄时嘶声缓缓渗上来，恢复时缓缓退下去，任何时刻都不做响度跳变。
  *
  * <h2>性能约束</h2>
  * 单独一条混音线程分支、每 20ms 才调一次；内部只有一阶低通与乘法递推，
@@ -32,10 +32,21 @@ public final class NetworkNoise {
 	private static final float PEAK = 0.12F;
 	/** 低通系数：弱信号嘶声偏闷，不要像白噪那么刺耳。 */
 	private static final float LOWPASS = 0.25F;
-	/** 起音步长（每写块，约 20ms）：链路变差要尽快让玩家察觉。 */
-	private static final float ATTACK = 0.14F;
-	/** 落音步长：恢复要慢一点，让提示音自然淡出而不是戛然消失。 */
-	private static final float RELEASE = 0.06F;
+	/**
+	 * 起音步长（每写块，约 20ms）：0 → 满档约 <b>600ms</b> 渐起。
+	 *
+	 * <p>旧值 0.14（0→弱档仅 60ms、弱档→满档仅 80ms）用户实测听感是
+	 * 「响度跳变」——缓存变薄时完全感觉不出过渡，灯闪瞬间噪音猛地炸出来。
+	 * 档位切换（静音→弱 0.4→满 1.0）必须是<b>可感知的渐变</b>。
+	 */
+	private static final float ATTACK = 0.033F;
+	/**
+	 * 落音步长（每写块，约 20ms）：满档 → 0 约 <b>1.5 秒</b>。
+	 *
+	 * <p>信号恢复后底噪按这个速率淡出（{@code PcmSink#onLinkRecovered}），
+	 * 听感是「沙声慢慢退去」；旧值 0.06 约 340ms，退得太急。
+	 */
+	private static final float RELEASE = 0.014F;
 	/** 单次掉数据提示的起始强度（相对最大值）。 */
 	private static final float PULSE_LEVEL = 0.85F;
 
@@ -86,7 +97,8 @@ public final class NetworkNoise {
 	 */
 	public void updateTarget(float target) {
 		float clamped = Math.max(0.0F, Math.min(1.0F, target));
-		// 起音快、落音慢：避免在阈值附近来回抖动
+		// 起音慢、落音更慢：健康↔弱档↔满档之间全是可听见的渐变，绝不跳变；
+		// 落音慢同时提供迟滞，网络瞬时就恢复时底噪不会立刻消失（避免一喘一喘的「噗噗」声）
 		float step = clamped > this.gain ? ATTACK : RELEASE;
 		if (this.gain < clamped) {
 			this.gain = Math.min(clamped, this.gain + step);
