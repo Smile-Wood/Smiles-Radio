@@ -674,6 +674,7 @@ public final class PcmSink {
 		this.weakNoiseHeld = false;
 		this.healthyBlocks = 0;
 		this.failingNow = false;
+		this.faultLatched = false;
 		// 用户关台：过渡静音窗一并作废。留着它只会让「下次开台」白得一段掩护，
 		// 而那次开台本来就有自己的窗口。
 		this.transitionSilenceUntil = 0L;
@@ -1587,8 +1588,27 @@ public final class PcmSink {
 		boolean starveGrace = failing && this.starvedSinceMs != 0L
 				&& nowMs - this.starvedSinceMs < STARVE_GRACE_MILLIS;
 
+		// <b>故障锁存</b>：真实故障一旦成立（宽限过后仍连续无数据），电平就锁死在满档，
+		// 不再随逐块重算的瞬时状态摆动。
+		//
+		// 用户实测：NOSIGNAL 期间电平像 0.4-0.6-1.0-0.3 一样来回跳——
+		// 原因是故障期间判据每块都在重算：上游闪断/重连尝试偶尔漏进一块数据，
+		// 「连续无数据」被清零 → failing 短暂为 false → 掉回弱档 0.4 → 又饿 → 回 1.0。
+		// 锁存后故障期间恒定 1.0，只有两条路能解锁：
+		//   1) 缓冲<b>真正恢复健康</b>（有数据且水位回来）→ 走正常淡出；
+		//   2) 显式恢复入口（onLinkRecovered / clearNetworkNoise / beginTransitionSilence）。
+		// 单块数据的闪现不会解锁（缓冲仍薄、healthy 为 false），电平纹丝不动。
+		if (failing && !starveGrace) {
+			this.faultLatched = true;
+		} else if (this.faultLatched && healthy && !starving) {
+			this.faultLatched = false;
+		}
+
 		float target;
-		if (starveGrace) {
+		if (this.faultLatched) {
+			// 故障期间恒定满档（NOSIGNAL 维持档），不摆动
+			target = 1.0F;
+		} else if (starveGrace) {
 			// 冻结：目标 = 当前实际增益（updateTarget 对相等的值不做任何移动）
 			target = this.networkNoise.gain();
 		} else if (failing) {
@@ -1614,6 +1634,17 @@ public final class PcmSink {
 
 	/** 「弱底噪」开始粘住的时刻；配合 {@link #WEAK_NOISE_MAX_MILLIS} 做时长封顶。 */
 	private long weakNoiseSinceMs;
+
+	/**
+	 * 故障锁存：真实故障（宽限过后仍连续无数据）成立后为 true。
+	 *
+	 * <p>锁存期间底噪电平<b>恒定满档</b>，不随逐块重算的瞬时状态摆动
+	 * （用户实测：NOSIGNAL 期间电平 0.4-0.6-1.0-0.3 来回跳）。
+	 * 解锁：缓冲真正恢复健康、或显式恢复入口
+	 * （{@link #onLinkRecovered()} / {@link #clearNetworkNoise()} /
+	 * {@link #beginTransitionSilence(long)}）。
+	 */
+	private boolean faultLatched;
 
 	/** 封顶撤销后是否禁止再次粘住（缓冲真正连续健康过一轮才解除）。 */
 	private boolean weakNoiseSuppressed;
@@ -1889,6 +1920,8 @@ public final class PcmSink {
 		this.consecutiveUnderruns = 0;
 		this.weakNoiseHeld = false;
 		this.healthyBlocks = 0;
+		// 链路已恢复：解锁故障电平，底噪从这里开始按落音速率淡出
+		this.faultLatched = false;
 		this.networkNoise.updateTarget(0.0F);
 	}
 
@@ -1896,6 +1929,7 @@ public final class PcmSink {
 		this.consecutiveUnderruns = 0;
 		this.failingNow = false;
 		this.faultReported = false;
+		this.faultLatched = false;
 		this.starvedSinceMs = 0L;
 		// 卡顿计数也要清：否则「网络恢复」后旧的卡顿历史还会让底噪响一阵
 		this.recentThinnedBlocks = 0;
@@ -2029,6 +2063,8 @@ public final class PcmSink {
 		this.consecutiveUnderruns = 0;
 		this.weakNoiseHeld = false;
 		this.healthyBlocks = 0;
+		// 换曲/重载是服务端明确声明的新节目：之前的故障状态一并解除
+		this.faultLatched = false;
 		// 卡顿滑动窗口也要清：否则窗一过，flush 前攒下的「见薄」痕迹
 		// 还会让弱底噪再响一阵，正好落在新节目的开头。
 		this.recentThinnedBlocks = 0;

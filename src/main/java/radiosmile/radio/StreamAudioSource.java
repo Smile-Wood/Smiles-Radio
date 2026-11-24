@@ -21,7 +21,7 @@ import radiosmile.SmileSRadio;
  * 抖动来源消失；而实测断网后收音机既不报 NOSIGNAL 也永远不恢复，
  * 玩家只能重连服务器，体验不可接受。所以恢复重连，职责收拢为：
  * <ul>
- *   <li><b>服务端</b>负责把管子接回去（指数退避 3s -> 30s，无限重试），
+ *   <li><b>服务端</b>负责把管子接回去（指数退避 1s -> 8s，无限重试），
  *       重连成功 {@link #sessionId} 递增，客户端自动重建解码器、无缝续播；</li>
  *   <li><b>客户端</b>只负责显示故障（NOSIGNAL + 底噪），见 {@code AutoSubscriber}。</li>
  * </ul>
@@ -49,10 +49,22 @@ public final class StreamAudioSource implements AudioSource {
 
 	// ---------------- 自动重连（指数退避） ----------------
 
-	/** 首次重连前的等待（毫秒）。 */
-	private static final long RECONNECT_BASE_MS = 3000L;
-	/** 重连间隔上限（毫秒）。断网几小时也别把上游打爆。 */
-	private static final long RECONNECT_MAX_MS = 30000L;
+	/**
+	 * 首次重连前的等待（毫秒）。
+	 *
+	 * <p>取 1 秒：网络闪断（几秒内恢复）是最常见的场景，
+	 * 第一次重试就该赶在最前面；持续断网靠后面的指数升级兜底。
+	 */
+	private static final long RECONNECT_BASE_MS = 1000L;
+	/**
+	 * 重连间隔上限（毫秒）。
+	 *
+	 * <p>旧值 30 秒：网络恢复后最多要干等 30 秒才尝试重连——
+	 * 用户实测「恢复后信号恢复得不够快」。压到 8 秒：加上建连超时 8s，
+	 * 最坏一轮 ~16 秒内必有尝试；持续断网时对上游的请求频率仍可接受
+	 * （失败日志另有 60 秒限频）。
+	 */
+	private static final long RECONNECT_MAX_MS = 8000L;
 	/** 重连失败日志的最小间隔（毫秒）：断网几小时时避免刷满日志。 */
 	private static final long FAILURE_LOG_INTERVAL_MS = 60000L;
 
@@ -63,7 +75,7 @@ public final class StreamAudioSource implements AudioSource {
 	/** 上次打印「重连失败」日志的时刻，防止刷屏。 */
 	private volatile long lastFailureLogAt;
 
-	/** 连接断开后安排下次重连：指数退避 3s、6s、12s、24s、30s、30s…… */
+	/** 连接断开后安排下次重连：指数退避 1s、2s、4s、8s、8s…… */
 	private void scheduleReconnect() {
 		if (this.closed) {
 			return;
