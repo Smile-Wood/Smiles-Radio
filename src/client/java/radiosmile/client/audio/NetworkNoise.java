@@ -57,6 +57,11 @@ public final class NetworkNoise {
 		return this.gain > 0.0005F;
 	}
 
+	/** 当前实际增益（0~1）。供诊断日志读取，混音判定只看 {@link #isAudible()}。 */
+	public float gain() {
+		return this.gain;
+	}
+
 	/**
 	 * 打一次「掉数据」提示。
 	 *

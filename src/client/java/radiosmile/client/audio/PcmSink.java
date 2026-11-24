@@ -177,11 +177,29 @@ public final class PcmSink {
 		 * 改成"相对自己的稳态"后，正常直播流不会报警，
 		 * 只有真正掉下去（丢包 / 上游卡 / 切台后接不上）才报。
 		 *
-		 * <p>更新规则见 {@link PcmSink#isBufferThinning()}：
+		 * <p>更新规则见 {@link PcmSink#isBufferUnhealthy()}：
 		 * 变厚立即跟随、变薄缓慢下移，于是"持续变薄"最终会被接受为新稳态，
 		 * 只留下"突然变薄"这一个报警信号。
+		 *
+		 * <p><b>只跟随平滑后的水位</b>（见 {@link #smoothFrames}）：
+		 * 跟随瞬时峰值会把「整块到达」的最高点当成稳态，
+		 * 之后每个周期的正常回落都会被误判成"正在变薄"。
 		 */
 		int steadyFrames;
+
+		/**
+		 * 平滑后的水位（帧数）：滤掉「整块推送」造成的锯齿后再做变薄判断。
+		 *
+		 * <p>服务端按实时节奏整块推送（约 250ms 一块），缓冲水位是锯齿形的：
+		 * 一块到达时顶到峰值，随后被声卡连续抽走一整块的量。
+		 * 任何拿<b>瞬时</b>深度做的"变薄"判断都会被这个锯齿骗到。
+		 * 平滑时间常数约 1 秒（远长于块节奏），锯齿被抹平，
+		 * 平滑值稳定停在周期均值上——只有数据真的停了它才会往下掉。
+		 *
+		 * <p>{@code smoothInit} 首次置位时直接取当前深度，避免从 0 缓慢爬升。
+		 */
+		float smoothFrames;
+		boolean smoothInit;
 
 		/**
 		 * 本音源<b>累计送给混音的帧数</b>（只增不减，诊断用）。
@@ -861,6 +879,8 @@ public final class PcmSink {
 		this.faultReported = false;
 		this.consecutiveUnderruns = 0;
 		this.weakNoiseHeld = false;
+		this.weakNoiseSinceMs = 0L;
+		this.weakNoiseSuppressed = false;
 		this.healthyBlocks = 0;
 		this.failingNow = false;
 		this.underruns.set(0);
@@ -1466,19 +1486,14 @@ public final class PcmSink {
 			return;
 		}
 
-		// 抖动缓冲是否已经回到健康水平（用来撤销「弱底噪」）。
+		// 抖动缓冲是否回到健康水平（用来撤销「弱底噪」）。
 		//
-		// <b>这里合并了两个判据</b>：
-		//   1) {@link #isJitterBufferThinned()}：已到危险线（目标的两成以下）——兜底；
-		//   2) {@link #isBufferThinning()}：相对<b>自己的稳态</b>正在变薄——新增的"提前预警"。
-		//
-		// 用户要求"缓冲层薄的时候也响底噪（含刚切台、断网恢复）"，
-		// 而这正是 (2) 覆盖的场景：切台/恢复后缓冲还没攒回来，
-		// 相对刚才的稳态明显变薄，于是发出轻微的嘶声提示"信号还不稳"。
-		//
-		// 只用 (1) 是不够的：它的阈值是"目标的两成"，正常播放时基本不会触发，
-		// 导致"缓冲明显变薄但还没到底"这段最该提示的区间完全静音。
-		boolean healthy = !this.isJitterBufferThinned() && !this.isBufferThinning();
+		// 旧写法是两道瞬时判据相与（isJitterBufferThinned + isBufferThinning）。
+		// 两者都拿<b>瞬时</b>深度做比较，被「整块推送」的水位锯齿骗到：
+		// 健康链路上每个周期都有几十毫秒深度低于阈值，于是永远判「不健康」，
+		// 弱底噪被永久粘住——本地回环也复现，与弱网无关（详见 isBufferUnhealthy）。
+		// 现在合并为一道基于<b>平滑水位</b>的判据。
+		boolean healthy = !this.isBufferUnhealthy();
 		if (healthy) {
 			this.healthyBlocks++;
 		} else {
@@ -1503,11 +1518,23 @@ public final class PcmSink {
 
 		// 「弱底噪」有粘性：一旦触发就保持，直到缓冲连续健康一段时间才撤。
 		// 否则卡顿是一阵一阵的，底噪会跟着一开一关，听感是「噗噗」抖动。
+		//
+		// <b>时长封顶</b>：粘住超过 {@link #WEAK_NOISE_MAX_MILLIS} 就强制撤销，
+		// 并禁止在缓冲真正健康过一轮之前再次粘住。这是结构性保险——
+		// 无论上游判据将来怎么误报，这一档都不可能再变成常驻嘶声。
 		if (thinned) {
-			this.weakNoiseHeld = true;
+			if (!this.weakNoiseHeld && !this.weakNoiseSuppressed) {
+				this.weakNoiseHeld = true;
+				this.weakNoiseSinceMs = nowMs;
+			} else if (this.weakNoiseHeld
+					&& nowMs - this.weakNoiseSinceMs > WEAK_NOISE_MAX_MILLIS) {
+				this.weakNoiseHeld = false;
+				this.weakNoiseSuppressed = true;
+			}
 			this.healthyBlocks = 0;
 		} else if (this.healthyBlocks >= HEALTHY_RESTORE_BLOCKS) {
 			this.weakNoiseHeld = false;
+			this.weakNoiseSuppressed = false;
 		}
 
 		boolean failing = starving || this.consecutiveUnderruns >= UNDERRUN_ALERT_BLOCKS;
@@ -1583,8 +1610,17 @@ public final class PcmSink {
 	 *
 	 * <p>有粘性：触发后一直响到缓冲连续健康 {@link #HEALTHY_RESTORE_BLOCKS} 块才撤，
 	 * 避免卡顿一阵一阵时底噪跟着一开一关（听感是「噗噗」抖）。
+	 *
+	 * <p>另有<b>时长封顶</b>（见 {@link #WEAK_NOISE_MAX_MILLIS}）：
+	 * 粘住太久会强制撤销，保证这一档不可能变成常驻嘶声。
 	 */
 	private boolean weakNoiseHeld;
+
+	/** 「弱底噪」开始粘住的时刻；配合 {@link #WEAK_NOISE_MAX_MILLIS} 做时长封顶。 */
+	private long weakNoiseSinceMs;
+
+	/** 封顶撤销后是否禁止再次粘住（缓冲真正连续健康过一轮才解除）。 */
+	private boolean weakNoiseSuppressed;
 
 	/**
 	 * 是否仍有「播放意图」（即玩家还希望听到这个台）。
@@ -1614,160 +1650,107 @@ public final class PcmSink {
 	private static final int HEALTHY_RESTORE_BLOCKS = 25;
 
 	/**
-	 * <b>缓冲层是否正在「变薄」</b>——本轮新增的底噪依据。
+	 * 「弱底噪」的最长持续时长（毫秒）。
 	 *
-	 * <h2>为什么不能再用「相对目标水位」判断</h2>
-	 * HANDOVER 第八节 C 记过 v1 的死因：用「剩余深度 / 目标 bufferMillis」当判据，
-	 * 但<b>直播流的产出与消费是实时 1:1</b>，缓冲会永远停在起播那一刻的水位
-	 * （约 300ms），而目标是 1000ms —— 于是比例恒为 0.3，
-	 * 底噪被永久拉在 40% 强度上，「突然出现且不消失」。
-	 *
-	 * <h2>现在的判据：相对<b>自己的稳态</b>变薄</h2>
-	 * 每个音源记一个「稳态深度」基线（缓慢跟随实际水位，见 {@code steadyFrames}）。
-	 * 判据是<b>当前深度相对稳态明显下降</b>，而不是相对配置目标。
-	 * 这样：
-	 * <ul>
-	 *   <li>直播流稳态 300ms → 基线也是 300ms → 正常时不报警；</li>
-	 *   <li>忽然掉到 120ms（上游卡、丢包、切台后没接上）→ 相对基线掉 60% → 报警；</li>
-	 *   <li>本地文件稳态接近目标 → 同样只在真的被吃薄时才报警。</li>
-	 * </ul>
-	 * 「相对于自己」正是"网络在变差"的定义，与绝对水位无关。
-	 *
-	 * <p>多音源时取最薄的那一路：只要有一台快断了，链路整体就不健康。
+	 * <p>结构性保险：提示音的职责是「告诉你信号不稳」，不是「替你忍受断网」。
+	 * 连续响满 8 秒还不见好就闭嘴——真断了还有大底噪（欠载档）与自动重连兜底。
+	 * 它保证这一档<b>无论上游判据将来怎么误报，都不可能再变成常驻嘶声</b>
+	 * （水位判据已三次被误报坑出「突然出现且不消失」的底噪）。
 	 */
-	private boolean isBufferThinning() {
-		int target = this.jitterTargetFrames();
-		if (target <= 0) {
-			return false;
-		}
-		int thinnestRatio = Integer.MAX_VALUE;
+	private static final long WEAK_NOISE_MAX_MILLIS = 8000L;
+
+	/**
+	 * <b>缓冲层是否「不健康」</b>——弱底噪的判据（原 isBufferThinning 与
+	 * isJitterBufferThinned 两道瞬时判据合并到这里）。
+	 *
+	 * <h2>为什么必须先平滑水位（本轮修「常驻底噪」的根因）</h2>
+	 * 服务端按实时节奏<b>整块</b>推送（约 250ms 一块），客户端缓冲水位是锯齿形的：
+	 * 一块到达时顶到起播水位（约 300~550ms），随后被声卡连续抽走一整块的量，
+	 * 落到 50~300ms 再被下一块顶回去。也就是说<b>健康链路的瞬时水位，
+	 * 每个周期都会掉到近期峰值的 55% 以下</b>。
+	 *
+	 * <p>旧判据拿瞬时深度跟「峰值棘轮基线」比（掉到 55% 报警）、
+	 * 或跟「目标的两成」比（起播水位 300ms 时两成只有 200ms，谷值经常更低），
+	 * 等于<b>每个推送周期都判一次「正在变薄」</b>。于是 {@code healthyBlocks}
+	 * 永远攒不满 25，「弱底噪」（40% 强度）被永久粘住——常驻嘶声。
+	 * 这与网络质量<b>无关</b>：本地回环、单机也必然复现，
+	 * 正是用户反馈的「常驻底噪，但我在本地回环服务器上」。
+	 *
+	 * <h2>现在的判据</h2>
+	 * 先对水位做时间常数约 1 秒的一阶低通（远长于约 250ms 的块节奏），
+	 * 锯齿被抹平，平滑值稳定停在周期均值（约 175~425ms）上：
+	 * <ol>
+	 *   <li><b>相对变薄</b>：平滑值低于稳态基线（同样基于平滑值棘轮）的
+	 *       {@link #BUFFER_THIN_PERMILLE}——真实断供约 0.6 秒内即可检出；</li>
+	 *   <li><b>绝对见底</b>：平滑值低于 {@link #ABSOLUTE_THIN_FRAMES}
+	 *       ——平均缓冲真的只剩「一块不到」。</li>
+	 * </ol>
+	 * 正常播放时两道都判「健康」；只有数据真的停了，平滑值才会跌破阈值。
+	 *
+	 * <p>没有音源时沿用旧语义：玩家还想听 = 不健康（音源被移除是明确异常）。
+	 * 有音源但都还在攒起播缓冲时不报警——真断供会走「无数据」档
+	 * （starved / consecutiveUnderruns），那里有更响的提示。
+	 */
+	private boolean isBufferUnhealthy() {
 		boolean any = false;
+		boolean primed = false;
+		boolean thin = false;
 		synchronized (this.lock) {
 			for (SourceBuffer buffer : this.sources.values()) {
+				any = true;
 				if (!buffer.primed) {
 					continue;
 				}
-				any = true;
+				primed = true;
 				int depth = buffer.length / OUT_CHANNELS;
-				// 稳态基线：只做"缓慢上升 + 缓慢下降"，避免被瞬时抖动带走
-				if (depth > buffer.steadyFrames) {
-					// 变厚：立即跟随（水位抬升是事实，不该延迟）
-					buffer.steadyFrames = depth;
+				if (!buffer.smoothInit) {
+					// 首次观察直接取当前深度，不从 0 爬升
+					buffer.smoothFrames = depth;
+					buffer.smoothInit = true;
+				}
+				buffer.smoothFrames += (depth - buffer.smoothFrames) * DEPTH_SMOOTH_ALPHA;
+				// 稳态基线只跟随<b>平滑值</b>：变厚立即跟随、变薄缓慢下移（1/1024，
+				// 半衰期约 14 秒）。跟随瞬时峰值会把整块到达的最高点当成稳态，
+				// 之后每个周期的正常回落都会被误判成"正在变薄"——旧实现的死因。
+				if (buffer.smoothFrames > buffer.steadyFrames) {
+					buffer.steadyFrames = Math.round(buffer.smoothFrames);
 				} else {
-					// 变薄：缓慢下移。
-					//
-					// <b>衰减必须比"真实下降"慢得多</b>，否则基线会把下降"吸收"掉、
-					// 永远不报警（实测：1/256 的半衰期 3.5 秒，比一次真实掉水还快）。
-					// 取 1/1024（半衰期约 14 秒）：真实丢包/卡顿造成的下降是秒级的，
-					// 基线十几秒才跟到，因此能被稳定检出；而切台/重连这种
-					// "永久换了一个水位"的情形，十几秒后也会被接受为新稳态，不会永久响。
 					buffer.steadyFrames -= Math.max(1, buffer.steadyFrames / 1024);
 				}
-				if (buffer.steadyFrames < BUFFER_STEADY_MIN_FRAMES) {
-					// 基线还没建立（刚起播、缓冲太浅）：不判断，交给起播专档
-					continue;
-				}
-				// 千分比，避免浮点运算（混音线程每 20ms 调用一次）
-				thinnestRatio = Math.min(thinnestRatio,
-						(int) ((long) depth * 1000L / Math.max(1, buffer.steadyFrames)));
+				thin |= buffer.smoothFrames * 1000F < buffer.steadyFrames * BUFFER_THIN_PERMILLE
+						|| buffer.smoothFrames < ABSOLUTE_THIN_FRAMES;
 			}
 		}
-		if (!any || thinnestRatio == Integer.MAX_VALUE) {
-			// 没有已预热的音源：这属于「起播/断流」，由别的档位处理
-			return false;
+		if (!any) {
+			// 没有音源 = 拿不到数据 = 不健康（玩家还想听时）。
+			// 空选/关机时 playbackWanted 为 false，安静是正确行为。
+			return this.playbackWanted;
 		}
-		// <b>两道判据取"或"</b>：
-		//   1) 相对自己的稳态明显变薄（突然掉水，最典型的"网络在变差"）；
-		//   2) 绝对深度已经低于起播门槛（一层薄薄的缓冲，随时会断）。
-		//
-		// 只保留 (1) 会漏掉"水位本来就一路很低"的情况——那种缓冲确实薄、
-		// 听感随时会断，正是用户要求提示的场景。
-		// 只保留 (2) 又会重蹈 HANDOVER 第八节 C 的 v1：直播流稳态 300ms
-		// 恰好贴着起播门槛，于是永久报警。
-		// 两者取或，并用 (1) 的"稳态基线"作为主要信号，(2) 只在
-		// <b>明显低于</b>门槛（70%）时才生效——留出足够余量，
-		// 避免直播流正常抖动（±25%）时底噪一直在响。
-		boolean relativelyThin = thinnestRatio < BUFFER_THIN_PERMILLE;
-		boolean absolutelyThin = thinnestRatio != Integer.MAX_VALUE
-				&& this.thinnestLiveFrames() < this.startupTargetFrames() * 7L / 10L;
-		return relativelyThin || absolutelyThin;
+		return primed && thin;
 	}
 
-	/** 当前各已预热音源里最薄的深度（帧）；无音源返回 {@link Integer#MAX_VALUE}。 */
-	private int thinnestLiveFrames() {
-		int thinnest = Integer.MAX_VALUE;
-		synchronized (this.lock) {
-			for (SourceBuffer buffer : this.sources.values()) {
-				if (!buffer.primed) {
-					continue;
-				}
-				thinnest = Math.min(thinnest, buffer.length / OUT_CHANNELS);
-			}
-		}
-		return thinnest;
-	}
+	/**
+	 * 水位平滑系数（每写块 ≈ 20ms 步进）。
+	 *
+	 * <p>取 0.02 → 时间常数约 1 秒：远长于约 250ms 的整块推送节奏，锯齿被抹平；
+	 * 又远短于基线 1/1024 的下移速度，真实断供约一秒内就能被检出。
+	 */
+	private static final float DEPTH_SMOOTH_ALPHA = 0.02F;
+
+	/**
+	 * 「绝对见底」线（帧，125ms）：平滑水位低于它说明平均缓冲只剩不到一块的量，
+	 * 丢一个包就断。正常播放的周期均值最低也有约 175ms，不会误触。
+	 */
+	private static final int ABSOLUTE_THIN_FRAMES = OUT_RATE / 8;
 
 	/**
 	 * 判定「相对稳态变薄」的阈值（千分比）。
 	 *
-	 * <p>取 <b>550‰</b>（即掉到稳态的 55% 以下）：正常网络抖动很少超过 30%，
-	 * 而真正的吃紧（丢包、上游卡顿、切台后接不上）通常直接掉到一半以下。
-	 * 太高会误报（底噪一直在响），太低则失去"提前预警"的意义。
+	 * <p>取 <b>550‰</b>（即平滑水位掉到稳态的 55% 以下）：真实丢包/卡顿
+	 * 通常直接掉到一半以下，而平滑后的正常水位与均值几乎重合（≈1000‰），
+	 * 不会误报。
 	 */
 	private static final int BUFFER_THIN_PERMILLE = 550;
-
-	/**
-	 * 允许建立「稳态基线」的最小帧数（约 100ms）。
-	 *
-	 * <p>低于这个深度时基线没有统计意义（刚起播、缓冲才几十毫秒），
-	 * 必须排除，否则"起播瞬间"会被当成"缓冲变薄"报警。
-	 */
-	private static final int BUFFER_STEADY_MIN_FRAMES = OUT_RATE / 10;
-
-	/**
-	 * 抖动缓冲是否「被吃薄」（相对配置目标的剩余比例过低）。
-	 *
-	 * <p><b>注意</b>：这个判据只用于"已经很危险"的兜底（目标的两成以下）。
-	 * "缓冲在变薄"这种<b>趋势</b>判断请用 {@link #isBufferThinning()}
-	 * ——后者不会因为直播流稳态偏低而永久误报。
-	 */
-	private boolean isJitterBufferThinned() {
-		int target = this.jitterTargetFrames();
-		if (target <= 0) {
-			return false;
-		}
-		int thinnest = Integer.MAX_VALUE;
-		boolean any = false;
-		synchronized (this.lock) {
-			for (SourceBuffer buffer : this.sources.values()) {
-				any = true;
-				thinnest = Math.min(thinnest, buffer.length / OUT_CHANNELS);
-			}
-		}
-		// <b>没有音源时不能算「健康」</b>。
-		//
-		// 早期这里返回 false（= 不薄 = 健康），本意是「空窗不算卡顿」。
-		// 但那会让「音源被移除」这种明确异常被当成正常：
-		// 卡顿触发重订阅 -> stop() 清空 sources -> 连续 25 块判「健康」
-		// -> 底噪被撤销。实测现象就是「底噪莫名其妙没了」。
-		//
-		// 现在：没有音源 = 拿不到数据 = 不健康，底噪应该继续响。
-		// 真正的「健康」只能是「有音源且缓冲充足」。
-		if (!any || thinnest == Integer.MAX_VALUE) {
-			// 没有音源：只有在「玩家还想听」的时候才算异常。
-			// 空选/关机时 playbackWanted 为 false，此时安静是正确行为。
-			return this.playbackWanted;
-		}
-		return thinnest < target * THIN_RATIO;
-	}
-
-	/**
-	 * 判定为「缓冲见薄」的阈值比例（相对稳态目标）。
-	 *
-	 * <p>取 20%：稳态下缓冲在目标附近摆动，正常远高于此；
-	 * 掉到目标的两成以下意味着已经在断供边缘。
-	 */
-	private static final float THIN_RATIO = 0.2F;
 
 	/** 弱底噪强度（相对卡住时的满强度）。够听出「信号不稳」又不盖过节目。 */
 	private static final float STUTTER_LEVEL = 0.4F;
@@ -1995,8 +1978,8 @@ public final class PcmSink {
 	 *   <li>{@code starved = true} → {@code consecutiveUnderruns} 每块 +1；</li>
 	 *   <li>8 块（约 160ms）后 {@code failing = true} → 底噪<b>直接拉到满强度</b>；</li>
 	 *   <li>此时 {@code streamFlowing} 早就是 true，预热门根本拦不住；</li>
-	 *   <li>抖动缓冲被 flush 归零，{@code isBufferThinning()} 与
-	 *       {@code isJitterBufferThinned()} 同时成立 → {@code weakNoiseHeld} 也粘住，
+	 *   <li>抖动缓冲被 flush 归零，{@code isBufferUnhealthy()} 判「不健康」
+	 *       → {@code weakNoiseHeld} 也粘住，
 	 *       节目接上后还要再沙 {@link #HEALTHY_RESTORE_BLOCKS} 块（约 500ms）才退。</li>
 	 * </ul>
 	 * 听感正是「一换歌就沙一阵」——这不是弱网，是<b>我们自己制造的</b>空窗。
