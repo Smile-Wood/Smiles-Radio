@@ -850,6 +850,8 @@ public final class PcmSink {
 		this.vanillaBlocksVolume = 1.0F;
 		this.blockVolume = 1.0F;
 		this.blockVolumes.clear();
+		// 推流增益是随订阅下发的：换世界 / 重连后必须丢掉，否则会拿旧值播新流
+		this.streamGains.clear();
 		// 两个效果音都要复位，否则下次进入世界会莫名响一下
 		this.tuningNoise.reset();
 		this.networkNoise.reset();
@@ -1195,7 +1197,47 @@ public final class PcmSink {
 		return this.volumeFor(blockPos)
 				* this.vanillaBlocksVolume
 				* this.vanillaMasterVolume
-				* distGain;
+				* distGain
+				* this.streamGainFor(blockPos);
+	}
+
+	/**
+	 * 每个音源的<b>推流增益</b>（0.00~1.00），由服务端随音频块下发。
+	 *
+	 * <h2>为什么需要它</h2>
+	 * 本地曲目是"给游戏内直接播放"处理过的成品，母带电平高（实测平均
+	 * -9.1 ~ -15.3 dBFS、峰值顶到 0 dBFS）；网络电台是原样透传的上游流，
+	 * 电平低一档。不压本地，本地那一路就会盖过网络电台，而且已经满刻度，
+	 * 一叠上底噪层就削波。
+	 *
+	 * <h2>为什么放在这里，而不是烤进缓存</h2>
+	 * 它是<b>运行时参数</b>：服务端每包按当前配置给一次，
+	 * 玩家改完 {@code outputGain} 下一个包就生效，不用重新预热。
+	 * 而方块音量 / 原版音量是<b>本地参数</b>，必须继续在本机乘——
+	 * 这条乘法链就是"所有影响响度的量都在同一处"的约定（见 {@link #sourceGain}）。
+	 */
+	private final Map<Long, Float> streamGains = new ConcurrentHashMap<>();
+
+	/** 由网络线程写入：某个音源当前的推流增益。 */
+	public void setStreamGain(long blockPos, float gain) {
+		float clamped = Math.max(0.0F, Math.min(1.0F, gain));
+		Float old = this.streamGains.get(blockPos);
+		// 每块音频都会调一次：值没变就不要反复覆盖，省掉无谓的 map 写
+		if (old != null && Math.abs(old - clamped) < 0.0005F) {
+			return;
+		}
+		if (clamped >= 0.9995F) {
+			// 满增益是绝大多数网络电台的情况，不必留表项
+			this.streamGains.remove(blockPos);
+			return;
+		}
+		this.streamGains.put(blockPos, clamped);
+	}
+
+	/** 取某个音源的推流增益；没下发过按 1.0（不衰减）。 */
+	private float streamGainFor(long blockPos) {
+		Float own = this.streamGains.get(blockPos);
+		return own != null ? own : 1.0F;
 	}
 
 	/**

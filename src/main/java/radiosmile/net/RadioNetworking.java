@@ -84,6 +84,15 @@ public final class RadioNetworking {
 	 */
 	public static final ResourceLocation S2C_AUDIO_SILENCE = SmileSRadio.id("s2c_audio_silence");
 
+	/**
+	 * 服务端 -> 客户端：本地曲目的推流增益（0.00~1.00）。
+	 *
+	 * <p>载荷只有 {@code BlockPos + float}：客户端把它乘进该音源的混音增益。
+	 * 独立成通道而不是塞进音频块，是为了让不认识它的旧客户端直接跳过
+	 * （{@code canSend} 为 false），而不是把字段读错导致整条字节流错位。
+	 */
+	public static final ResourceLocation S2C_OUTPUT_GAIN = SmileSRadio.id("s2c_output_gain");
+
 	private RadioNetworking() {
 	}
 

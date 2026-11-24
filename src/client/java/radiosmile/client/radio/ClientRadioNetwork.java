@@ -100,8 +100,24 @@ public final class ClientRadioNetwork {
 							radiosmile.radio.AudioFormat.byId(formatId), data);
 				});
 
-		// 「空音量包」：服务端声明「接下来这段是换曲预载/重载，请输出数字静音」。
+		// 「本地推流增益」：把该音源的混音电平乘上一个系数。
 		//
+		// 本地曲目是"给游戏内直接播放"处理过的成品，母带电平高；网络电台是
+		// 原样透传的上游流，电平低一档。服务端按 stations.json 的 outputGain
+		// 只压本地，两边响度才对得齐，也给混音留出余量（满刻度叠加底噪会削波）。
+		//
+		// <b>由服务端主动下发、值变才发</b>，所以改配置不需要重新预热缓存。
+		// 这条通道是新开的：旧客户端没注册它，服务端 canSend 为 false 会直接跳过，
+		// 不会污染音频字节流。
+		// 不 hop 主线程：只写一个并发 map，值必须在本块混音前就位。
+		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_OUTPUT_GAIN,
+				(Minecraft client, ClientPacketListener handler, FriendlyByteBuf buf, PacketSender sender) -> {
+					net.minecraft.core.BlockPos pos = buf.readBlockPos();
+					float gain = buf.readFloat();
+					radiosmile.client.audio.PcmSink.INSTANCE.setStreamGain(pos.asLong(), gain);
+				});
+
+		// 「空音量包」：服务端声明「接下来这段是换曲预载/重载，请输出数字静音」。		//
 		// <b>它不带任何音频字节</b>，绝不能被喂给解码器；作用只有一个——
 		// 把混音器的过渡静音窗往后铺，让它在预载期间不把「没有任何音源供数」
 		// 当成弱网去响底噪（见 PcmSink#beginTransitionSilence）。

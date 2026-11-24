@@ -57,6 +57,7 @@ an error when the signal dies.
 ```json
 {
   "ffmpeg": "",
+  "outputGain": 0.25,
   "stations": [
     {
       "id": "tiehen",
@@ -91,6 +92,7 @@ an error when the signal dies.
 | Field | Description |
 |---|---|
 | `ffmpeg` | Path to the ffmpeg executable. **Leave empty to use ffmpeg from `PATH`**; only set it when ffmpeg is not on `PATH` or you need a specific build (e.g. `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` or `/usr/local/bin/ffmpeg`) |
+| `outputGain` | Output gain for **local** tracks, `0.00`-`1.00` (default `0.25`). Local files are usually mastered loud for in-game playback while internet radio arrives one notch lower, so scaling local down lines them up and leaves headroom against clipping. Internet radio bytes are passed through untouched. Takes effect on the next config reload, no re-bake needed |
 
 #### Station fields
 

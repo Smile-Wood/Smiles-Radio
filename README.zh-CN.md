@@ -56,6 +56,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
 ```json
 {
   "ffmpeg": "",
+  "outputGain": 0.25,
   "stations": [
     {
       "id": "tiehen",
@@ -90,6 +91,7 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
 | 字段 | 说明 |
 |---|---|
 | `ffmpeg` | ffmpeg 可执行文件路径。**留空 = 用 PATH 里的 ffmpeg**；仅当 ffmpeg 不在 PATH 或需指定特定版本时填写（如 `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` 或 `/usr/local/bin/ffmpeg`） |
+| `outputGain` | **本地**曲目的推流增益，`0.00`-`1.00`（默认 `0.25`）。本地素材通常按游戏内播放打得较响，而网络电台电平低一档，压一下本地两边才对得齐，也给削波留出余量。网络电台是原样透传的，不受影响。改完下一次重载配置即生效，无需重新预热 |
 
 #### 频道字段
 

@@ -411,6 +411,27 @@ public final class AudioSubscription {
 		return switched;
 	}
 
+	/** 上一次下发给客户端的推流增益（-1 = 还一包都没发过）。 */
+	private float lastSentGain = -1.0F;
+
+	/**
+	 * 记录推流增益，并回答「要不要补发一包」。
+	 *
+	 * <p>增益是运行时参数（{@code stations.json} 的 {@code outputGain}），
+	 * 改完不需要重烤缓存：这里发现值变了就补发，客户端下一块音频就按新值混音。
+	 * 没变时只是一次浮点比较，放在每块之前调用也不会成为负担。
+	 *
+	 * @param gain 本块应使用的增益（0.00~1.00）
+	 * @return 是否需要下发
+	 */
+	public synchronized boolean noteSentGain(float gain) {
+		if (this.lastSentGain >= 0.0F && Math.abs(this.lastSentGain - gain) < 0.0005F) {
+			return false;
+		}
+		this.lastSentGain = gain;
+		return true;
+	}
+
 
 	/**
 	 * 记一次发送并安排下一次。

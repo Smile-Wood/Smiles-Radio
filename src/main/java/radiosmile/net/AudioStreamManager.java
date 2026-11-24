@@ -615,6 +615,12 @@ public final class AudioStreamManager {
 					writeSilence(target, stationId, targetPos, trackIndex,
 							TRACK_SWITCH_SILENCE_MILLIS);
 				}
+				// 推流增益变了就补一包：同一块里先发增益、再发音频，
+				// 客户端拿到的电平顺序才和波形一致。没变时只是一个浮点比较。
+				float gain = outputGainFor(sub);
+				if (sub.noteSentGain(gain)) {
+					writeOutputGain(target, targetPos, gain);
+				}
 				FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
 				buf.writeBlockPos(targetPos);
 				buf.writeUtf(stationId);
@@ -717,6 +723,51 @@ public final class AudioStreamManager {
 	 * 客户端另有 {@code PcmSink.TRANSITION_SILENCE_MAX_MILLIS} = 3s 的总上限兜底。
 	 */
 	private static final int COMMAND_SWITCH_SILENCE_MILLIS = 1200;
+
+	/**
+	 * 这个订阅当前的推流增益（0.00~1.00）。
+	 *
+	 * <h2>为什么只有本地曲目要压</h2>
+	 * 本地素材是"给游戏内直接播放"处理过的成品，母带电平高、峰值常顶到 0 dBFS；
+	 * 网络电台的字节是<b>原样透传</b>的（上游怎么发就怎么播），电平本来就低一档。
+	 * 压本地正好让两者对齐，也不能去动网络电台——那等于篡改别人的流。
+	 *
+	 * <h2>为什么每包重新取</h2>
+	 * 取的是 {@link RadioStationRegistry#outputGain()} 这个 volatile 字段，
+	 * 所以改配置之后下一个包就生效，<b>不需要重新预热缓存</b>。
+	 * 这正是它不放在烤制阶段的原因：增益是运行时参数，缓存是内容。
+	 */
+	private static float outputGainFor(AudioSubscription sub) {
+		if (sub == null || sub.station() == null || sub.station().isStreaming()) {
+			return 1.0F;
+		}
+		return RadioStationRegistry.outputGain();
+	}
+
+	/**
+	 * 单独下发「本地推流增益」（0.00~1.00）。
+	 *
+	 * <h2>为什么单开通道，而不是塞进音频块</h2>
+	 * 音频块的字段布局是和旧客户端共用的：往里加一个 float，旧客户端会把它
+	 * 当成数据长度读，<b>整条字节流错位</b>，声音直接变噪音。
+	 * 单开通道时旧客户端根本没注册这个接收器，{@code canSend} 返回 false，
+	 * 这里静默跳过——它只是听不到衰减，播放本身不会坏。
+	 *
+	 * <p>也正因为独立成包，改配置后不需要重新预热缓存：
+	 * 下一块音频前发现值变了就补发一包，客户端立刻按新增益混音。
+	 */
+	private static void writeOutputGain(ServerPlayer target, BlockPos pos, float gain) {
+		if (target == null || target.hasDisconnected()) {
+			return;
+		}
+		if (!ServerPlayNetworking.canSend(target, RadioNetworking.S2C_OUTPUT_GAIN)) {
+			return;
+		}
+		FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
+		buf.writeBlockPos(pos);
+		buf.writeFloat(gain);
+		ServerPlayNetworking.send(target, RadioNetworking.S2C_OUTPUT_GAIN, buf);
+	}
 
 	/**
 	 * 发送一个<b>空音量包</b>（无音频字节，只是一句「这段请按数字静音处理」）。
