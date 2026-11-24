@@ -1987,11 +1987,14 @@ public final class PcmSink {
 	 * 根本没法区分，而现在一饿就按满强度响，等于把前者也当成后者。
 	 * 真实故障是持续几秒的，600ms 的宽限不会漏报，却能让切曲空窗保持干净。
 	 *
-	 * <p>取值 600ms：比实测空窗（约 300~900ms）略短，保证
-	 * 「真空窗跨完还不恢复」时仍会响；又明显长于单块抖动（20ms）与
-	 * 欠载计数阈值（{@link #UNDERRUN_ALERT_BLOCKS} 约 160ms）。
+	 * <p>取值 300ms（用户实测反馈「断网的噪声起的也太晚了」，从 600 下调）：
+	 * 仍然明显长于单块抖动（20ms）与欠载计数阈值
+	 * （{@link #UNDERRUN_ALERT_BLOCKS} 约 160ms），起播/换曲的正常空窗
+	 * 现在都已有<b>显式的过渡静音窗</b>（{@link #beginTransitionSilence}）挡在前头，
+	 * 走不到这里；能落到宽限里的只剩「没被声明的真饥饿」，
+	 * 它没有理由再让玩家对着死寂等 600ms。
 	 */
-	public static final int STARVE_GRACE_MILLIS = 600;
+	public static final int STARVE_GRACE_MILLIS = 300;
 
 	/**
 	 * 本次「连续无数据」的起始时刻（0 表示当前并不处于连续无数据状态）。
