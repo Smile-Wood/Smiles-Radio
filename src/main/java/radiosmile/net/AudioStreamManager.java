@@ -702,6 +702,23 @@ public final class AudioStreamManager {
 	private static final int PRELOAD_SILENCE_MILLIS = 400;
 
 	/**
+	 * 命令切歌（{@code /radio play}、{@code /radio reload <频道>}、配置重载）
+	 * 拆订阅时声明的过渡静音窗长度（毫秒）。
+	 *
+	 * <h2>为什么命令路径比自动换曲要多留一点</h2>
+	 * 自动换曲只是 {@code PlaylistAudioSource.advance()} 在后台打开下一首，
+	 * 订阅对象还在、网络通道不断；而命令路径是<b>整个订阅被拆掉重建</b>：
+	 * 关音源 → 重新 {@code subscribe()} → 重新 seek 到新位置 → 客户端重建解码器
+	 * → 重新攒抖动缓冲。这几步加起来明显更长。
+	 *
+	 * <p>用户实测的正是这一段：14:15:20 一次 {@code radio reload}，
+	 * 客户端 4~16kHz 噪声底在 10.95s 于 50ms 内跳 12 dB，之后 850ms
+	 * 死平在 -8.5 dB 直到新流接上。取 1200ms（850ms 实测 + 余量），
+	 * 客户端另有 {@code PcmSink.TRANSITION_SILENCE_MAX_MILLIS} = 3s 的总上限兜底。
+	 */
+	private static final int COMMAND_SWITCH_SILENCE_MILLIS = 1200;
+
+	/**
 	 * 发送一个<b>空音量包</b>（无音频字节，只是一句「这段请按数字静音处理」）。
 	 *
 	 * <p>用于换曲预载期：读线程卡在打开下一首里，队列排空，
@@ -746,6 +763,10 @@ public final class AudioStreamManager {
 	 */
 	private static void writeSilence(ServerPlayer target, String stationId, BlockPos pos,
 			int trackIndex, int millis) {
+		// 重建路径可能在玩家已下线后才走到这里（快照里留着 null / 离线玩家）
+		if (target == null || target.hasDisconnected()) {
+			return;
+		}
 		if (!ServerPlayNetworking.canSend(target, RadioNetworking.S2C_AUDIO_SILENCE)) {
 			return;
 		}
@@ -823,6 +844,12 @@ public final class AudioStreamManager {
 					ServerPlayNetworking.send(snap.player(), RadioNetworking.S2C_RELOADED,
 							new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer()));
 				}
+				// 与自动换曲同样先声明一段「空音量」：命令切歌的空隙比自动换曲更长
+				// （整条订阅被拆掉重建），不声明的话客户端只看到「没数据」，
+				// 会按弱网故障响底噪——这正是用户听到的那 850ms 嘶声。
+				// 这里已经在服务端主线程，直接 writeSilence，不必再 execute 一次。
+				writeSilence(snap.player(), snap.stationId(), snap.pos(), sub.trackIndex(),
+						COMMAND_SWITCH_SILENCE_MILLIS);
 				sub.deactivate();
 				sub.closeSource();
 			}
@@ -870,6 +897,10 @@ public final class AudioStreamManager {
 
 		// 2. 全部关闭并清空
 		for (AudioSubscription sub : SUBSCRIPTIONS.values()) {
+			// 与 rebuildStation 同理：整批订阅要拆掉重建，先给每个客户端声明过渡静音，
+			// 否则重载期间所有人都会听到「没数据 = 弱网」的底噪。
+			writeSilence(sub.player(), sub.station().id(), sub.pos(), sub.trackIndex(),
+					COMMAND_SWITCH_SILENCE_MILLIS);
 			sub.deactivate();
 			sub.closeSource();
 		}
