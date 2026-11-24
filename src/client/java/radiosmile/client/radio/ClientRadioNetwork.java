@@ -192,17 +192,50 @@ public final class ClientRadioNetwork {
 							// 方块记着一个不存在的频道时，玩家听到的应该是底噪，
 							// 而不是死寂——死寂分不清"设备坏了"和"台没了"。
 							// stopForFailure 保留播放意图，底噪因此有依据持续响。
-							if (status == radiosmile.net.AudioStatus.TOO_FAR) {
-								radiosmile.client.audio.ClientAudioPlayer.stop(pos);
-							} else {
-								// stopForFailure 内部已经处理了"保留播放意图 + 注册噪音归属方块"，
-								// 这里不要再重复调一遍 PcmSink（会绕开 REQUESTED 判据）。
-								radiosmile.client.audio.ClientAudioPlayer.stopForFailure(pos);
+						if (status == radiosmile.net.AudioStatus.TOO_FAR) {
+							radiosmile.client.audio.ClientAudioPlayer.stop(pos);
+						} else if (status == radiosmile.net.AudioStatus.TIMEOUT) {
+							// <b>TIMEOUT 走「轻量故障路径」，不拆流、不重订阅。</b>
+							//
+							// 服务端在上游断流时主动宣告 TIMEOUT（见 AudioStreamManager#pump）。
+							// 此时服务器仍然认为客户端在播放、订阅原样保留，
+							// 上游的重连由服务端 StreamAudioSource 的自动退避重连负责；
+							// 客户端这边只需要点亮故障表现（灯 + NOSIGNAL + 底噪），
+							// 等 Stream 的流对象被真实音频块唤醒（handleChunk）后自动灭灯。
+							//
+							// 若这里也走 stopForFailure（拆流），AutoSubscriber 会在 6 秒后
+							// 重订阅 → 服务端拆掉旧订阅重建新源 → 打断正在退避重连的旧源，
+							// 形成「每 6 秒重来一次」的双重抖动。
+							if (radiosmile.client.audio.ClientAudioPlayer.wantsStream(pos)) {
+								radiosmile.client.audio.PcmSink.INSTANCE.setPlaybackWanted(true);
+								radiosmile.client.audio.PcmSink.INSTANCE.markFaultReported();
+								radiosmile.client.audio.PcmSink.INSTANCE.setNetworkNoiseSource(pos);
 							}
+						} else {
+							// stopForFailure 内部已经处理了"保留播放意图 + 注册噪音归属方块"，
+							// 这里不要再重复调一遍 PcmSink（会绕开 REQUESTED 判据）。
+							radiosmile.client.audio.ClientAudioPlayer.stopForFailure(pos);
+						}
 						} else {
 							// OK：链路恢复。让混音器按自己的落音速率淡出底噪，
 							// 不要硬切（硬切听感是"沙"地一下断掉）。
 							radiosmile.client.audio.PcmSink.INSTANCE.onLinkRecovered();
+							// <b>网络电台：客户端自己从上游拉流</b>（架构约定：
+							// 服务端只维护订阅状态机，音频不经服务端）。
+							// 订阅 OK = 服务端认可播放，这里起拉流线程直连上游；
+							// 本地电台则确保没有残留的拉流任务。
+							if (client.level != null
+									&& client.level.getBlockEntity(pos)
+											instanceof radiosmile.block.entity.RadioBlockEntity be) {
+								radiosmile.radio.RadioStation station =
+										radiosmile.client.radio.ClientRadioData.findStation(be.getStation());
+								if (station != null && station.isStreaming()) {
+									radiosmile.client.audio.ClientAudioPlayer.startStreamFeed(
+											pos, station.id(), station.file());
+								} else {
+									radiosmile.client.audio.ClientAudioPlayer.stopStreamFeed(pos);
+								}
+							}
 						}
 					});
 				});

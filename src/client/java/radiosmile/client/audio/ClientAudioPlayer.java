@@ -396,6 +396,12 @@ public final class ClientAudioPlayer {
 		// 后者不能也交给混音器：它只管听感，完全不知道有块屏幕。
 		// 而「数据重新到达」正是故障结束最直接的证据（本地 TIMEOUT 的判据就是"多久没数据"）。
 		clearClientFaultOnResume(pos);
+		// <b>故障噪音的"结束"跳变</b>：断流期间 TIMEOUT 轻量路径注册过的方块，
+		// 收到第一块真实数据 = 服务端重连成功、链路恢复——
+		// 此时让混音器按落音速率淡出底噪（不是硬切），并撤销故障态。
+		// 只在跳变处调一次：恢复初期缓冲还没攒厚，弱底噪档要继续响，
+		// 每块都清会把它杀掉（听感变成断流一恢复就立刻完全无声）。
+		clearFaultNoiseOnResume(pos);
 		if (!stream.feed(format, data)) {
 			// 数据不可解码。这里刻意<b>不调用 stop(pos)</b>，而是保留这个（已标记 rejected 的）流。
 			//
@@ -605,6 +611,8 @@ public final class ClientAudioPlayer {
 	 *                   那一层又被合并回同一个函数（HANDOVER 第八节 D 没做完的下半截）。
 	 */
 	private static void stopInternal(BlockPos pos, boolean forFailure) {
+		// 网络电台拉流任务一并停掉（客户端直连上游：流的生命周期跟播放实例走）。
+		stopStreamFeed(pos);
 		Stream stream = STREAMS.remove(pos.asLong());
 		if (stream != null) {
 			stream.close();
@@ -744,6 +752,11 @@ public final class ClientAudioPlayer {
 	 * 若反过来，解码线程可能在声卡被关后又写入一帧。
 	 */
 	public static void stopAll() {
+		// 网络电台拉流任务全部停止（客户端直连上游，退出世界时关掉所有连接）
+		for (StreamFeed feed : FEEDS.values()) {
+			feed.stop();
+		}
+		FEEDS.clear();
 		for (Stream stream : STREAMS.values()) {
 			try {
 				stream.close();
@@ -830,6 +843,190 @@ public final class ClientAudioPlayer {
 	 */
 	private static final java.util.concurrent.atomic.AtomicLong FAULT_GENERATION =
 			new java.util.concurrent.atomic.AtomicLong();
+
+	/**
+	 * 处于「断流故障噪音」状态的方块集合。
+	 *
+	 * <p>由 TIMEOUT 轻量故障路径（{@code ClientRadioNetwork}）通过
+	 * {@link #noteFaultNoise} 登记；服务端重连成功、真实音频块重新到达时，
+	 * {@link #clearFaultNoiseOnResume} 检出跳变并让底噪淡出。
+	 * 只登记、不阻止任何其它行为——它唯一的作用是标记"噪音该收尾了"这一次跳变。
+	 */
+	private static final java.util.Set<Long> FAULT_NOISE =
+			java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	/** 登记：该方块正处在断流故障噪音状态（见 {@link #FAULT_NOISE}）。 */
+	public static void noteFaultNoise(BlockPos pos) {
+		if (pos != null) {
+			FAULT_NOISE.add(pos.asLong());
+		}
+	}
+
+	/** 收到真实数据：若该方块曾处于故障噪音状态，让底噪按落音速率淡出（跳变只触发一次）。 */
+	private static void clearFaultNoiseOnResume(BlockPos pos) {
+		if (FAULT_NOISE.remove(pos.asLong())) {
+			PcmSink.INSTANCE.onLinkRecovered();
+		}
+	}
+
+	// ------------------------------------------------- 客户端直连网络电台拉流
+
+	/**
+	 * 网络电台拉流任务表（每方块一个）。
+	 *
+	 * <p><b>架构约定（用户明确）</b>：网络电台的音频流由<b>客户端自己从上游拉取</b>——
+	 * 服务端只维护「是否在播放」的订阅状态机，音频字节完全不经服务端。
+	 * 客户端收到订阅 OK 后在这里起拉流线程：连上游 → 剥 ICY 元数据 →
+	 * 解码 → 混音，断流后的退避重连也由拉流线程自己完成（复用
+	 * {@link radiosmile.radio.StreamAudioSource}，它不依赖任何服务端类）。
+	 *
+	 * <p>故障表现与用户设定的链路一致：
+	 * 上游断 → 客户端缓冲变薄、底噪抬高 → 8 秒收不到上游数据 →
+	 * NOSIGNAL + 闪灯 + 底噪持续 → 退避重连 → 数据回来 → 底噪随缓冲变厚渐弱。
+	 */
+	private static final Map<Long, StreamFeed> FEEDS = new ConcurrentHashMap<>();
+
+	/** 订阅 OK 后启动（或替换）该方块的网络电台拉流任务。 */
+	public static void startStreamFeed(BlockPos pos, String stationId, String url) {
+		if (!RadioClientConfig.get().enableStreaming) {
+			return;
+		}
+		if (pos == null || stationId == null || url == null || url.isBlank()) {
+			return;
+		}
+		long key = pos.asLong();
+		StreamFeed existing = FEEDS.get(key);
+		if (existing != null) {
+			if (existing.url.equals(url) && existing.thread.isAlive()) {
+				return;
+			}
+			existing.stop();
+		}
+		StreamFeed feed = new StreamFeed(pos, stationId, url);
+		FEEDS.put(key, feed);
+		feed.thread.start();
+		SmileSRadio.LOGGER.info("客户端开始拉取网络电台流：{} <- {}", stationId, url);
+	}
+
+	/** 停止该方块的网络电台拉流任务（换台/关台/走远/退出时调用）。 */
+	public static void stopStreamFeed(BlockPos pos) {
+		if (pos == null) {
+			return;
+		}
+		StreamFeed feed = FEEDS.remove(pos.asLong());
+		if (feed != null) {
+			feed.stop();
+		}
+	}
+
+	/**
+	 * 一个方块的网络电台拉流线程。
+	 *
+	 * <p>循环体只做三件事：读上游字节（{@link StreamAudioSource#read} 内部已含
+	 * 退避重连与 ICY 剥离）→ 更新流心跳（供 8 秒超时判定）→ 喂解码器。
+	 * 会话号变化（上游重连成功）时重建解码器，避免断线前后的字节被当成连续流。
+	 */
+	private static final class StreamFeed implements Runnable {
+		final BlockPos pos;
+		final String stationId;
+		final String url;
+		final Thread thread;
+		volatile boolean stopped;
+
+		StreamFeed(BlockPos pos, String stationId, String url) {
+			this.pos = pos.immutable();
+			this.stationId = stationId;
+			this.url = url;
+			this.thread = new Thread(this, "RadioSmile-ClientStream");
+			this.thread.setDaemon(true);
+		}
+
+		void stop() {
+			this.stopped = true;
+			this.thread.interrupt();
+		}
+
+		@Override
+		public void run() {
+			radiosmile.radio.StreamAudioSource source =
+					new radiosmile.radio.StreamAudioSource(this.url);
+			try {
+				while (!this.stopped) {
+					byte[] data = source.read(16384);
+					if (data == null) {
+						// 订阅被主动关闭（close 后 read 返回 null）
+						break;
+					}
+					if (data.length == 0) {
+						// 建连中 / 断线重连中：拉流线程自己等，不动解码器。
+						// 客户端缓冲此时会被逐渐吃薄——那正是"底噪抬高"的信号来源。
+						Thread.sleep(20L);
+						continue;
+					}
+					handleUpstreamChunk(this.pos, this.stationId, source.sessionId(), data);
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			} catch (Throwable e) {
+				if (!this.stopped) {
+					SmileSRadio.LOGGER.warn("客户端拉流异常 @{}", this.pos, e);
+				}
+			} finally {
+				source.close();
+			}
+		}
+	}
+
+	/**
+	 * 处理一块从上游直接读到的音频字节（在拉流线程上执行）。
+	 *
+	 * <p>与 {@link #handleChunk} 的换台/重建逻辑对齐，但数据来源是本线程自己的
+	 * 上游连接而不是 S2C_AUDIO_CHUNK——没有服务端心跳/空包，也不需要配速。
+	 */
+	private static void handleUpstreamChunk(BlockPos pos, String stationId,
+			int sessionId, byte[] data) {
+		long key = pos.asLong();
+		Stream stream = STREAMS.get(key);
+		// 会话号变化 = 上游断过又重连：字节流不连续，必须重建解码器。
+		// 重连空窗用过渡静音窗声明（不响调台噪——重连不是换台）。
+		if (stream != null && stream.sessionId >= 0 && stream.sessionId != sessionId) {
+			SmileSRadio.LOGGER.info("网络流重连（会话 {} -> {}），重建解码器 @{}",
+					stream.sessionId, sessionId, pos);
+			stream.close();
+			STREAMS.remove(key);
+			PcmSink.INSTANCE.flush();
+			PcmSink.INSTANCE.clearNetworkNoise();
+			PcmSink.INSTANCE.setNetworkNoiseSource(pos);
+			PcmSink.INSTANCE.beginTransitionSilence();
+			stream = null;
+		}
+		if (stream == null) {
+			// 收到数据本身就是"玩家想要这个台"的强证据
+			noteStreamRequested(pos);
+			// 网络直播流从连上那一刻起播，没有"跳过历史"的概念；
+			// 清掉本地电台握手可能残留的 skip 时长，避免开头被误丢。
+			setPendingMetadata(0L);
+			stream = new Stream();
+			stream.stationId = stationId;
+			stream.sessionId = sessionId;
+			stream.blockPosKey = key;
+			STREAMS.put(key, stream);
+			PcmSink.INSTANCE.setPlaybackWanted(true);
+			PcmSink.INSTANCE.setSourcePosition(key, pos);
+			PcmSink.INSTANCE.start();
+		}
+		// 刷新流心跳：isStalled 的 8 秒超时判据统一看 lastChunkAt，
+		// 本地电台由 S2C_AUDIO_CHUNK 刷新，网络电台由这里（真实上游数据）刷新。
+		// 断流期间 read 一直返回空数组 → 这里不再执行 → 8 秒后判超时。
+		stream.chunks++;
+		stream.lastChunkAt = System.currentTimeMillis();
+		clearFaultNoiseOnResume(pos);
+		if (!stream.feed(radiosmile.radio.AudioFormat.MP3, data)) {
+			// 数据不可解码：保留 rejected 流（防止重建风暴），只把混音器里的残留清掉
+			PcmSink.INSTANCE.removeSource(key);
+		}
+	}
+
 
 	/**
 	 * 在主线程清除某个方块的故障显示。

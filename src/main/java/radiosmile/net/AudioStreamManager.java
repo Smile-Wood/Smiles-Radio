@@ -34,6 +34,25 @@ import radiosmile.radio.StreamAudioSource;
  */
 public final class AudioStreamManager {
 	private static final Map<UUID, AudioSubscription> SUBSCRIPTIONS = new ConcurrentHashMap<>();
+
+	/**
+	 * 网络电台订阅状态机。
+	 *
+	 * <p><b>架构约定（用户明确）</b>：网络电台的音频流由<b>客户端自己从上游拉取</b>，
+	 * 服务端不代理、不推流、不检查网络——对服务端来说网络电台只是一个
+	 * 「是否在播放」的订阅状态。这里登记的条目只用于：
+	 * <ul>
+	 *   <li>订阅数限制（与本地电台共用上限）；</li>
+	 *   <li>走远 / 方块拆除时通知客户端停止拉流（TOO_FAR / STOPPED）。</li>
+	 * </ul>
+	 * 音频字节完全不经服务端；断流判定、底噪、NOSIGNAL、重连全在客户端。
+	 */
+	private static final Map<UUID, StreamingSub> STREAMING_SUBS = new ConcurrentHashMap<>();
+
+	/** 网络电台的一条订阅登记（见 {@link #STREAMING_SUBS}）。 */
+	private record StreamingSub(ServerPlayer player, BlockPos pos, String stationId) {
+	}
+
 	/**
 	 * 每玩家最多同时订阅的收音机数量。
 	 *
@@ -98,6 +117,38 @@ public final class AudioStreamManager {
 		// 距离校验：与唱片机一致，48 格可听范围
 		if (player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > HEAR_RANGE * HEAR_RANGE) {
 			sendStatus(player, pos, AudioStatus.TOO_FAR);
+			return null;
+		}
+
+		// <b>网络电台：纯订阅状态机</b>（架构约定：客户端自己从上游拉流）。
+		//
+		// 服务端不做任何音频工作——不建源、不读流、不推送、不重连。
+		// 这里只登记「这个玩家在这个方块听这个网络台」，然后回 OK；
+		// 客户端收到 OK 后自己连接上游 URL（电台列表里已下发）开始拉流。
+		// 后续走远 / 方块拆除由 tick 的状态机检测发 TOO_FAR / STOPPED。
+		if (station.isStreaming()) {
+			UUID subKey = key(player, pos);
+			StreamingSub existing = STREAMING_SUBS.get(subKey);
+			if (existing != null && existing.stationId().equals(stationId)) {
+				// 幂等：重复订阅直接回 OK（同本地电台的复用语义）
+				sendStatus(player, pos, AudioStatus.OK);
+				return null;
+			}
+			long count = SUBSCRIPTIONS.values().stream()
+					.filter(s -> s.player().getUUID().equals(player.getUUID()))
+					.count()
+					+ STREAMING_SUBS.values().stream()
+							.filter(s -> s.player().getUUID().equals(player.getUUID()))
+							.count();
+			if (count >= MAX_SUBSCRIPTIONS_PER_PLAYER) {
+				SmileSRadio.LOGGER.warn("[停止原因A] 订阅数超限 {}/{} @{}",
+						count, MAX_SUBSCRIPTIONS_PER_PLAYER, pos);
+				sendStatus(player, pos, AudioStatus.STOPPED);
+				return null;
+			}
+			STREAMING_SUBS.put(subKey, new StreamingSub(player, pos.immutable(), stationId));
+			sendStatus(player, pos, AudioStatus.OK);
+			SmileSRadio.LOGGER.info("网络电台订阅登记 {} @{}（客户端自行拉流）", stationId, pos);
 			return null;
 		}
 
@@ -320,6 +371,11 @@ public final class AudioStreamManager {
 			sub.deactivate();
 			sub.closeSource();
 		}
+		// 网络电台的订阅登记一并清除（换台/退订时客户端自己停拉流）
+		STREAMING_SUBS.entrySet().removeIf(entry -> {
+			StreamingSub sub = entry.getValue();
+			return sub.player().getUUID().equals(player.getUUID()) && sub.pos().equals(pos);
+		});
 	}
 
 	/** 玩家断开时清理其所有订阅。 */
@@ -334,6 +390,7 @@ public final class AudioStreamManager {
 				it.remove();
 			}
 		}
+		STREAMING_SUBS.values().removeIf(sub -> sub.player().getUUID().equals(player.getUUID()));
 	}
 
 	/**
@@ -385,7 +442,7 @@ public final class AudioStreamManager {
 
 
 	private static void pumpAll() {
-		if (SUBSCRIPTIONS.isEmpty()) {
+		if (SUBSCRIPTIONS.isEmpty() && STREAMING_SUBS.isEmpty()) {
 			return;
 		}
 
@@ -409,28 +466,71 @@ public final class AudioStreamManager {
 				}
 				continue;
 			}
-			// <b>还没到发送节拍，但可能已经很久没发过任何东西了。</b>
+			// <b>还没到发送节拍：什么都不发。</b>
 			//
-			// 这是换曲场景下很容易漏掉的一条：{@code isDue()} 由配速锚点决定，
-			// 换曲/轮转时锚点可能被推到较远的未来，于是这里一路 {@code continue}，
-			// 客户端那边长时间收不到包 → 误判超时 → 点 NOSIGNAL + 响底噪。
-			//
-			// 因此补一条<b>与配速无关</b>的心跳路径：只要距上次发包超过
-			// {@link #HEARTBEAT_INTERVAL_MILLIS}，就发一个空包维持连接。
-			// 它不参与配速（不调 markSent），所以不会影响正常音频的节奏。
-			//
-			// 心跳与 pump 主路径同一套双重判据：订阅未拆除 + 上游仍在供数。
-			// 上游断流时停发，让客户端按 8 秒超时点亮 NOSIGNAL（详见 pump 内说明）。
-			if (sub.isHeartbeatDue(now)
-					&& !sub.source().isFinished() && sub.upstreamFlowing(now)) {
-				sendHeartbeat(sub);
-			}
+			// 网络电台流没有心跳包（用户明确的架构约定）：服务端只做
+			// 客户端驱动的订阅状态机 + 按配速推流，不额外造「我还活着」的空包。
+			// 换曲/轮转的空窗只有 1~2 秒，远小于客户端判超时的 8 秒，
+			// 不会误报；上游断流时客户端本来就收不到任何包，
+			// 正好按它自己的超时点亮 NOSIGNAL——故障判定完全在客户端。
 		}
 
 		for (AudioSubscription sub : dead) {
 			SUBSCRIPTIONS.remove(key(sub.player(), sub.pos()));
 			sub.closeSource();
 
+		}
+
+		// 网络电台订阅状态机：走远 / 方块拆除 → 通知客户端停止拉流。
+		// 音频不经服务端，这里只管「是否还该播」。
+		sweepStreamingSubs();
+	}
+
+	/**
+	 * 巡检网络电台订阅：玩家下线 / 走远 / 方块被拆时移除登记并通知客户端。
+	 *
+	 * <p>由推送线程每 5ms 调用一次；单个条目的开销只有一次距离平方计算，
+	 * 没有节流的必要。移除登记后状态包只发一次（条目已不在表里，不会重复）。
+	 */
+	private static void sweepStreamingSubs() {
+		if (STREAMING_SUBS.isEmpty()) {
+			return;
+		}
+		double stopRange = (HEAR_RANGE + 4.0) * (HEAR_RANGE + 4.0);
+		Iterator<Map.Entry<UUID, StreamingSub>> it = STREAMING_SUBS.entrySet().iterator();
+		while (it.hasNext()) {
+			Map.Entry<UUID, StreamingSub> entry = it.next();
+			StreamingSub sub = entry.getValue();
+			ServerPlayer player = sub.player();
+			if (player.hasDisconnected()) {
+				it.remove();
+				continue;
+			}
+			double distSq = player.distanceToSqr(sub.pos().getX() + 0.5,
+					sub.pos().getY() + 0.5, sub.pos().getZ() + 0.5);
+			if (distSq > stopRange) {
+				SmileSRadio.LOGGER.info("[网络电台] 玩家走远，停止订阅：{} @{}",
+						sub.stationId(), sub.pos());
+				sendStatus(player, sub.pos(), AudioStatus.TOO_FAR);
+				it.remove();
+				continue;
+			}
+			var level = player.level();
+			if (!level.isLoaded(sub.pos())) {
+				continue;
+			}
+			var state = level.getBlockState(sub.pos());
+			net.minecraft.resources.ResourceLocation blockId =
+					net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock());
+			boolean isRadio = blockId != null
+					&& "radio-smile".equals(blockId.getNamespace())
+					&& "radio".equals(blockId.getPath());
+			if (!isRadio) {
+				SmileSRadio.LOGGER.info("[网络电台] 方块已拆除/替换，停止订阅：{} @{}",
+						sub.stationId(), sub.pos());
+				sendStatus(player, sub.pos(), AudioStatus.STOPPED);
+				it.remove();
+			}
 		}
 	}
 
@@ -525,59 +625,22 @@ public final class AudioStreamManager {
 		// 因此这里绝不会因为等网络而卡住服务器 tick。
 		AudioSubscription.Chunk chunk = sub.pollChunk();
 		if (chunk == null || chunk.data().length == 0) {
-			// <b>没有数据时要发「心跳空包」，不能一言不发。</b>
+			// <b>没有数据：什么都不发（网络电台流没有心跳包）。</b>
 			//
-			// <h2>为什么必须发</h2>
-			// 换曲、播放列表轮转、上游短暂卡顿时，读线程会有<b>几百毫秒</b>拿不到数据。
-			// 早期这里直接 return，客户端那边就是"服务端没消息"——
-			// 而客户端判断「流僵住」和「要不要响底噪」都看 {@code lastChunkAt}，
-			// 于是：按时长积累到 8 秒 → 判超时 → <b>点亮 NOSIGNAL + 响底噪</b>，
-			// 可实际上服务一切正常，只是中间换了一首歌。
+			// 架构约定（用户明确）：服务端只做客户端驱动的订阅状态机 + 按配速推流，
+			// 与客户端之间不传「我还活着」的心跳包。故障判定完全在客户端：
+			// 它的抖动缓冲（缓存在客户端，不在服务端）吃空后底噪抬高，
+			// 8 秒收不到真实音频块就点亮 NOSIGNAL——不需要服务端代劳。
 			//
-			// <p>用户的原话是「要么中间做到无缝，要么就发空包（让客户端知道服务还活着）」。
-			// 做到无缝需要客户端预解码下一首并拼接 PCM，改动面大且容易在换曲处
-			// 产生爆音；<b>发空包是更稳的方案</b>：它精确表达了"我还活着，只是这段没数据"。
+			// 换曲/轮转的空窗只有 1~2 秒，远小于客户端 8 秒的超时窗，
+			// 不会因为「没包」而误报。
 			//
-			// <h2>空包不会污染音频</h2>
-			// 客户端收到空数组时<b>只刷新心跳、不喂解码器</b>（见 ClientAudioPlayer.handleChunk），
-			// 所以不会在 MP3 流里插入垃圾字节。
-			//
-			// <h2>为什么不需要限流</h2>
-			// 本方法由推送线程按 {@code isDue()} 的节奏调用（约每 250ms 一次），
-			// 天然不会刷屏；空包只有十几个字节。
-			//
-			// <h2>但不能无限发</h2>
-			// 若上游真的死了，继续发空包只会让客户端以为"一切正常"而永远不报故障。
-			// 因此判据是<b>双重的</b>：
-			//   1) {@code source.isFinished()}：订阅已拆除（不再有意义）；
-			//   2) {@code upstreamFlowing}：上游最近确实在供数。
-			// 第 2 条是关键：断网/重连期间订阅对象同样是"活着"的，
-			// 若只看第 1 条，心跳会一直发、客户端的 8 秒超时被永远刷新，
-			// NOSIGNAL 永远不亮、底噪也不保持（用户实测：断网无任何提示）。
-			// 停发后客户端按自己的节奏判超时 → 点亮 NOSIGNAL + 底噪；
-			// 服务端那边 StreamAudioSource 的自动重连把流接回来后一切恢复。
-			if (!sub.source().isFinished() && sub.upstreamFlowing(now)) {
-				// <b>换曲预载期间发「空音量包」，而不是普通心跳。</b>
-				//
-				// 两者都带 0 字节音频，差别只在语义与客户端的处置：
-				//   - 心跳：只告诉客户端"我还活着"，底噪该响还是响；
-				//   - 空音量包：明确声明"这段没声是换曲预载，请输出数字静音"，
-				//     客户端据此推迟故障判定（有总上限，见 PcmSink#TRANSITION_SILENCE_MAX_MILLIS）。
-				//
-				// <p>顺带修掉一个心率问题：这条分支原来<b>不判</b> {@code isHeartbeatDue}，
-				// 而推送线程 5ms 转一圈、{@code isDue()} 在没数据时又会一直为真，
-				// 于是空窗期间等于每 5ms 发一个包。现在按各自的间隔节流：
-				// 空音量包 {@link AudioSubscription#SILENCE_INTERVAL_MILLIS}（200ms，
-				// 必须比重载/换曲空窗更密，否则两头都盖不住），
-				// 心跳 {@code HEARTBEAT_INTERVAL_MILLIS}（1000ms，仍远小于客户端判超时的 8 秒）。
-				if (sub.source().isPreloadingTracks()) {
-					if (sub.isSilenceDue(now)) {
-						sendSilence(sub, PRELOAD_SILENCE_MILLIS);
-					}
-					return;
-				}
-				if (sub.isHeartbeatDue(now)) {
-					sendHeartbeat(sub);
+			// 唯一例外是下面的「空音量包」（S2C_AUDIO_SILENCE）：
+			// 它不是心跳，而是换曲预载的<b>静音声明</b>——防止客户端把
+			// 预载空窗当成服务器故障去响弱网底噪（用户特意设计的语义）。
+			if (sub.source().isPreloadingTracks()) {
+				if (sub.isSilenceDue(now)) {
+					sendSilence(sub, PRELOAD_SILENCE_MILLIS);
 				}
 			}
 			return;
@@ -646,57 +709,6 @@ public final class AudioStreamManager {
 		});
 
 		sub.markSent(now, data.length, data);
-	}
-
-	/**
-	 * 发送一个<b>心跳空包</b>：复用音频块通道，但载荷长度为 0。
-	 *
-	 * <p>它唯一的作用是告诉客户端「服务端还活着，只是这段没有音频数据」。
-	 * 客户端收到后<b>只刷新心跳时间、不喂解码器</b>，因此不会污染 MP3 字节流。
-	 *
-	 * <p><b>为什么复用 S2C_AUDIO_CHUNK 而不是新开一个通道</b>：
-	 * 客户端对这个通道的处理已经包含"切台/换曲/会话变化"的完整判定逻辑，
-	 * 空包走同一条路能顺带把这些状态同步过去（例如换曲时的 trackIndex 变化
-	 * 会让客户端重建解码器——正是我们想要的）。
-	 *
-	 * <p>字段顺序必须与正常音频块<b>完全一致</b>，否则客户端读取会错位：
-	 * pos / stationId / trackIndex / sessionId / formatId / data。
-	 */
-	private static void sendHeartbeat(AudioSubscription sub) {
-		ServerPlayer target = sub.player();
-		if (target == null || target.hasDisconnected()) {
-			return;
-		}
-		// <b>立刻记时间</b>，否则推送线程每 5ms 转一圈就会判定"又该发心跳了"，
-		// 变成每 5ms 一个空包刷屏。
-		sub.markHeartbeatSent(System.currentTimeMillis());
-		String stationId = sub.station().id();
-		BlockPos targetPos = sub.pos();
-		radiosmile.radio.AudioFormat format = sub.source().format();
-		int trackIndex = sub.trackIndex();
-		int sessionId = sub.sessionId();
-		var server = target.getServer();
-		if (server == null) {
-			return;
-		}
-		server.execute(() -> {
-			try {
-				if (!ServerPlayNetworking.canSend(target, RadioNetworking.S2C_AUDIO_CHUNK)) {
-					return;
-				}
-				FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
-				buf.writeBlockPos(targetPos);
-				buf.writeUtf(stationId);
-				buf.writeVarInt(trackIndex);
-				buf.writeVarInt(sessionId);
-				buf.writeVarInt(format.id());
-				// 空载荷：客户端据此识别为心跳
-				buf.writeByteArray(new byte[0]);
-				ServerPlayNetworking.send(target, RadioNetworking.S2C_AUDIO_CHUNK, buf);
-			} catch (Throwable t) {
-				SmileSRadio.LOGGER.error("[心跳] 空包发送异常", t);
-			}
-		});
 	}
 
 	/**

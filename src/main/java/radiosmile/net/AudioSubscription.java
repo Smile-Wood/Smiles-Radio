@@ -240,9 +240,6 @@ public final class AudioSubscription {
 				// 曲目序号在「读到这块数据的那一刻」就冻结下来，随数据一起入队。
 				// 换曲后读到的第一块新数据才带新序号，与字节流严格对应。
 				int chunkTrackIndex = this.source.trackIndex();
-				// <b>上游确实在供数</b>：刷新「上游数据流动」时钟。
-				// 心跳（见 upstreamFlowing）依据它区分「订阅活着」和「上游活着」。
-				this.lastUpstreamDataAt = System.currentTimeMillis();
 				synchronized (this.queue) {
 					while (this.queuedBytes + data.length > MAX_QUEUED_BYTES && !this.closed) {
 						this.queue.wait(200);
@@ -328,65 +325,6 @@ public final class AudioSubscription {
 	}
 
 	/**
-	 * 心跳发送间隔（毫秒）。
-	 *
-	 * <p>取 <b>1000ms</b>：远小于客户端判超时的 8 秒（{@code STALL_TIMEOUT_MILLIS}），
-	 * 留足 8 倍余量；又远大于正常块间隔（约 250ms），
-	 * 所以<b>正常播放时这条路径根本不会触发</b>（真实音频块会不断刷新它）。
-	 *
-	 * <p>它只在"配速把下一次发送推到很远的未来"时兜底——
-	 * 典型场景是换曲瞬间没有可读数据，而 {@code nextSendAt} 还在未来。
-	 */
-	private static final long HEARTBEAT_INTERVAL_MILLIS = 1000L;
-
-	/** 上次真正发出任何包（音频块或心跳）的时刻。 */
-	private volatile long lastSendAt = System.currentTimeMillis();
-
-	/**
-	 * 是否该发心跳空包了。
-	 *
-	 * <p>判据刻意只看「距上次发包多久」，<b>不看配速</b>：
-	 * 心跳的目的就是覆盖"配速还没到、但客户端已经等太久"的窗口。
-	 */
-	public boolean isHeartbeatDue(long now) {
-		return now - this.lastSendAt >= HEARTBEAT_INTERVAL_MILLIS;
-	}
-
-	/** 记录一次发包（音频块或心跳），用于心跳判定。 */
-	public void markHeartbeatSent(long now) {
-		this.lastSendAt = now;
-	}
-
-	/**
-	 * 上游「还有数据流」的判定窗口（毫秒）。
-	 *
-	 * <p>取 <b>5000ms</b>：远大于换曲/轮转的正常空窗（几百毫秒），
-	 * 又明显小于客户端判 {@code STALL_TIMEOUT} 的 8 秒——保证
-	 * 「上游断了 → 心跳停发 → 客户端判超时点 NOSIGNAL」这条链路一定走得完。
-	 */
-	private static final long UPSTREAM_FLOW_WINDOW_MILLIS = 5000L;
-
-	/** 上游最后一次真正供数的时刻（读线程每读到一块非空数据就刷新）。 */
-	private volatile long lastUpstreamDataAt = System.currentTimeMillis();
-
-	/**
-	 * 上游现在是否还有数据在流动。
-	 *
-	 * <h2>为什么心跳不能只看「订阅活着」</h2>
-	 * 心跳空包的语义是「我还活着，只是这段没数据」，它存在的目的是挡住
-	 * 换曲空窗的误报。但断网时订阅对象同样是「活着」的——
-	 * 若心跳照发，客户端的 8 秒超时（{@code lastChunkAt}）会被永远刷新，
-	 * NOSIGNAL 永远不亮、底噪也不会保持，玩家看到的是无提示的永久静音。
-	 *
-	 * <p>所以心跳必须绑定「上游确实在供数」：上游断流超过
-	 * {@link #UPSTREAM_FLOW_WINDOW_MILLIS} 就停发心跳，把故障判定
-	 * 完整交还给客户端；重连成功后数据恢复，心跳与音频自然回来。
-	 */
-	public boolean upstreamFlowing(long now) {
-		return now - this.lastUpstreamDataAt < UPSTREAM_FLOW_WINDOW_MILLIS;
-	}
-
-	/**
 	 * 「空音量包」的发送间隔（毫秒）。
 	 *
 	 * <p>取 <b>200ms</b>：它要<b>比重载/换曲的空窗更密</b>，否则两头都盖不住——
@@ -407,13 +345,9 @@ public final class AudioSubscription {
 
 	/**
 	 * 记录一次空音量包。
-	 *
-	 * <p>同时刷新 {@code lastSendAt}：空音量包也算「服务端发包了」，
-	 * 否则心跳路径会在同一时刻再多发一个冗余包。
 	 */
 	public void markSilenceSent(long now) {
 		this.lastSilenceAt = now;
-		this.lastSendAt = now;
 	}
 
 	/**
@@ -476,8 +410,6 @@ public final class AudioSubscription {
 	 * （逐帧累加 {@code 1152/sampleRate}），与码率换算严格自洽（实测误差 0.5%）。
 	 */
 	public void markSent(long now, int bytes, byte[] data) {
-		// 正常发包也算"活着"，同步刷新心跳计时
-		this.lastSendAt = now;
 		long intervalMs = radiosmile.radio.AudioDurationEstimator.estimateMillis(data, this.bytesPerSecond);
 		intervalMs = Math.max(20L, Math.min(1000L, intervalMs));
 

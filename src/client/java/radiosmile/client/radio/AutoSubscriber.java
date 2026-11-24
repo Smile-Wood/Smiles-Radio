@@ -428,6 +428,9 @@ public final class AutoSubscriber implements ClientModInitializer {
 					radiosmile.client.audio.PcmSink.INSTANCE.markFaultReported();
 					radiosmile.client.audio.PcmSink.INSTANCE.setPlaybackWanted(true);
 					radiosmile.client.audio.PcmSink.INSTANCE.setNetworkNoiseSource(entry.getKey());
+					// 登记故障噪音：数据恢复的第一块真实音频会让底噪按落音速率淡出
+					// （见 ClientAudioPlayer#clearFaultNoiseOnResume）。
+					radiosmile.client.audio.ClientAudioPlayer.noteFaultNoise(entry.getKey());
 				}
 			}
 		}
