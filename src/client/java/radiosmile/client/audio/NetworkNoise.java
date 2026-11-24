@@ -28,7 +28,12 @@ import java.util.Random;
  * <b>没有逐采样三角函数、没有对象分配</b>（见 {@link TuningNoise} 的同类约束）。
  */
 public final class NetworkNoise {
-	/** 底噪最大幅度：存在感明确，但不至于盖过节目。 */
+	/**
+	 * 底噪最大幅度：与电台节目<b>同档</b>（约 -18 dBFS 峰值），只提示、不抢戏。
+	 *
+	 * <p>用户明确要求：底噪响度不能盖过其他电台——多台并响时它就是背景级的
+	 * 沙沙声，归属电台自己的音量滑块与距离衰减才是主调节手段。
+	 */
 	private static final float PEAK = 0.12F;
 	/** 低通系数：弱信号嘶声偏闷，不要像白噪那么刺耳。 */
 	private static final float LOWPASS = 0.25F;

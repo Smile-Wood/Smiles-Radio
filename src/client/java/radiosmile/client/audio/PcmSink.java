@@ -671,7 +671,7 @@ public final class PcmSink {
 		this.streamFlowing = false;
 		this.faultReported = false;
 		this.consecutiveUnderruns = 0;
-		this.weakNoiseHeld = false;
+		this.lastUnderrunAtMs = 0L;
 		this.healthyBlocks = 0;
 		this.failingNow = false;
 		this.faultLatched = false;
@@ -750,7 +750,7 @@ public final class PcmSink {
 				this.networkNoise.reset();
 				this.faultReported = false;
 				this.consecutiveUnderruns = 0;
-				this.weakNoiseHeld = false;
+				this.lastUnderrunAtMs = 0L;
 				this.healthyBlocks = 0;
 				this.failingNow = false;
 			}
@@ -879,9 +879,7 @@ public final class PcmSink {
 		this.streamFlowing = false;
 		this.faultReported = false;
 		this.consecutiveUnderruns = 0;
-		this.weakNoiseHeld = false;
-		this.weakNoiseSinceMs = 0L;
-		this.weakNoiseSuppressed = false;
+		this.lastUnderrunAtMs = 0L;
 		this.healthyBlocks = 0;
 		this.failingNow = false;
 		this.underruns.set(0);
@@ -1012,7 +1010,7 @@ public final class PcmSink {
 					this.networkNoise.reset();
 					this.failingNow = false;
 					this.consecutiveUnderruns = 0;
-					this.weakNoiseHeld = false;
+					this.lastUnderrunAtMs = 0L;
 				} else {
 					// 玩家还想听，但没有音源 → 这段静音是故障。
 					// 用与正常路径<b>同一个</b> updateNetworkNoise() 判定，
@@ -1107,11 +1105,11 @@ public final class PcmSink {
 				// <b>本流第一次真的出声</b>：预热窗口结束。
 				//
 				// 把这段窗口里累积的"欠载/缓冲见薄"痕迹全部清掉——它们是起播的正常过程，
-				// 不是故障。不清的话，粘性判定（weakNoiseHeld）会让底噪在正常播放时
-				// 继续响到 HEALTHY_RESTORE_BLOCKS，听感就是「每次起播都先沙一秒」。
+				// 不是故障。不清的话，弱底噪闸门（recentUnderrun）会在正常播放时
+				// 让嘶声多响几秒，听感就是「每次起播都先沙一下」。
 				this.streamFlowing = true;
 				this.consecutiveUnderruns = 0;
-				this.weakNoiseHeld = false;
+				this.lastUnderrunAtMs = 0L;
 				this.healthyBlocks = 0;
 				this.failingNow = false;
 				this.networkNoise.reset();
@@ -1452,6 +1450,9 @@ public final class PcmSink {
 			if (this.starvedSinceMs == 0L) {
 				this.starvedSinceMs = nowMs;
 			}
+			// 每个饥饿块都刷新：弱底噪的闸门（RECENT_UNDERRUN_WINDOW_MILLIS）看的是
+			// 「最近一次真饿」，而不是「这一块饿不饿」。
+			this.lastUnderrunAtMs = nowMs;
 		} else {
 			this.starvedSinceMs = 0L;
 		}
@@ -1459,7 +1460,7 @@ public final class PcmSink {
 		// 只清计数、不动 networkNoise 的增益（那时它本来就是 0）。
 		if (!this.streamFlowing && !this.faultReported) {
 			this.consecutiveUnderruns = 0;
-			this.weakNoiseHeld = false;
+			this.lastUnderrunAtMs = 0L;
 			this.failingNow = false;
 			this.starvedSinceMs = 0L;
 			this.networkNoise.updateTarget(0.0F);
@@ -1472,14 +1473,14 @@ public final class PcmSink {
 		//
 		// <p>判据顺序很关键：这一段必须<b>早于</b>下面 healthy / thinning 的计算。
 		// flush 之后缓冲是 0，那两个判据必然"不健康"，先算就等于先 latch 弱底噪，
-		// 之后即使窗内把目标压成 0，{@code weakNoiseHeld} 的粘性也会让它
-		// 在窗后接着响 500ms。
+		// 之后即使窗内把目标压成 0，NetworkNoise 的缓慢落音也会让嘶声
+		// 在窗后拖着尾巴。
 		//
 		// <p>只在「服务端没有明确报故障」时生效：{@code faultReported} 是被告知的结论，
 		// 优先级高于我们从欠载里做的推测。
 		if (!this.faultReported && this.inTransitionSilence()) {
 			this.consecutiveUnderruns = 0;
-			this.weakNoiseHeld = false;
+			this.lastUnderrunAtMs = 0L;
 			this.healthyBlocks = 0;
 			this.failingNow = false;
 			this.starvedSinceMs = 0L;
@@ -1517,26 +1518,23 @@ public final class PcmSink {
 		boolean starving = this.consecutiveUnderruns > 0;
 		boolean thinned = !healthy;
 
-		// 「弱底噪」有粘性：一旦触发就保持，直到缓冲连续健康一段时间才撤。
-		// 否则卡顿是一阵一阵的，底噪会跟着一开一关，听感是「噗噗」抖动。
+		// <b>弱底噪只在「最近真的饿过」时才响</b>——用户实测「1.0 之后一直 0.3」的根因修复。
 		//
-		// <b>时长封顶</b>：粘住超过 {@link #WEAK_NOISE_MAX_MILLIS} 就强制撤销，
-		// 并禁止在缓冲真正健康过一轮之前再次粘住。这是结构性保险——
-		// 无论上游判据将来怎么误报，这一档都不可能再变成常驻嘶声。
-		if (thinned) {
-			if (!this.weakNoiseHeld && !this.weakNoiseSuppressed) {
-				this.weakNoiseHeld = true;
-				this.weakNoiseSinceMs = nowMs;
-			} else if (this.weakNoiseHeld
-					&& nowMs - this.weakNoiseSinceMs > WEAK_NOISE_MAX_MILLIS) {
-				this.weakNoiseHeld = false;
-				this.weakNoiseSuppressed = true;
-			}
-			this.healthyBlocks = 0;
-		} else if (this.healthyBlocks >= HEALTHY_RESTORE_BLOCKS) {
-			this.weakNoiseHeld = false;
-			this.weakNoiseSuppressed = false;
-		}
+		// 客户端直连上游是 1:1 实时流：建连时 TCP 先把积压一口气灌进来，缓冲瞬间顶高，
+		// 稳态基线（棘轮）随之抬到峰值；之后实时 pacing 下缓冲长期停在远低于峰值的水平
+		// ——「相对变薄」判据从此<b>永久为真</b>，弱底噪 0.4 被永久粘住，
+		// 故障恢复后听起来就是「一直 0.3」（而 NOSIGNAL 期间明明是 1.0）。
+		//
+		// 修法：相对变薄本身不报警，只有<b>它真的导致了饥饿</b>才报警——
+		// 缓冲被吃薄到断供（哪怕只有一个空块）后的一小段时间内才允许弱底噪；
+		// 一直有数据、从未断供的流，无论水位比基线低多少都是安静的。
+		// 绝对见底（真的一块都不剩）仍然直接报警，不依赖饥饿历史。
+		//
+		// 淡入淡出交给 NetworkNoise 的 attack/release 平滑，不再需要粘性去抖
+		// （粘性正是把 0.4 永久按住的机制）。
+		boolean recentUnderrun = this.lastUnderrunAtMs != 0L
+				&& nowMs - this.lastUnderrunAtMs < RECENT_UNDERRUN_WINDOW_MILLIS;
+		boolean thinWarning = thinned && (recentUnderrun || this.isBufferAbsolutelyThin());
 
 		boolean failing = starving || this.consecutiveUnderruns >= UNDERRUN_ALERT_BLOCKS;
 
@@ -1591,16 +1589,14 @@ public final class PcmSink {
 		// <b>故障锁存</b>：真实故障一旦成立（宽限过后仍连续无数据），电平就锁死在满档，
 		// 不再随逐块重算的瞬时状态摆动。
 		//
-		// 用户实测：NOSIGNAL 期间电平像 0.4-0.6-1.0-0.3 一样来回跳——
-		// 原因是故障期间判据每块都在重算：上游闪断/重连尝试偶尔漏进一块数据，
-		// 「连续无数据」被清零 → failing 短暂为 false → 掉回弱档 0.4 → 又饿 → 回 1.0。
-		// 锁存后故障期间恒定 1.0，只有两条路能解锁：
-		//   1) 缓冲<b>真正恢复健康</b>（有数据且水位回来）→ 走正常淡出；
+		// 解锁只有两条路：
+		//   1) 缓冲<b>持续恢复健康</b>（{@link #HEALTHY_RESTORE_BLOCKS} 连续健康块，
+		//      而不是单块健康）→ 走正常淡出；
 		//   2) 显式恢复入口（onLinkRecovered / clearNetworkNoise / beginTransitionSilence）。
-		// 单块数据的闪现不会解锁（缓冲仍薄、healthy 为 false），电平纹丝不动。
+		// 单块数据的闪现既不解锁（避免 1.0↔0.4 抖动），也不会把电平拉下去。
 		if (failing && !starveGrace) {
 			this.faultLatched = true;
-		} else if (this.faultLatched && healthy && !starving) {
+		} else if (this.faultLatched && this.healthyBlocks >= HEALTHY_RESTORE_BLOCKS) {
 			this.faultLatched = false;
 		}
 
@@ -1613,7 +1609,7 @@ public final class PcmSink {
 			target = this.networkNoise.gain();
 		} else if (failing) {
 			target = 1.0F;
-		} else if (this.weakNoiseHeld) {
+		} else if (thinWarning) {
 			target = STUTTER_LEVEL;
 		} else {
 			target = 0.0F;
@@ -1622,32 +1618,27 @@ public final class PcmSink {
 	}
 
 	/**
-	 * 「弱底噪」是否处于保持状态。
+	 * 最近一次<b>真的断供</b>（空块）的时刻。
 	 *
-	 * <p>有粘性：触发后一直响到缓冲连续健康 {@link #HEALTHY_RESTORE_BLOCKS} 块才撤，
-	 * 避免卡顿一阵一阵时底噪跟着一开一关（听感是「噗噗」抖）。
-	 *
-	 * <p>另有<b>时长封顶</b>（见 {@link #WEAK_NOISE_MAX_MILLIS}）：
-	 * 粘住太久会强制撤销，保证这一档不可能变成常驻嘶声。
+	 * <p>弱底噪的闸门：只有最近真饿过（见 {@link #RECENT_UNDERRUN_WINDOW_MILLIS}），
+	 * 「缓冲相对基线变薄」才允许报警。直连实时流的缓冲天然远低于建连瞬间的峰值基线，
+	 * 相对判据单独使用会永久为真——那是「1.0 之后一直 0.3」的根因。
 	 */
-	private boolean weakNoiseHeld;
+	private long lastUnderrunAtMs;
 
-	/** 「弱底噪」开始粘住的时刻；配合 {@link #WEAK_NOISE_MAX_MILLIS} 做时长封顶。 */
-	private long weakNoiseSinceMs;
+	/** 弱底噪的饥饿追溯窗（毫秒）。取 3000：覆盖一次短暂卡顿的恢复过程，又不会拖太久。 */
+	private static final long RECENT_UNDERRUN_WINDOW_MILLIS = 3000L;
 
 	/**
 	 * 故障锁存：真实故障（宽限过后仍连续无数据）成立后为 true。
 	 *
 	 * <p>锁存期间底噪电平<b>恒定满档</b>，不随逐块重算的瞬时状态摆动
 	 * （用户实测：NOSIGNAL 期间电平 0.4-0.6-1.0-0.3 来回跳）。
-	 * 解锁：缓冲真正恢复健康、或显式恢复入口
-	 * （{@link #onLinkRecovered()} / {@link #clearNetworkNoise()} /
+	 * 解锁：缓冲持续恢复健康（{@link #HEALTHY_RESTORE_BLOCKS} 连续健康块）、
+	 * 或显式恢复入口（{@link #onLinkRecovered()} / {@link #clearNetworkNoise()} /
 	 * {@link #beginTransitionSilence(long)}）。
 	 */
 	private boolean faultLatched;
-
-	/** 封顶撤销后是否禁止再次粘住（缓冲真正连续健康过一轮才解除）。 */
-	private boolean weakNoiseSuppressed;
 
 	/**
 	 * 是否仍有「播放意图」（即玩家还希望听到这个台）。
@@ -1665,26 +1656,16 @@ public final class PcmSink {
 	 */
 	private volatile boolean playbackWanted;
 
-	/** 连续健康块数：缓冲持续不薄才允许撤销弱底噪。 */
+	/** 连续健康块数：缓冲持续不薄才允许解锁故障锁存。 */
 	private int healthyBlocks;
 
 	/**
-	 * 撤销弱底噪所需的连续健康块数。
+	 * 撤销<b>故障锁存</b>所需的连续健康块数。
 	 *
-	 * <p>约 0.5 秒（25 块 × 20ms）：够跨过卡顿之间的短暂间隙，
-	 * 又不会让恢复后底噪拖太久。
+	 * <p>约 0.5 秒（25 块 × 20ms）：解锁故障锁存必须「持续」健康这么久，
+	 * 单块数据的闪现（重连尝试漏进来的几块）不解锁，电平保持在 1.0 不抖动。
 	 */
 	private static final int HEALTHY_RESTORE_BLOCKS = 25;
-
-	/**
-	 * 「弱底噪」的最长持续时长（毫秒）。
-	 *
-	 * <p>结构性保险：提示音的职责是「告诉你信号不稳」，不是「替你忍受断网」。
-	 * 连续响满 8 秒还不见好就闭嘴——真断了还有大底噪（欠载档）与自动重连兜底。
-	 * 它保证这一档<b>无论上游判据将来怎么误报，都不可能再变成常驻嘶声</b>
-	 * （水位判据已三次被误报坑出「突然出现且不消失」的底噪）。
-	 */
-	private static final long WEAK_NOISE_MAX_MILLIS = 8000L;
 
 	/**
 	 * <b>缓冲层是否「不健康」</b>——弱底噪的判据（原 isBufferThinning 与
@@ -1758,6 +1739,27 @@ public final class PcmSink {
 	}
 
 	/**
+	 * 缓冲是否<b>绝对见底</b>（平滑水位低于 {@link #ABSOLUTE_THIN_FRAMES}）。
+	 *
+	 * <p>与 {@link #isBufferUnhealthy()} 的「相对变薄」分开暴露：
+	 * 弱底噪闸门要求「最近真饿过」，但缓冲真的只剩一块不到时，
+	 * 断供就在眼前，不依赖饥饿历史也要报警。
+	 */
+	private boolean isBufferAbsolutelyThin() {
+		synchronized (this.lock) {
+			for (SourceBuffer buffer : this.sources.values()) {
+				if (!buffer.primed) {
+					continue;
+				}
+				if (buffer.smoothFrames < ABSOLUTE_THIN_FRAMES) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * 平滑系数（每写块 0.1 → 时间常数约 <b>200ms</b>）。
 	 *
 	 * <p>旧值 0.02（时间常数 1 秒）在客户端直连架构下有一个致命滞后：
@@ -1817,8 +1819,7 @@ public final class PcmSink {
 	 * 但有一条**合法**的连续无音频窗口：起播/换台后抖动缓冲正在预热，
 	 * {@code SourceBuffer.primed} 还是 false，必须攒够 {@code startupTargetFrames()}
 	 * （约 300 ms）才第一次出声。这段窗口里 {@code any == false} 是<b>完全正常</b>的，
-	 * 却会被记成连续欠载；再叠加 {@code weakNoiseHeld} 的粘性
-	 * （{@link #HEALTHY_RESTORE_BLOCKS} = 25 块才撤），
+	 * 却会被记成连续欠载；再叠加弱底噪闸门的追溯窗（{@link #RECENT_UNDERRUN_WINDOW_MILLIS}），
 	 * 结果是每次正常起播/换台都先响约 1 秒假底噪 —— 那是把"故障提示"变成了"起播音效"。
 	 *
 	 * <p>所以：<b>只有本流真的出过声之后</b>，"没声音"才可能是故障。
@@ -1892,7 +1893,7 @@ public final class PcmSink {
 			this.faultReported = false;
 			this.failingNow = false;
 			this.consecutiveUnderruns = 0;
-			this.weakNoiseHeld = false;
+			this.lastUnderrunAtMs = 0L;
 			this.networkNoise.reset();
 		}
 	}
@@ -1918,7 +1919,7 @@ public final class PcmSink {
 	public void onLinkRecovered() {
 		this.faultReported = false;
 		this.consecutiveUnderruns = 0;
-		this.weakNoiseHeld = false;
+		this.lastUnderrunAtMs = 0L;
 		this.healthyBlocks = 0;
 		// 链路已恢复：解锁故障电平，底噪从这里开始按落音速率淡出
 		this.faultLatched = false;
@@ -2006,8 +2007,8 @@ public final class PcmSink {
 	 *   <li>8 块（约 160ms）后 {@code failing = true} → 底噪<b>直接拉到满强度</b>；</li>
 	 *   <li>此时 {@code streamFlowing} 早就是 true，预热门根本拦不住；</li>
 	 *   <li>抖动缓冲被 flush 归零，{@code isBufferUnhealthy()} 判「不健康」
-	 *       → {@code weakNoiseHeld} 也粘住，
-	 *       节目接上后还要再沙 {@link #HEALTHY_RESTORE_BLOCKS} 块（约 500ms）才退。</li>
+	 *       → 弱底噪闸门的追溯窗也被点亮，
+	 *       节目接上后还要再拖几秒嘶声才退。</li>
 	 * </ul>
 	 * 听感正是「一换歌就沙一阵」——这不是弱网，是<b>我们自己制造的</b>空窗。
 	 *
@@ -2061,7 +2062,7 @@ public final class PcmSink {
 		long until = Math.min(now + span, this.transitionSilenceCapUntil);
 		this.transitionSilenceUntil = Math.max(this.transitionSilenceUntil, until);
 		this.consecutiveUnderruns = 0;
-		this.weakNoiseHeld = false;
+		this.lastUnderrunAtMs = 0L;
 		this.healthyBlocks = 0;
 		// 换曲/重载是服务端明确声明的新节目：之前的故障状态一并解除
 		this.faultLatched = false;
