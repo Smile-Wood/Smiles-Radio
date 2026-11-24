@@ -184,6 +184,21 @@ public final class PcmSink {
 		int steadyFrames;
 
 		/**
+		 * 本音源<b>累计送给混音的帧数</b>（只增不减，诊断用）。
+		 *
+		 * <p>为什么需要它：客户端「收到的数据块数」和「真的能出声」是两件事。
+		 * 解码器若一直搜不到帧同步（例如订阅起点落在坏数据里），块会源源不断到达、
+		 * 流对象看起来完全正常，但混音器一帧都收不到——听感就是<b>永久静音</b>，
+		 * 而且日志里没有任何异常。
+		 *
+		 * <p>用它做「冷启动看门狗」的判据：有流 + 有块 + 这个值为 0 = 解码卡死，
+		 * 由 {@code AutoSubscriber} 强制重建一次解码器。
+		 *
+		 * <p>{@link #reset()} 刻意<b>不</b>清它：换台/清缓冲不是"从来没出过声"。
+		 */
+		long deliveredFrames;
+
+		/**
 		 * 这个缓冲里是否<b>只有效果音</b>、没有真实节目数据。
 		 *
 		 * <p>丢包/换台空窗时我们会为归属方块挂一个空块承载噪声。
@@ -555,6 +570,7 @@ public final class PcmSink {
 				}
 			}
 			buffer.append(converted, converted.length);
+			buffer.deliveredFrames += converted.length / OUT_CHANNELS;
 		}
 	}
 
@@ -878,6 +894,24 @@ public final class PcmSink {
 
 	public long underruns() {
 		return this.underruns.get();
+	}
+
+	/**
+	 * 某个音源到目前为止一共送给混音多少帧（诊断用）。
+	 *
+	 * <p>返回 0 有两种含义，调用方要配合 {@code ClientAudioPlayer.isStreaming()} 区分：
+	 * <ul>
+	 *   <li>根本没有音源 → 从没出过声（正常，可能还没起播）；</li>
+	 *   <li>有音源、有数据块，但一帧也没送进来 → <b>解码器卡死</b>（异常）。</li>
+	 * </ul>
+	 *
+	 * @param blockPos 音源方块的坐标键（{@code BlockPos#asLong()}）
+	 */
+	public long deliveredFramesFor(long blockPos) {
+		synchronized (this.lock) {
+			SourceBuffer buffer = this.sources.get(blockPos);
+			return buffer == null ? 0L : buffer.deliveredFrames;
+		}
 	}
 
 	public int queuedFrames() {

@@ -81,6 +81,46 @@ public final class AutoSubscriber implements ClientModInitializer {
 	 * 保证每次重试都有机会真正连上；又不至于让真断线的恢复等太久。
 	 */
 	private static final long RESUBSCRIBE_INTERVAL_MS = 6000L;
+
+	/**
+	 * 冷启动「暖机」窗口（毫秒）：进入世界后的这段时间用更短的退避间隔。
+	 *
+	 * <h2>为什么必须有</h2>
+	 * 刚进世界时，第一次订阅<b>很容易失败</b>，而且都是暂时性的：
+	 * <ul>
+	 *   <li>客户端区块刚加载完，方块实体的 NBT 可能还没到；</li>
+	 *   <li>服务端的电台清单/转码预热可能正忙，订阅会先回 {@code NO_AUDIO}；</li>
+	 *   <li>服务端那边的区块可能还没加载完（{@code pump} 会主动 deactivate）。</li>
+	 * </ul>
+	 * 用 6 秒的常态退避，玩家听到的就是「进服静音好几秒，甚至要开一下界面才响」。
+	 * 暖机期把间隔压到 {@link #WARMUP_RETRY_MILLIS}，让第一声尽快出来；
+	 * 过了窗口仍按 6 秒，避免真的坏掉的台被高频重试刷日志。
+	 */
+	private static final long WARMUP_MILLIS = 20_000L;
+
+	/** 暖机期的重订阅间隔（毫秒）。 */
+	private static final long WARMUP_RETRY_MILLIS = 1500L;
+
+	/**
+	 * 多久没解出任何声音就判定「解码器卡死」（毫秒）。
+	 *
+	 * <p>要显著大于一次正常起播（订阅 → 首块 → 攒满抖动缓冲，约 1 秒），
+	 * 又要小到玩家不会觉得「进服就是没声」。
+	 */
+	private static final long COLD_SILENCE_MILLIS = 6000L;
+
+	/** 冷启动「解码器卡死」的强制重建次数上限（每方块、每世界）。 */
+	private static final int MAX_COLD_KICKS = 2;
+
+	/** 进入世界的那一刻（毫秒）；{@code 0} 表示当前不在世界里。 */
+	private long joinedAt;
+
+	/** 上次打过日志的「扫描结果」快照：只在变化时打一条，避免每 0.5 秒刷屏。 */
+	private String lastScanSummary = "";
+
+	/** 已对某个方块做过几次「冷启动强制重建」。 */
+	private final Map<BlockPos, Integer> coldKicks = new HashMap<>();
+
 	private int tickCounter;
 
 	@Override
@@ -91,8 +131,20 @@ public final class AutoSubscriber implements ClientModInitializer {
 				// 否则下次进入时可能带着旧计数，导致首次扫描被推迟。
 				this.subscribed.clear();
 				this.retryLogged.clear();
+				// <b>退避表也必须清</b>：它是「上个世界」的时间戳，
+				// 留着会让新世界里的第一次重试被无谓地压住（本期修的）。
+				this.lastResubscribeAt.clear();
+				this.coldKicks.clear();
+				this.lastScanSummary = "";
+				this.joinedAt = 0L;
 				this.tickCounter = 0;
 				return;
+			}
+			// 刚进世界：<b>下一个 tick 就扫</b>，不要等满一个扫描周期。
+			// 「进服第一声」全靠这一次扫描，晚 0.5 秒在体感上就是「进来没声音」。
+			if (this.joinedAt == 0L) {
+				this.joinedAt = System.currentTimeMillis();
+				this.tickCounter = SCAN_INTERVAL_TICKS;
 			}
 			if (++this.tickCounter < SCAN_INTERVAL_TICKS) {
 				return;
@@ -147,6 +199,44 @@ public final class AutoSubscriber implements ClientModInitializer {
 		return false;
 	}
 
+	/**
+	 * 扫描结果<b>变化时</b>打一条日志。
+	 *
+	 * <h2>为什么值得占一行日志</h2>
+	 * 「进服不自动订阅」有三种完全不同的现场，而它们的表现都是<b>没声音</b>：
+	 * <ol>
+	 *   <li><b>根本没扫到方块</b>（区块没加载 / 半径不够）→ 这台是 0；</li>
+	 *   <li><b>扫到了但频道是空的</b>（方块 NBT 没同步到客户端）→ 列表里没有它；</li>
+	 *   <li><b>扫到也订阅了</b>，但数据/解码那条链路有别的问题 → 有记录、没有声。</li>
+	 * </ol>
+	 * 只看「有没有声音」永远分不清是哪一种，日志又只会打成功订阅时的那一行。
+	 * 这里在<b>结果变化</b>时打一条（不是每 0.5 秒），开销可忽略，
+	 * 但上面三种情况一眼就能分开。
+	 *
+	 * @param found 本次扫描找到的「有频道」的收音机
+	 */
+	private void logScanOnce(Map<BlockPos, String> found) {
+		StringBuilder sb = new StringBuilder();
+		for (Map.Entry<BlockPos, String> entry : found.entrySet()) {
+			if (sb.length() > 0) {
+				sb.append(", ");
+			}
+			sb.append(entry.getKey().toShortString()).append('=').append(entry.getValue());
+		}
+		String summary = found.size() + "|" + sb;
+		if (summary.equals(this.lastScanSummary)) {
+			return;
+		}
+		this.lastScanSummary = summary;
+		if (found.isEmpty()) {
+			SmileSRadio.LOGGER.info("[自动订阅] 扫描：{} 格内没有已加载的收音机（电台列表已加载={}）",
+					SCAN_RADIUS, ClientRadioData.isLoaded());
+			return;
+		}
+		SmileSRadio.LOGGER.info("[自动订阅] 扫描：{} 台 {}（电台列表已加载={}）",
+				found.size(), sb, ClientRadioData.isLoaded());
+	}
+
 	private void scanAndSync(Minecraft client) {
 		BlockPos playerPos = client.player.blockPosition();
 		Map<BlockPos, String> found = new HashMap<>();
@@ -177,6 +267,10 @@ public final class AutoSubscriber implements ClientModInitializer {
 				}
 			}
 		}
+
+		// 结果只在<b>变化时</b>打一条：这是排查「进服不自动订阅」唯一的现场证据——
+		// 扫不到方块、扫到了但频道为空、扫到了也订阅了却仍没声，三种情况一眼可分。
+		this.logScanOnce(found);
 
 		// 新增 / 频道变化 / <b>播放已中断</b> 的：重新订阅
 		for (Map.Entry<BlockPos, String> entry : found.entrySet()) {
@@ -213,8 +307,16 @@ public final class AutoSubscriber implements ClientModInitializer {
 			//
 			// 退避仍然保留：扫描每 0.5 秒一次，若流对象反复建不起来，
 			// 没有退避会每 0.5 秒发一次订阅请求。
-			boolean canRetry = System.currentTimeMillis() - this.lastResubscribeAt
-					.getOrDefault(entry.getKey(), 0L) >= RESUBSCRIBE_INTERVAL_MS;
+			//
+			// <b>退避间隔分两档</b>：进世界后的暖机期内用 1.5 秒（冷启动的第一声
+			// 全靠它），之后回到 6 秒。常态下 6 秒是必要的——它要盖过
+			// 「网络流建连约 1 秒 + 首块缓冲 0.3 秒」，太短会形成"每次都在建连、
+			// 永远等不到数据"的死循环。
+			long now = System.currentTimeMillis();
+			boolean warming = this.joinedAt > 0L && now - this.joinedAt < WARMUP_MILLIS;
+			long retryInterval = warming ? WARMUP_RETRY_MILLIS : RESUBSCRIBE_INTERVAL_MS;
+			boolean canRetry = now - this.lastResubscribeAt
+					.getOrDefault(entry.getKey(), 0L) >= retryInterval;
 			if (isNew || (notStreaming && canRetry)) {
 				if (isNew) {
 					SmileSRadio.LOGGER.info("[自动订阅] 开始接收 {} @{}", entry.getValue(), entry.getKey());
@@ -224,8 +326,29 @@ public final class AutoSubscriber implements ClientModInitializer {
 					SmileSRadio.LOGGER.warn("[自动订阅] 订阅缺失，重新建立 {} @{}",
 							entry.getValue(), entry.getKey());
 				}
-				this.lastResubscribeAt.put(entry.getKey(), System.currentTimeMillis());
+				this.lastResubscribeAt.put(entry.getKey(), now);
 				ClientRadioNetwork.subscribeAudio(entry.getKey(), entry.getValue());
+			} else if (warming && !isNew && canRetry
+					&& ClientAudioPlayer.isStreaming(entry.getKey())
+					&& now - this.joinedAt > COLD_SILENCE_MILLIS
+					&& radiosmile.client.audio.PcmSink.INSTANCE
+							.deliveredFramesFor(entry.getKey().asLong()) == 0L
+					&& this.coldKicks.getOrDefault(entry.getKey(), 0) < MAX_COLD_KICKS) {
+				// <b>冷启动看门狗：有流、有数据块，却一帧都没解出来。</b>
+				//
+				// 这种情况下重订阅是<b>无效</b>的——服务端订阅好好的，数据也在推，
+				// 卡的是客户端解码器（订阅起点正好落在坏字节里，JLayer 搜不到帧同步
+				// 就一直空转）。必须把解码器整个换掉，让下一块从新的同步点重新开始。
+				//
+				// 这个缺陷的现场特征是「进服没声音，开一次界面/换一次台就好了」——
+				// 因为换台会重建解码器。这里把它自动化，并且<b>限次</b>
+				// （{@link #MAX_COLD_KICKS}），避免在真正无音频的台上反复折腾。
+				int kicks = this.coldKicks.merge(entry.getKey(), 1, Integer::sum);
+				this.lastResubscribeAt.put(entry.getKey(), now);
+				SmileSRadio.LOGGER.warn(
+						"[自动订阅] {} 有数据但一帧都没解出来，重建解码器（第 {}/{} 次）@{}",
+						entry.getValue(), kicks, MAX_COLD_KICKS, entry.getKey());
+				ClientAudioPlayer.restartStream(entry.getKey());
 			}
 			// 数据超时：点亮红灯 + 屏幕 NOSIGNAL，让玩家知道「不是设备坏了，是没信号」。
 			//

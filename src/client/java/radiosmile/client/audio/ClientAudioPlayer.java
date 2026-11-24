@@ -658,6 +658,39 @@ public final class ClientAudioPlayer {
 	}
 
 	/**
+	 * 丢掉某个方块的解码器，等下一块数据用<b>全新解码器</b>重建。
+	 *
+	 * <h2>什么时候需要</h2>
+	 * 数据块一直在到（{@link #isStreaming} 为真），但解码器<b>一帧也没解出来</b>
+	 * （{@link PcmSink#deliveredFramesFor} 为 0）。最典型的场景是冷启动订阅时
+	 * 起点恰好落在坏数据/错位字节里，JLayer 在里面搜不到帧同步就一直空转——
+	 * 块源源不断，声音一点没有，日志也没有任何异常，只能靠外部踢一脚。
+	 *
+	 * <p>重建很便宜：下一次 {@code handleChunk} 发现流不存在会新建实例，
+	 * 新解码器从那一块的第一帧重新搜同步。服务端仍在推同一位置的数据，
+	 * 所以不会跳曲、不会重复。
+	 *
+	 * <p><b>不动混音器</b>：不 flush、不 removeSource。若新解码器仍解不出东西，
+	 * 混音器那边本来也没有可播的东西，清不清都一样；
+	 * 而如果只是这一块错位，清缓冲反而会多一次不必要的断音。
+	 *
+	 * @param pos 方块坐标
+	 */
+	public static void restartStream(BlockPos pos) {
+		if (pos == null) {
+			return;
+		}
+		Stream stream = STREAMS.remove(pos.asLong());
+		if (stream != null) {
+			try {
+				stream.close();
+			} catch (Throwable ignored) {
+				// 单个解码器关闭失败不应影响重建
+			}
+		}
+	}
+
+	/**
 	 * 某个方块的流是否<b>僵住了</b>：流对象还在，但超过 {@link #STALL_TIMEOUT_MILLIS} 没收到任何数据。
 	 *
 	 * <h2>它现在的唯一用途是<b>显示故障</b>，不再触发重订阅</h2>
