@@ -319,6 +319,11 @@ public final class ClientAudioPlayer {
 			}
 			stream.close();
 			STREAMS.remove(key);
+			// <b>先起调台噪、再清声卡</b>（用户反馈：换台时先有一小段数字静音）。
+			// 噪声由混音线程逐块生成，flush 只丢掉声卡里已排队的旧字节，
+			// 不会清掉噪声本身；顺序反了会让「旧音频断裂」与「噪声淡入」之间
+			// 多露出几毫秒数字 0。传入 pos 让噪声跟随【该方块自己的音量滑块】。
+			PcmSink.INSTANCE.playTuningNoise(pos);
 			// 清空声卡缓冲，否则上一台已解码的音频还会播完
 			PcmSink.INSTANCE.flush();
 			// 切台是底噪的明确终止点（用户要求：手动切台后停）。
@@ -326,11 +331,6 @@ public final class ClientAudioPlayer {
 			// 若新台也连不上，仍然要靠下面重新注册的锚点 + 混音器自己的欠载判定来响。
 			PcmSink.INSTANCE.clearNetworkNoise();
 			PcmSink.INSTANCE.setNetworkNoiseSource(pos);
-			// 用一段「调台噪」盖住这次跳变：flush 之后到新音频攒够抖动缓冲之间
-			// 必然有一个空窗，纯静音会让「啪」的断裂声非常明显。
-			// 注意要在 flush 之后触发，否则噪声自己也被清掉。
-			// 传入 pos 让噪声跟随【该方块自己的音量滑块】。
-			PcmSink.INSTANCE.playTuningNoise(pos);
 			// <b>标记「这是我们自己造成的空窗」</b>：见 PcmSink#beginTransitionSilence()。
 			//
 			// 上面的 flush() 把抖动缓冲清了，接下来几百毫秒没有任何音源供数——

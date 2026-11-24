@@ -127,10 +127,19 @@ public final class ClientRadioNetwork {
 		// 这个方法只写 volatile 时间戳与混音线程独占的计数器，可以在网络线程直接调。
 		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_AUDIO_SILENCE,
 				(Minecraft client, ClientPacketListener handler, FriendlyByteBuf buf, PacketSender sender) -> {
-					buf.readBlockPos();          // 方块坐标：目前不参与判定，读掉以免字节错位
+					net.minecraft.core.BlockPos pos = buf.readBlockPos();
 					buf.readUtf();               // 频道 id：同上，为日志对齐预留
 					buf.readVarInt();            // 曲目序号：换曲仍以数据块为准
 					int millis = buf.readVarInt();
+					// <b>调台噪提前到空窗的开头</b>（用户反馈：换台时先有一小段数字静音）。
+					//
+					// 服务端在换曲/命令切歌的空窗一开始就发本包，但客户端此前要等到
+					// 新曲目的第一块数据抵达（handleChunk）才触发调台噪——
+					// 这中间几百毫秒没有任何音源供数、噪声又还没起，输出就是纯数字 0，
+					// 听感是「先哑一下，再沙沙」。现在包一到就起噪，噪声抢在空窗
+					// 前面铺开，与换台回执（S2C_SELECT_ACK）的行为对齐。
+					// 400ms 去重窗保证预载期每 200ms 一包的重复触发不会反复重启噪声。
+					radiosmile.client.audio.PcmSink.INSTANCE.playTuningNoise(pos);
 					radiosmile.client.audio.PcmSink.INSTANCE.beginTransitionSilence(millis);
 				});
 
