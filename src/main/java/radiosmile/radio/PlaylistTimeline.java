@@ -8,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 
 import radiosmile.SmileSRadio;
 
@@ -58,6 +59,12 @@ public final class PlaylistTimeline {
 	/** 轮次缓存大小：只需覆盖「当前轮 + 前一轮」，多留两个以防并发/跳跃访问。 */
 	private static final int ROUND_CACHE_SIZE = 4;
 
+	/** 起点轮次的取值范围：够大且不会让后续加法溢出。 */
+	private static final int ROUND_OFFSET_MODULUS = 1_000_003;
+
+	/** 上一次构建选中的首曲，用于保证「重载后第一首一定换掉」。 */
+	private static volatile Path lastFirstTrack;
+
 	/** 曲池（去重后的实际推流文件，顺序由调用方的自然序/随机决定仅用于无随机时）。 */
 	private final List<Track> pool;
 	private final boolean random;
@@ -86,23 +93,50 @@ public final class PlaylistTimeline {
 		// 从哪轮开始都会播同一首，改了也没有区别）。
 		//
 		// <p>取值必须满足两点：
-		//   <li>同一进程内<b>稳定</b>——否则每次订阅都跳到不同的歌，播放会乱；</li>
-		//   <li>不同启动之间<b>分散</b>——否则"第一首"仍然总一样。</li>
+		//   <li>同一实例内<b>稳定</b>——否则每次订阅都跳到不同的歌，播放会乱；
+		//   <li>每次构建都<b>不同</b>——否则「刷新后第一首还是那首」。</li>
 		//
-		// <p>直接取 {@code now/3600000} 虽然每次都变，但相邻小时只差 1，
-		// 而 {@link #mixSeed} 对相邻轮次虽做了混淆，实测 12 次里仍只出现 4 种首曲
-		// （5 首池理论应有 5 种）。这里再乘一个大奇数散开，
-		// 让"相差 1 的启动时间"映射到"相差很远的轮次"。
-		this.roundOffset = random
-				? (int) Math.floorMod(
-						(System.currentTimeMillis() / 3_600_000L) * 2_654_435_761L, 1_000_003L)
-				: 0;
+		// <p>旧实现取 {@code now / 一小时} 再乘大奇数散开：它只能保证「不同小时」不同，
+		// <b>一小时之内连续 /radio reload 抽到的起点轮次完全相同</b>，
+		// 于是重载后顺序没变、第一首还是刚才那首——这正是玩家反馈的现象。
+		// 现在改为每次构建现抽一个，并校验首曲确实与上次不同（见 pickFreshRoundOffset）。
+		this.roundOffset = this.random ? pickFreshRoundOffset() : 0;
 		long total = 0L;
 		for (Track track : this.pool) {
 			// 防御：时长未知（<=0）时给最小正数，否则整轮时长会变成 0、除零卡死。
 			total += Math.max(1L, track.durationMillis());
 		}
 		this.roundTotalMillis = Math.max(1L, total);
+	}
+
+	/**
+	 * 选一个「首曲与上一次构建不同」的起点轮次。
+	 *
+	 * <p>只把轮次号换掉并不足以保证第一首变化：不同轮次仍可能抽出同一个第一首
+	 * （概率约 1/曲池大小，小曲池上很容易撞）。因此抽到候选后直接算出该轮
+	 * <b>实际播放顺序</b>（含跨轮冷却修正），比对首曲；相同就重抽，最多 32 次。
+	 *
+	 * <p>只关心「本次构建」与「上次构建」的差异：同一实例内的结果被固化下来，
+	 * 多个订阅共享同一份顺序，多人同步不受影响（时间轴只存在于服务端）。
+	 */
+	private int pickFreshRoundOffset() {
+		if (this.pool.size() <= 1) {
+			return ThreadLocalRandom.current().nextInt(ROUND_OFFSET_MODULUS);
+		}
+		int candidate = 0;
+		for (int attempt = 0; attempt < 32; attempt++) {
+			candidate = ThreadLocalRandom.current().nextInt(ROUND_OFFSET_MODULUS);
+			Path head = round(candidate).order().get(0).file();
+			synchronized (PlaylistTimeline.class) {
+				if (!head.equals(lastFirstTrack)) {
+					lastFirstTrack = head;
+					return candidate;
+				}
+			}
+		}
+		// 32 次都撞上（理论上只可能发生在曲池极小、且冷却把首曲锁死的情况下）：
+		// 接受这个候选，至少轮次换了，静音或抛异常都更糟。
+		return candidate;
 	}
 
 	/**

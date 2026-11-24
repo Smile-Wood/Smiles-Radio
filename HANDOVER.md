@@ -1352,6 +1352,13 @@ this.roundOffset = random
 **Companion fix**: `PlaylistTimeline.clearCache()`, called on config reload.
 The timeline instance bakes in `roundOffset`, so reusing the old instance would produce "reloaded but the first track is still that one".
 
+> **Follow-up fix (same day)**: the hour-based offset only has hour resolution, so two `/radio reload` commands
+> **inside the same hour** landed on the *same* starting round — the shuffle did not change and playback resumed
+> with what was already playing. `roundOffset` is now drawn per construction (`pickFreshRoundOffset`), and the
+> candidate is rejected unless its first track differs from the previous build's first track, so every reload
+> restarts a visibly different shuffled round. Sync is unaffected: the timeline still only exists on the server
+> and the offset is frozen into the instance.
+
 ##### Architecture question verified along the way
 
 The user asked "why does network radio feel like server-side redistribution rather than a direct client connection" — **the feeling is correct**,
