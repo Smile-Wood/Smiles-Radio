@@ -2,9 +2,9 @@
 
 **English** | [简体中文](HANDOVER.zh-CN.md)
 
-> Last updated: 2026-11-24 21:00 (**Round 20** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
+> Last updated: 2026-11-25 10:20 (**Round 21** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
 > Project path: `C:\Projects\Smile's Radio mod`
-> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **353 KB**, BUILD SUCCESSFUL)
+> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **355 KB**, BUILD SUCCESSFUL)
 > Version control: git initialised, **one commit per round of fixes**
 > User guide: the full documentation for server owners/players is in [README.md](README.md) (this file is the developer handover)
 
@@ -15,11 +15,12 @@
 | Learn what the project is and how to configure it | [README.md](README.md) |
 | Get up to speed on changing code quickly | Section 10 in this document (resuming work quickly) |
 | **Must read before touching code** | "7. Critical Pitfalls" + section 12 (reminders for the next session) |
-| Look up the historical root cause of a bug | Section 8 (Current State), ordered by round (**20 rounds, A to AD**; later is newer) |
+| Look up the historical root cause of a bug | Section 8 (Current State), ordered by round (**21 rounds, A to AE**; later is newer) |
 | Find where config lives, directory structure | Section 3 in this document, or the README |
 
 > ⚠️ **The easiest pitfall to fall into**: in this codebase **most serious bugs come from "one function/field carrying two meanings"**
-> (see the table in section 12; it has already happened **9 times**, and the ninth silently crushed the internet-radio volume to 25%).
+> (see the table in section 12; it has already happened **10 times**, and the tenth mistook "gain 1.0 (a legal
+> business value)" for "no gain (a cleanup signal)", wiping the local stations' `outputGain` to 100%).
 > Before changing any function, ask: **how many callers with different semantics does it have?**
 
 ---
@@ -188,7 +189,7 @@ Channels defined by `RadioNetworking`:
 | `s2c_audio_status` | BlockPos + statusCode |
 | `s2c_reloaded` | empty (config reload notice; client plays tuning noise + declares a transition silence window) |
 | `s2c_audio_silence` | BlockPos + stationId + trackIndex + millis (**empty-volume packet**: declares a track-change preload silence window, see AC) |
-| `s2c_output_gain` | BlockPos + gain (stream gain; **for internet radios it is sent along with the subscription OK reply**, section AD) |
+| `s2c_output_gain` | BlockPos + stationId + gain (**gain with channel ownership**, see AE; sent with the subscription OK reply for internet radios) |
 
 `AudioStatus`: 0=OK, 1=UNKNOWN_STATION, 2=NO_AUDIO, 3=TOO_FAR, 4=UNSUPPORTED, 5=STOPPED, 6=TIMEOUT (408, **determined locally by the client**; the server never announces it)
 
@@ -1497,15 +1498,66 @@ nearly 1.2s of silence after the program stops before the noise is in place.
 - In the last ~125ms before the buffer bottoms out (the absolute-thin line) the weak noise already starts seeping in;
   with the faster attack, the noise is already rising before the program has fully stopped
 
+#### AE. Round 21: stream-gain isolated by channel ownership (2026-11-25)
+
+##### The user's question and what the review found
+
+The user asked: "the local station's gain seems to pollute the internet station's gain". **After reviewing the whole
+chain, the direction was reversed — and the real problem was worse**: the local station's own `outputGain` was being
+**erased by the client**.
+
+The full evidence chain:
+1. The server's `pump()` sends the local gain `0.25` under a "send only on change" rule (`sub.noteSentGain(gain)`);
+2. The client stores it in `streamGains`;
+3. But the client called `setStreamGain(key, 1.0F)` on stream creation in `handleChunk`, on **every chunk** in
+   `handleUpstreamChunk`, and on teardown in `stopInternal`, intending to "clear the residual stream gain";
+4. Inside `setStreamGain`, `1.0` hits the "full gain needs no table entry" branch → the entry is `remove`d;
+5. The server's `lastSentGain` is already 0.25, so it concludes "unchanged" and never resends;
+6. Result: **the local station plays at 100% level for its whole lifetime — `outputGain` is entirely ineffective.**
+
+##### Root cause (the tenth "one value, two meanings")
+
+`1.0` was used simultaneously as a **legal business value** ("no attenuation") and as a **cleanup signal**
+("no gain record"). The two meanings are unrelated, so the cleanup action was equivalent to cancelling the attenuation.
+A second defect compounded it: the `S2C_OUTPUT_GAIN` payload was only `(BlockPos, float)` — **no stationId** — so the
+client had no way to tell which channel a gain packet belonged to and could only blind-write per block. That is the
+origin of every station-switch race.
+
+##### Fix
+
+| Layer | Change |
+|---|---|
+| Protocol | The `S2C_OUTPUT_GAIN` payload changed from `(BlockPos, float)` to `(BlockPos, stationId, float)`, carrying channel ownership |
+| Version compatibility | **No compatibility layer is needed**: mismatched client/server builds cannot be used together anyway (Fabric's channel registration and registry handshake reject the mismatched side), so the payload can be evolved directly without a legacy-format fallback |
+| Data structure | `PcmSink.streamGains` changed from `Map<Long, Float>` to `Map<Long, StreamGain>` (`record(stationId, gain)`) |
+| Validation | `streamGainFor(blockPos, stationId)` compares channels and returns `1.0` when the record belongs to a different channel (a late packet from the previous station is discarded automatically) |
+| Ownership | Added a `blockStations` map (each block's current channel), written by `ClientAudioPlayer` on stream creation / station switch |
+| Cleanup | **All `setStreamGain(key, 1.0F)` calls removed**; invalidation now happens via channel comparison. Added `clearStreamGain(key)` so "remove the record" and "gain is 1.0" are strictly separate operations |
+
+> ⚠️ **Never use `setStreamGain(key, 1.0F)` to mean "clean up"**. Call `clearStreamGain(key)` instead. This is the
+> central lesson of this round.
+
+> ⚠️ **Do not clear gain records in `handleChunk` / `stopInternal`**: the server's send order is "gain packet, then audio
+> chunk", so by the time those branches run the new station's gain packet has **already landed** — clearing the table
+> would wipe the gain that just arrived. Let the channel comparison invalidate the old record instead.
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 353 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 355 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (Round 21)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 21 (morning of 2026-11-25)**:
+- ⚠️ **Does the local stations' `outputGain` actually take effect** — the core fix of this round. Set
+  `outputGain` to 0.25 in `stations.json`; local stations should be audibly one tier quieter than internet stations;
+  setting it back to 1.0 should get louder immediately. Key check: listen to a local station for more than 10 seconds —
+  the attenuation must persist (the old build restored it to 100% as soon as the first chunk arrived).
+- ⚠️ **Is the local gain correct after a station switch** — internet → local, and local → local (different channels):
+  the new station must get its own gain and must not inherit the previous one's.
 
 **Round 21 (night of 2026-11-24)**:
 - ⚠️ **Is the internet-radio volume now consistently full** — after the Round 20 fix a race condition still let the
@@ -1653,11 +1705,14 @@ Client config: `maxBandwidthKbps=1024`, `maxChunkBytes=8192`, `bufferMillis=1000
 | Track list in `PlaylistTimeline` | "playable" vs "configured" | Untranscoded files enter the timeline → **the whole playlist's timing goes wrong** (Section V) |
 | `S2C_AUDIO_SILENCE` receiver | "declare silence to prevent misjudgment" vs "mask the track-change jump with noise" | The empty-volume packet falsely triggered tuning noise; reverted (section AC) |
 | Lifetime of `streamGains` entries | "the server keeps sending the gain with every chunk" vs "an internet station never gets another packet" | A local station's 0.25 residue silently crushed the internet-radio volume to 25% (section AD) |
-| Pump `server.execute` lambda timing | "subscription is still active when the lambda fires" vs "player may have switched away while the lambda was queued" | A stale 0.025 gain packet arrived after the subscription's 1.0, overwriting it — internet-radio volume stuck at `outputGain` even after the AD fix (section AD follow-up, Round 21) |
+| Pump `server.execute` lambda timing | "subscription is still active when the lambda fires" vs "player may have switched away while the lambda was queued" | A stale 0.025 gain packet arrived after the subscription's 1.0, overwriting it — internet-radio volume stuck at `outputGain` (section AD follow-up, Round 21) |
+| `1.0` in `streamGains` | "no attenuation (a legal business value)" vs "no gain record (a cleanup signal)" | The client wiped the local stations' `outputGain`, making the compression config entirely ineffective (section AE) |
 
-> The eighth and ninth both happened on 2026-11-24: the first made the level sit at "0.3 forever after 1.0" during
-> NOSIGNAL, the second silently crushed the internet-radio volume to 25% — both were corrected by a single sentence
-> from the user. **Read the code and confirm the lifetime before changing anything; never fix on a guess.**
+> The eighth through tenth all happened on 2026-11-24/25: the eighth made the level sit at "0.3 forever after 1.0"
+> during NOSIGNAL, the ninth silently crushed the internet-radio volume to 25%, and the tenth conversely wiped the
+> local stations' `outputGain` to 100% — each corrected by a single sentence from the user. **Read the code and confirm
+> the lifetime before changing anything; never fix on a guess** — and be especially wary of "using a legal business
+> value as a cleanup signal".
 
 **Before changing anything, ask: how many places with different meanings call this function?**
 If the answer is not 1, split the entry point first, rather than adding conditionals inside the function.

@@ -1280,7 +1280,7 @@ public final class PcmSink {
 	/**
 	 * 一条推流增益记录：数值 + 它所属的频道。
 	 *
-	 * @param stationId 服务端下发这条增益时的频道 id；{@code ""} 表示不限（兼容路径）
+	 * @param stationId 服务端下发这条增益时的频道 id
 	 * @param gain      0.00~1.00
 	 */
 	private record StreamGain(String stationId, float gain) {
@@ -1290,11 +1290,13 @@ public final class PcmSink {
 	 * 由网络线程写入：某个音源当前的推流增益。
 	 *
 	 * @param blockPos  方块坐标（音源键）
-	 * @param stationId 该增益所属的频道 id；空串表示"不限频道"（当前无此调用点）
+	 * @param stationId 该增益所属的频道 id
 	 * @param gain      0.00~1.00；满增益不留表项（等价于不衰减）
 	 */
 	public void setStreamGain(long blockPos, String stationId, float gain) {
 		float clamped = Math.max(0.0F, Math.min(1.0F, gain));
+		// 空串只出现在「服务端无法判定归属」的异常数据上；此时退化为按方块生效，
+		// 是刻意选择的最弱行为（宁可多乘一次，也不要让增益凭空消失）。
 		String owner = stationId == null ? "" : stationId;
 		StreamGain old = this.streamGains.get(blockPos);
 		// 每块音频都会调一次：值没变就不要反复覆盖，省掉无谓的 map 写

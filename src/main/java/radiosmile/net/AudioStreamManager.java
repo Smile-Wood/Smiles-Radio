@@ -814,33 +814,21 @@ public final class AudioStreamManager {
 		if (target == null || target.hasDisconnected()) {
 			return;
 		}
-		// <b>新通道：带 stationId</b>。增益是「某一台节目的电平系数」，
-		// 不是方块的固有属性——客户端据此判断该包是否仍适用于当前频道，
-		// 换台后迟到的旧台增益会被自动作废。
-		//
-		// 早期载荷只有 (坐标, 增益)，客户端只能按方块盲写，于是换台竞态
-		// 无法在客户端判别（泵线程的 server.execute 闭包可能在新台订阅之后
-		// 才被执行，旧台的 0.25 会覆盖新台的 1.0）。当时的补救是客户端
-		// 「每块重置为 1.0」，但那是拿「满增益」当清理信号——1.0 是合法业务值，
-		// 结果把本地台自己的 outputGain 也抹掉了，压缩配置完全失效。
-		if (ServerPlayNetworking.canSend(target, RadioNetworking.S2C_OUTPUT_GAIN_V2)) {
-			FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
-			buf.writeBlockPos(pos);
-			buf.writeUtf(stationId == null ? "" : stationId);
-			buf.writeFloat(gain);
-			ServerPlayNetworking.send(target, RadioNetworking.S2C_OUTPUT_GAIN_V2, buf);
-			return;
-		}
-		// <b>旧通道（仅 BlockPos + float）</b>：只发给不认识 V2 的客户端。
-		//
-		// 不能直接改 V1 的载荷格式——旧客户端会按旧布局解析，读到的是
-		// UTF 长度前缀而不是增益，行为完全错乱。新增通道 + 逐个降级
-		// 是唯一安全的演进方式。
 		if (!ServerPlayNetworking.canSend(target, RadioNetworking.S2C_OUTPUT_GAIN)) {
 			return;
 		}
+		// 载荷带 stationId：增益是「某一台节目的电平系数」，不是方块的固有属性。
+		//
+		// 早期载荷只有 (坐标, 增益)，客户端只能按方块盲写，换台时旧台滞后的
+		// 增益包会覆盖新台的值。当时的补救是客户端「每块重置为 1.0」，
+		// 但那是拿「满增益」当清理信号——1.0 是合法业务值，结果把本地台
+		// 自己的 outputGain 也抹掉了，压缩配置完全失效。
+		//
+		// 客户端与服务端必须同版本（Fabric 握手会挡掉混用），所以这里
+		// 直接演进载荷格式，不需要保留旧布局的降级分支。
 		FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
 		buf.writeBlockPos(pos);
+		buf.writeUtf(stationId == null ? "" : stationId);
 		buf.writeFloat(gain);
 		ServerPlayNetworking.send(target, RadioNetworking.S2C_OUTPUT_GAIN, buf);
 	}
