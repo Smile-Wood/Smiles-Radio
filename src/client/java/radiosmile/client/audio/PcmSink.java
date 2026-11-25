@@ -79,6 +79,16 @@ public final class PcmSink {
 	private final Map<Long, Float> blockVolumes = new ConcurrentHashMap<>();
 	/** 各收音机方块的世界坐标，用于距离衰减。 */
 	private final Map<Long, net.minecraft.core.BlockPos> blockPositions = new ConcurrentHashMap<>();
+	/**
+	 * 各收音机方块<b>当前</b>正在播放的频道 id。
+	 *
+	 * <p>存在的唯一理由是给推流增益做归属校验：增益包带的是「发送时的频道」，
+	 * 混音时必须拿它和方块此刻的真实频道比对，否则换台后迟到的旧台增益
+	 * 会被套到新台上（见 {@link #streamGainFor}）。
+	 *
+	 * <p>由 {@code ClientAudioPlayer} 在建流时写入，停流时清除。
+	 */
+	private final Map<Long, String> blockStations = new ConcurrentHashMap<>();
 	private volatile float blockVolume = 1.0F;
 	/** 原版 BLOCKS 声道音量（主线程更新）。 */
 	private volatile float vanillaBlocksVolume = 1.0F;
@@ -317,6 +327,20 @@ public final class PcmSink {
 			if (this.listenerValid) {
 				this.rebuildSpatialCache();
 			}
+		}
+	}
+
+	/**
+	 * 记录某个方块当前播放的频道 id（推流增益的归属校验用）。
+	 *
+	 * @param blockPos  音源键
+	 * @param stationId 此刻正在播放的频道；{@code null} / 空串表示清除
+	 */
+	public void setBlockStation(long blockPos, String stationId) {
+		if (stationId == null || stationId.isEmpty()) {
+			this.blockStations.remove(blockPos);
+		} else {
+			this.blockStations.put(blockPos, stationId);
 		}
 	}
 
@@ -878,6 +902,8 @@ public final class PcmSink {
 		this.blockVolumes.clear();
 		// 推流增益是随订阅下发的：换世界 / 重连后必须丢掉，否则会拿旧值播新流
 		this.streamGains.clear();
+		// 频道归属同理——新世界里的方块坐标可能复用，残留的频道会让增益校验失效
+		this.blockStations.clear();
 		// 两个效果音都要复位，否则下次进入世界会莫名响一下
 		this.tuningNoise.reset();
 		this.networkNoise.reset();
@@ -1224,11 +1250,11 @@ public final class PcmSink {
 				* this.vanillaBlocksVolume
 				* this.vanillaMasterVolume
 				* distGain
-				* this.streamGainFor(blockPos);
+				* this.streamGainFor(blockPos, this.blockStations.get(blockPos));
 	}
 
 	/**
-	 * 每个音源的<b>推流增益</b>（0.00~1.00），由服务端随音频块下发。
+	 * 每个音源的<b>推流增益</b>及其<b>所属频道</b>，由服务端随增益包下发。
 	 *
 	 * <h2>为什么需要它</h2>
 	 * 本地曲目是"给游戏内直接播放"处理过的成品，母带电平高（实测平均
@@ -1236,34 +1262,83 @@ public final class PcmSink {
 	 * 电平低一档。不压本地，本地那一路就会盖过网络电台，而且已经满刻度，
 	 * 一叠上底噪层就削波。
 	 *
-	 * <h2>为什么放在这里，而不是烤进缓存</h2>
-	 * 它是<b>运行时参数</b>：服务端每包按当前配置给一次，
-	 * 玩家改完 {@code outputGain} 下一个包就生效，不用重新预热。
-	 * 而方块音量 / 原版音量是<b>本地参数</b>，必须继续在本机乘——
-	 * 这条乘法链就是"所有影响响度的量都在同一处"的约定（见 {@link #sourceGain}）。
+	 * <h2>为什么带 stationId（本轮修复）</h2>
+	 * 增益是「某一台节目的电平系数」，<b>不是方块的固有属性</b>。
+	 * 早期这张表只按方块坐标存一个 float，客户端无法判断收到的增益包
+	 * 属于哪个频道，只能盲写；换台时旧台滞后的增益包会覆盖新台的值
+	 * （AD 节「网络台只有 2.5%」的竞态窗口）。
+	 *
+	 * <p>当时的补救是「建流/每块把增益重置为 1.0」，但那是拿<b>满增益当清理信号</b>
+	 * ——1.0 本身是合法业务值，于是本地台自己的 outputGain（如 0.25）
+	 * 也被一并抹掉，压缩配置形同虚设（本地台实际按 100% 电平播放）。
+	 *
+	 * <p>现在改成携带频道：写入时校验频道、混音时也校验频道，
+	 * 频道不匹配（换台后的迟到包）直接视为无效，不再需要任何"重置"动作。
 	 */
-	private final Map<Long, Float> streamGains = new ConcurrentHashMap<>();
+	private final Map<Long, StreamGain> streamGains = new ConcurrentHashMap<>();
 
-	/** 由网络线程写入：某个音源当前的推流增益。 */
-	public void setStreamGain(long blockPos, float gain) {
+	/**
+	 * 一条推流增益记录：数值 + 它所属的频道。
+	 *
+	 * @param stationId 服务端下发这条增益时的频道 id；{@code ""} 表示不限（兼容路径）
+	 * @param gain      0.00~1.00
+	 */
+	private record StreamGain(String stationId, float gain) {
+	}
+
+	/**
+	 * 由网络线程写入：某个音源当前的推流增益。
+	 *
+	 * @param blockPos  方块坐标（音源键）
+	 * @param stationId 该增益所属的频道 id；空串表示"不限频道"（当前无此调用点）
+	 * @param gain      0.00~1.00；满增益不留表项（等价于不衰减）
+	 */
+	public void setStreamGain(long blockPos, String stationId, float gain) {
 		float clamped = Math.max(0.0F, Math.min(1.0F, gain));
-		Float old = this.streamGains.get(blockPos);
+		String owner = stationId == null ? "" : stationId;
+		StreamGain old = this.streamGains.get(blockPos);
 		// 每块音频都会调一次：值没变就不要反复覆盖，省掉无谓的 map 写
-		if (old != null && Math.abs(old - clamped) < 0.0005F) {
+		if (old != null && Math.abs(old.gain() - clamped) < 0.0005F
+				&& old.stationId().equals(owner)) {
 			return;
 		}
 		if (clamped >= 0.9995F) {
-			// 满增益是绝大多数网络电台的情况，不必留表项
+			// 满增益不衰减，不必留表项
 			this.streamGains.remove(blockPos);
 			return;
 		}
-		this.streamGains.put(blockPos, clamped);
+		this.streamGains.put(blockPos, new StreamGain(owner, clamped));
 	}
 
-	/** 取某个音源的推流增益；没下发过按 1.0（不衰减）。 */
-	private float streamGainFor(long blockPos) {
-		Float own = this.streamGains.get(blockPos);
-		return own != null ? own : 1.0F;
+	/**
+	 * 作废某个音源的推流增益记录（换台 / 停流 / 来源被判定不可解时调用）。
+	 *
+	 * <p><b>这是唯一的"清理"入口，且只能显式调用</b>：
+	 * 早期用 {@code setStreamGain(key, 1.0)} 来清理，等于把「不衰减」
+	 * 当成"没有增益"的同义词，结果把服务端下发的合法 0.25 也清掉了。
+	 * 语义上「移除记录」与「增益为 1.0」是两件事，必须分开表达。
+	 */
+	public void clearStreamGain(long blockPos) {
+		this.streamGains.remove(blockPos);
+	}
+
+	/**
+	 * 取某个音源的推流增益。
+	 *
+	 * @param blockPos  音源键
+	 * @param stationId 该方块<b>当前</b>正在播放的频道 id；{@code null} 表示未知（不做校验）
+	 * @return 0.00~1.00；无记录、或记录属于别的频道（迟到的旧台增益）都返回 1.0
+	 */
+	private float streamGainFor(long blockPos, String stationId) {
+		StreamGain own = this.streamGains.get(blockPos);
+		if (own == null) {
+			return 1.0F;
+		}
+		// 频道不匹配 = 这是换台前那一台的增益，绝不能套到新台上
+		if (stationId != null && !own.stationId().isEmpty() && !own.stationId().equals(stationId)) {
+			return 1.0F;
+		}
+		return own.gain();
 	}
 
 	/**

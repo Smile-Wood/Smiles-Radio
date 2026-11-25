@@ -134,7 +134,7 @@ public final class AudioStreamManager {
 				sendStatus(player, pos, AudioStatus.OK);
 				// 增益随订阅回复一起下发（幂等路径同样发）：客户端若因换台残留了
 				// 旧台的推流增益，这次重订阅就是清掉它的权威时机。
-				writeOutputGain(player, pos, STREAM_GAIN);
+				writeOutputGain(player, pos, stationId, STREAM_GAIN);
 				return null;
 			}
 			long count = SUBSCRIPTIONS.values().stream()
@@ -160,7 +160,7 @@ public final class AudioStreamManager {
 			// 没有任何包来覆盖它，整路就会被永久压到 25%——这正是
 			// 「网络电台声音小」的根因。订阅时下发 = 权威覆盖，客户端侧的
 			// 建流/停流兜底清理退居第二道防线。
-			writeOutputGain(player, pos, STREAM_GAIN);
+			writeOutputGain(player, pos, stationId, STREAM_GAIN);
 			SmileSRadio.LOGGER.info("网络电台订阅登记 {} @{}（客户端自行拉流）", stationId, pos);
 			return null;
 		}
@@ -704,9 +704,18 @@ public final class AudioStreamManager {
 				}
 				// 推流增益变了就补一包：同一块里先发增益、再发音频，
 				// 客户端拿到的电平顺序才和波形一致。没变时只是一个浮点比较。
-				float gain = outputGainFor(sub);
-				if (sub.noteSentGain(gain)) {
-					writeOutputGain(target, targetPos, gain);
+				//
+				// <b>竞态保护</b>：泵线程把本 execute 入队后、主线程执行它之前，
+				// 玩家可能已经换台（unsubscribe → 新台 subscribe → 发 1.0 增益包）。
+				// 若此时仍无条件发旧台的 0.025，会在 1.0 之后到达客户端，
+				// 把网络台增益表项重新写成 0.025——这正是「网络台声音只有 2.5%」的根因
+				// （AD 修复的第一道防线只防静态残留，未防住泵闭包的异步滞后）。
+				// 判据：订阅对象还在 SUBSCRIPTIONS 表里就说明它仍然有效。
+				if (SUBSCRIPTIONS.containsValue(sub)) {
+					float gain = outputGainFor(sub);
+					if (sub.noteSentGain(gain)) {
+						writeOutputGain(target, targetPos, stationId, gain);
+					}
 				}
 				FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
 				buf.writeBlockPos(targetPos);
@@ -801,10 +810,32 @@ public final class AudioStreamManager {
 	 * <p>也正因为独立成包，改配置后不需要重新预热缓存：
 	 * 下一块音频前发现值变了就补发一包，客户端立刻按新增益混音。
 	 */
-	private static void writeOutputGain(ServerPlayer target, BlockPos pos, float gain) {
+	private static void writeOutputGain(ServerPlayer target, BlockPos pos, String stationId, float gain) {
 		if (target == null || target.hasDisconnected()) {
 			return;
 		}
+		// <b>新通道：带 stationId</b>。增益是「某一台节目的电平系数」，
+		// 不是方块的固有属性——客户端据此判断该包是否仍适用于当前频道，
+		// 换台后迟到的旧台增益会被自动作废。
+		//
+		// 早期载荷只有 (坐标, 增益)，客户端只能按方块盲写，于是换台竞态
+		// 无法在客户端判别（泵线程的 server.execute 闭包可能在新台订阅之后
+		// 才被执行，旧台的 0.25 会覆盖新台的 1.0）。当时的补救是客户端
+		// 「每块重置为 1.0」，但那是拿「满增益」当清理信号——1.0 是合法业务值，
+		// 结果把本地台自己的 outputGain 也抹掉了，压缩配置完全失效。
+		if (ServerPlayNetworking.canSend(target, RadioNetworking.S2C_OUTPUT_GAIN_V2)) {
+			FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
+			buf.writeBlockPos(pos);
+			buf.writeUtf(stationId == null ? "" : stationId);
+			buf.writeFloat(gain);
+			ServerPlayNetworking.send(target, RadioNetworking.S2C_OUTPUT_GAIN_V2, buf);
+			return;
+		}
+		// <b>旧通道（仅 BlockPos + float）</b>：只发给不认识 V2 的客户端。
+		//
+		// 不能直接改 V1 的载荷格式——旧客户端会按旧布局解析，读到的是
+		// UTF 长度前缀而不是增益，行为完全错乱。新增通道 + 逐个降级
+		// 是唯一安全的演进方式。
 		if (!ServerPlayNetworking.canSend(target, RadioNetworking.S2C_OUTPUT_GAIN)) {
 			return;
 		}

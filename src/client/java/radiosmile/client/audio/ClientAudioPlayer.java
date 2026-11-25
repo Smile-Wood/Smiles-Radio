@@ -319,6 +319,19 @@ public final class ClientAudioPlayer {
 			}
 			stream.close();
 			STREAMS.remove(key);
+			// <b>只登记新频道，绝不在这里清增益记录</b>。
+			//
+			// 服务端的发包顺序是「增益包 → 音频块」，所以走到这里时
+			// <b>新台的增益包早已落地</b>；此时若清表，抹掉的正是刚收到的
+			// 新台增益（本地台从此按 100% 电平播放）。
+			//
+			// 旧台的残留记录由<b>频道校验</b>负责失效：混音时拿记录里的
+			// stationId 与这里登记的新频道比对，不匹配就返回 1.0。
+			// 这样既不会误伤新台，也不需要任何"重置为 1.0"的动作。
+			// 换台：登记新频道；换曲/重连：频道没变，保持原登记不动。
+			if (stationChanged) {
+				PcmSink.INSTANCE.setBlockStation(key, stationId);
+			}
 			// <b>先起调台噪、再清声卡</b>（用户反馈：换台时先有一小段数字静音）。
 			// 噪声由混音线程逐块生成，flush 只丢掉声卡里已排队的旧字节，
 			// 不会清掉噪声本身；顺序反了会让「旧音频断裂」与「噪声淡入」之间
@@ -347,15 +360,17 @@ public final class ClientAudioPlayer {
 		if (stream == null) {
 			// 收到数据本身就是"玩家想要这个台"的强证据（订阅请求可能来自别的路径）。
 			noteStreamRequested(pos);
-			// <b>清掉这个方块可能残留的推流增益</b>。
+			// <b>登记本方块此刻播放的频道</b>：推流增益的归属校验靠它。
 			//
-			// 同一个方块之前放过本地电台时，服务端下发过 outputGain（如 0.25），
-			// 客户端把它记在 streamGains 里；换成网络电台后服务端不再发任何
-			// 增益包（网络电台不走推流），残留值就永远清不掉——整路音频被
-			// 压在 25%，系统音量、收音机音量开到最大也救不回来。
-			// 传 1.0 会让 PcmSink 直接移除表项（满增益不留表）。
-			// 本地电台随后会被服务端的新增益包覆盖，行为不变。
-			PcmSink.INSTANCE.setStreamGain(key, 1.0F);
+			// <b>这里绝不动增益表</b>。早期这里调 {@code setStreamGain(key, 1.0F)}
+			// 想"清掉残留的推流增益"，但服务端下发增益与推送音频是<b>先后两个包</b>：
+			// 增益包先到（写进 0.25），紧接着第一块音频到达时走的就是这个分支，
+			// 于是刚写进去的 0.25 被立刻抹成 1.0；而服务端记着「0.25 已发过」
+			// 不会再发，本地台整场按 100% 电平播放，outputGain 完全失效。
+			//
+			// 换台时不清增益记录（新台的增益包可能已先到），只登记新频道；
+			// 首次建流时登记的就是当前频道。两种情况增益表都保持原样。
+			PcmSink.INSTANCE.setBlockStation(key, stationId);
 			stream = new Stream();
 			stream.trackIndex = trackIndex;
 			stream.sessionId = sessionId;
@@ -629,9 +644,15 @@ public final class ClientAudioPlayer {
 		// 只移除本音源的数据，不能把别的收音机一起静掉
 		PcmSink.INSTANCE.removeSource(pos.asLong());
 		PcmSink.INSTANCE.clearVolumeFor(pos.asLong());
-		// 推流增益一并清掉：下一次在这个方块换台时不能继承旧值
-		//（本地台 0.25 残留会把之后的网络台整路压到 25%，见 handleChunk 说明）。
-		PcmSink.INSTANCE.setStreamGain(pos.asLong(), 1.0F);
+		// <b>不在这里清增益记录</b>：停流可能发生在新频道的增益包<b>已经到达</b>
+		// 之后（换台 = ACK 淡出 + 重订阅，服务端的增益包可能先于新音频块落地），
+		// 这时清掉会把新台的 0.25 一起抹了。
+		//
+		// 正确做法是只注销「这个方块当前播放的频道」，让增益的<b>频道校验</b>去失效
+		// 旧台记录：下次建流登记新频道后，旧台的增益因归属不匹配自动返回 1.0。
+		// 记录本身留在表里无害（方块没有音源时 sourceGain 不会被调用），
+		// 且会被后续同名频道的增益包覆盖。
+		PcmSink.INSTANCE.setBlockStation(pos.asLong(), null);
 		// 立刻停止，不留任何余音：
 		// 用户明确要求「空选列表后按下就立刻停止播放」，
 		// 那点断电氛围远不如「按了没停」来得困扰。
@@ -1023,13 +1044,20 @@ public final class ClientAudioPlayer {
 			PcmSink.INSTANCE.setNetworkNoiseSource(pos);
 			stream = null;
 		}
+		// <b>登记频道 + 作废旧增益</b>（不再每块重置为 1.0）。
+		//
+		// 早期这里是「每块都 setStreamGain(key, 1.0F)」，目的是压制一种竞态：
+		// 泵线程的 server.execute 闭包可能在换台后才执行，旧台的 0.025 增益包
+		// 会排在新台的 1.0 之后到达，把网络台的增益表项写回 0.025。
+		//
+		// 但那等于拿「满增益」当清理信号。现在协议里增益包带了 stationId，
+		// 混音时会校验频道归属，迟到的旧台增益<b>自动失效</b>，
+		// 不需要也不应该再由客户端改写增益值——否则本地台的 outputGain
+		// 同样会被这块逻辑抹掉。
+		PcmSink.INSTANCE.setBlockStation(key, stationId);
 		if (stream == null) {
 			// 收到数据本身就是"玩家想要这个台"的强证据
 			noteStreamRequested(pos);
-			// 清掉本地电台可能残留的推流增益（见 handleChunk 内同名说明）：
-			// 方块从本地台换成网络台后，服务端不再发增益包，0.25 残留会把
-			// 网络流整路压到 25%——正是「网络电台声音小」的根因。
-			PcmSink.INSTANCE.setStreamGain(key, 1.0F);
 			// 网络直播流从连上那一刻起播，没有"跳过历史"的概念；
 			// 清掉本地电台握手可能残留的 skip 时长，避免开头被误丢。
 			setPendingMetadata(0L);

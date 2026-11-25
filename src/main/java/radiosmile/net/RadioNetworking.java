@@ -85,13 +85,34 @@ public final class RadioNetworking {
 	public static final ResourceLocation S2C_AUDIO_SILENCE = SmileSRadio.id("s2c_audio_silence");
 
 	/**
-	 * 服务端 -> 客户端：本地曲目的推流增益（0.00~1.00）。
+	 * 服务端 -> 客户端：本地曲目的推流增益（0.00~1.00），<b>旧版载荷</b>。
 	 *
 	 * <p>载荷只有 {@code BlockPos + float}：客户端把它乘进该音源的混音增益。
 	 * 独立成通道而不是塞进音频块，是为了让不认识它的旧客户端直接跳过
 	 * （{@code canSend} 为 false），而不是把字段读错导致整条字节流错位。
+	 *
+	 * <p><b>已由 {@link #S2C_OUTPUT_GAIN_V2} 取代</b>，仅为兼容仍在线上的旧客户端保留。
+	 * 新客户端只注册 V2，服务端发现对端认识 V2 就只发 V2。
 	 */
 	public static final ResourceLocation S2C_OUTPUT_GAIN = SmileSRadio.id("s2c_output_gain");
+
+	/**
+	 * 服务端 -> 客户端：推流增益，<b>带频道归属</b>（{@code BlockPos + String + float}）。
+	 *
+	 * <h2>为什么要新开通道而不是改旧载荷</h2>
+	 * 旧载荷只有坐标和增益，客户端无从判断这个增益属于哪个频道，只能按方块盲写。
+	 * 换台时旧台滞后的增益包会覆盖新台的值；当时的补救是客户端「把增益重置为 1.0」，
+	 * 但 1.0 本身是合法业务值（不衰减），于是本地台自己的 {@code outputGain}
+	 * 也被一并抹掉，压缩配置失效。
+	 *
+	 * <p>带上 stationId 后语义唯一：客户端只在「包里的台 == 方块当前播放的台」
+	 * 时应用，过期的旧台增益自动丢弃，不再需要任何"重置"动作。
+	 *
+	 * <p><b>不能直接改 V1 的载荷</b>——旧客户端会按旧布局解析，
+	 * 把 UTF 长度前缀当成增益，行为错乱。新增通道 + {@code canSend} 逐个降级
+	 * 是唯一安全的协议演进方式。
+	 */
+	public static final ResourceLocation S2C_OUTPUT_GAIN_V2 = SmileSRadio.id("s2c_output_gain_v2");
 
 	private RadioNetworking() {
 	}

@@ -1460,6 +1460,21 @@ Fix (two layers):
 - Client-side backstop: on stream creation in `handleChunk`/`handleUpstreamChunk` and on teardown in `stopInternal`,
   call `setStreamGain(key, 1.0)` to clear the residue (full gain triggers removal)
 
+> **Follow-up fix (same session, Round 21)**: the two layers above cover the _static_ residue case, but a **race
+> condition** made internet-radio volume still land at `outputGain` (e.g. 0.025) even after the fix.
+> Root cause: the pump thread queues a `server.execute(λ)` that includes `writeOutputGain(0.025)`; between the
+> moment it is queued and the moment the main thread executes it, the player switches to an internet station and the
+> server sends `S2C_OUTPUT_GAIN(1.0)`; the queued λ then fires _after_ the 1.0, overwriting the client's gain map
+> entry back to 0.025 — permanently, because the internet-radio path never sends another gain packet.
+>
+> Two-pronged fix (Round 21):
+> - **Server**: inside the pump's `server.execute` lambda, skip `writeOutputGain` when the subscription is no longer
+>   in `SUBSCRIPTIONS` (i.e. the player has already switched away). Guard: `if (SUBSCRIPTIONS.containsValue(sub))`
+>   wraps the gain-send block.
+> - **Client**: in `handleUpstreamChunk`, move `setStreamGain(key, 1.0F)` **outside** the `if (stream == null)`
+>   block so it fires on _every_ upstream chunk, not just the first. Any stale 0.025 packet that arrives after the
+>   first chunk is overwritten on the next chunk. For internet stations the gain is always 1.0, so this is idempotent.
+
 ##### 2. Tuning noise finalised (user measurements: "the noise only starts after the sound is gone", "peak loudness too low", "the fade-in is still too late")
 
 | Item | Change |
@@ -1486,11 +1501,18 @@ nearly 1.2s of silence after the program stops before the noise is in place.
 
 - **`build/libs/radio-smile-1.0.0.jar`, about 353 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (`7a6aa98`)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (Round 21)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 21 (night of 2026-11-24)**:
+- ⚠️ **Is the internet-radio volume now consistently full** — after the Round 20 fix a race condition still let the
+  pump's stale 0.025 packet arrive after the subscription's 1.0, leaving the network station permanently quiet.
+  The Round 21 fix adds a validity check in the pump lambda (server-side) and resets the gain on every upstream
+  chunk (client-side). Test: switch local → internet → local → internet several times quickly; internet volume
+  should always be at full gain, not quietly stuck at `outputGain`.
 
 **Round 20 (evening of 2026-11-24)**:
 - ⚠️ **Is the internet-radio volume back to full** — it used to be crushed to 25% by a residual 0.25 stream gain;
@@ -1631,6 +1653,7 @@ Client config: `maxBandwidthKbps=1024`, `maxChunkBytes=8192`, `bufferMillis=1000
 | Track list in `PlaylistTimeline` | "playable" vs "configured" | Untranscoded files enter the timeline → **the whole playlist's timing goes wrong** (Section V) |
 | `S2C_AUDIO_SILENCE` receiver | "declare silence to prevent misjudgment" vs "mask the track-change jump with noise" | The empty-volume packet falsely triggered tuning noise; reverted (section AC) |
 | Lifetime of `streamGains` entries | "the server keeps sending the gain with every chunk" vs "an internet station never gets another packet" | A local station's 0.25 residue silently crushed the internet-radio volume to 25% (section AD) |
+| Pump `server.execute` lambda timing | "subscription is still active when the lambda fires" vs "player may have switched away while the lambda was queued" | A stale 0.025 gain packet arrived after the subscription's 1.0, overwriting it — internet-radio volume stuck at `outputGain` even after the AD fix (section AD follow-up, Round 21) |
 
 > The eighth and ninth both happened on 2026-11-24: the first made the level sit at "0.3 forever after 1.0" during
 > NOSIGNAL, the second silently crushed the internet-radio volume to 25% — both were corrected by a single sentence

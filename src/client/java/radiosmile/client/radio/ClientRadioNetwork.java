@@ -109,12 +109,37 @@ public final class ClientRadioNetwork {
 		// <b>由服务端主动下发、值变才发</b>，所以改配置不需要重新预热缓存。
 		// 这条通道是新开的：旧客户端没注册它，服务端 canSend 为 false 会直接跳过，
 		// 不会污染音频字节流。
+		//
+		// <b>载荷带 stationId</b>（本轮新增）：增益属于「某一台节目」，不是方块的
+		// 固有属性。客户端据此判断该增益包是否仍然适用于当前播放的频道——
+		// 换台时旧台滞后的增益包会被自动作废，不再需要「把增益重置为 1.0」
+		// 那种把业务值当清理信号的危险手段（见 PcmSink#setStreamGain）。
 		// 不 hop 主线程：只写一个并发 map，值必须在本块混音前就位。
+		//
+		// <b>V2（带 stationId）</b>：增益属于「某一台节目」，不是方块的固有属性。
+		// 客户端据此判断该增益包是否仍适用于当前播放的频道——换台时旧台滞后的
+		// 增益包会被自动作废，不再需要「把增益重置为 1.0」那种把业务值当清理
+		// 信号的危险手段（见 PcmSink#setStreamGain）。
+		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_OUTPUT_GAIN_V2,
+				(Minecraft client, ClientPacketListener handler, FriendlyByteBuf buf, PacketSender sender) -> {
+					net.minecraft.core.BlockPos pos = buf.readBlockPos();
+					String stationId = buf.readUtf();
+					float gain = buf.readFloat();
+					radiosmile.client.audio.PcmSink.INSTANCE
+							.setStreamGain(pos.asLong(), stationId, gain);
+				});
+
+		// <b>V1（旧载荷，仅 BlockPos + float）</b>：只为兼容旧服务端保留。
+		//
+		// 旧服务端只会发 V1，所以必须继续认识它，否则连上旧服时增益通道失效
+		// （本地台与网络台响度对不齐）。空串表示「不限频道」，
+		// {@code streamGainFor} 对空串不做频道校验——这正是旧协议的能力边界：
+		// 它本来就无法表达归属，只能退回按方块生效的老行为。
 		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_OUTPUT_GAIN,
 				(Minecraft client, ClientPacketListener handler, FriendlyByteBuf buf, PacketSender sender) -> {
 					net.minecraft.core.BlockPos pos = buf.readBlockPos();
 					float gain = buf.readFloat();
-					radiosmile.client.audio.PcmSink.INSTANCE.setStreamGain(pos.asLong(), gain);
+					radiosmile.client.audio.PcmSink.INSTANCE.setStreamGain(pos.asLong(), "", gain);
 				});
 
 		// 「空音量包」：服务端声明「接下来这段是换曲预载/重载，请输出数字静音」。
