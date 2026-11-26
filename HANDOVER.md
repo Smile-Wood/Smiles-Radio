@@ -2,7 +2,7 @@
 
 **English** | [简体中文](HANDOVER.zh-CN.md)
 
-> Last updated: 2026-11-25 10:20 (**Round 21** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
+> Last updated: 2026-11-26 20:35 (**Round 22** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
 > Project path: `C:\Projects\Smile's Radio mod`
 > Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **355 KB**, BUILD SUCCESSFUL)
 > Version control: git initialised, **one commit per round of fixes**
@@ -1541,6 +1541,71 @@ origin of every station-switch race.
 > chunk", so by the time those branches run the new station's gain packet has **already landed** — clearing the table
 > would wipe the gain that just arrived. Let the channel comparison invalidate the old record instead.
 
+#### AF. Round 22: calibrating `outputGain` against a measured reference (2026-11-26)
+
+##### What the user asked
+
+Two pieces of material: a 34 s gameplay recording from *Arknights: Endfield* and a 254 s 320 kbps MP3.
+The request: "make the radio at 100% sound like the BGM in this video", explicitly **by comparing spectra**.
+
+##### Measurement method (reproducible)
+
+1. Decode both to 48 kHz / stereo / s16le PCM;
+2. Split into 8 bands with ffmpeg `highpass + lowpass` (poles=2):
+   60-120 / 120-250 / 250-500 / 500-1k / 1k-2k / 2k-4k / 4k-8k / 8k-16k Hz;
+3. Compute 100 ms frame RMS (dB) per band; on the video side take the median of the
+   **lowest 25% of frames by overall level** — those have the least SFX, approximating "BGM only";
+4. Take the whole-file median per band on the source side, then subtract band by band.
+
+**Important**: high bands must not be downsampled to 8 kHz — aliasing pollutes the 4k-8k / 8k-16k bands.
+The first pass hit exactly that, and the 8k-16k delta came out artificially high (-14.8 dB).
+
+##### Results
+
+| Band | 60-120 | 120-250 | 250-500 | 500-1k | 1k-2k | 2k-4k | 4k-8k | 8k-16k |
+|---|---|---|---|---|---|---|---|---|
+| source dBFS | -19.4 | -20.1 | -19.5 | -19.8 | -22.2 | -26.6 | -31.1 | -34.0 |
+| video BGM dBFS | -41.6 | -39.7 | -39.1 | -41.5 | -43.4 | -45.9 | -51.4 | -48.8 |
+| delta dB | -22.3 | -19.7 | -19.6 | -21.7 | -21.2 | -19.3 | -20.3 | -14.8 |
+
+- Source integrated loudness **-9.9 LUFS** (true peak **+0.9 dBFS**, already clipping); video -25.4 LUFS (peak -11.0).
+- All eight bands sit near -20 dB in parallel; tightening the "quiet frame" threshold from the 25th to the
+  10th / 5th percentile moves the delta from -20.1 / -21.1 to **-21.8 dB** (less SFX contamination, closer
+  to the true BGM level).
+- Conclusion: **the game mix attenuates its BGM by roughly 20 dB relative to the master** — not a per-band trick.
+
+##### One false premise, ruled out
+
+The video's BGM is **not the same recording** as this MP3: three-band (150-600 / 600-1500 / 1500-3200 Hz)
+envelope cross-correlation peaks at only **0.17 / 0.26 / 0.28** (identical audio would be above 0.9).
+So only **level alignment** is possible, not sample-level subtraction. The conclusion is unaffected —
+the user wanted a loudness reference, not content matching.
+
+##### What was changed
+
+| Item | Value |
+|---|---|
+| `DEFAULT_OUTPUT_GAIN` | `0.25` → **`0.10`** (-20 dB) |
+| Target level | **-30 LUFS** at 100% volume |
+| Verification | source at 0.10 gain measures **-29.9 LUFS**, true peak -19.1 dBFS (19 dB headroom, noise layers will not clip) |
+| Config files | `run/config/radio-smile/stations.json` and the `serverconfig/…` sample both set to 0.10; README (both languages) sample and table updated |
+
+##### Trade-off the user accepted
+
+The user chose to **calibrate local stations only** (keeping the "internet radio is passed through untouched" convention),
+target -30 LUFS. The resulting gap is documented in `RadioStationRegistry#outputGain`:
+
+> With local at 0.10 (~-30 LUFS) and internet streams typically at ~-15 LUFS, **switching from a local station to a
+> network station jumps about 15 dB louder**.
+
+Two ways to remove the jump, both requiring a separate decision:
+1. **Master gain** — make `outputGainFor` apply to `isStreaming()` too; one line, but it overturns "don't touch someone else's stream";
+2. **Per-track loudness normalisation** — measure each file's integrated loudness during prewarm and derive the gain from
+   "target − measured"; removes both master variance and the network gap, but changes the cache format and the gain path.
+
+> ⚠️ **A fixed gain cannot adapt to master variance**: a -9.9 LUFS track attenuated by 20 dB lands exactly at -30, while a
+> -15 LUFS track under the same 20 dB lands at -35. Loudness across a mixed playlist will still drift — an inherent limit of the 0.10 constant.
+
 ### Current build status
 
 - **`build/libs/radio-smile-1.0.0.jar`, about 355 KB**
@@ -1550,6 +1615,18 @@ origin of every station-switch race.
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 22 (evening of 2026-11-26, `outputGain` calibration)**:
+- ⚠️ **Is a local station at 100% level with the video's BGM** — the core item. The default is now 0.10 (-20 dB),
+  measured at -29.9 LUFS. How to judge: all in-game volumes maxed, standing within 4 blocks of the radio, a local
+  station should feel close to the BGM in that Endfield recording (clearly below the track's native level, still
+  clearly audible). Too quiet → raise it (0.13 ≈ -27.7 LUFS); too loud → lower it (0.08 ≈ -31.9 LUFS).
+- ⚠️ **Volume jump when switching local → network station** — a known trade-off: with local at 0.10, network
+  stations will sound about 15 dB louder. If the jump is unacceptable, choose between "master gain" and
+  "per-track loudness normalisation" (see the end of section AF).
+- ⚠️ **Loudness consistency across a mixed playlist** — a fixed gain cannot adapt to master variance: a -9.9 LUFS
+  track lands exactly at -30, a -15 LUFS track at -35. If a few tracks are obviously quieter, that means
+  normalisation is needed rather than more tweaking of this constant.
 
 **Round 21 (morning of 2026-11-25)**:
 - ⚠️ **Does the local stations' `outputGain` actually take effect** — the core fix of this round. Set

@@ -1,5 +1,5 @@
 {
-  "outputGain": 0.25,
+  "outputGain": 0.10,
   "stations": [
     {
       "id": "example",

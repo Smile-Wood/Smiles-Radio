@@ -57,7 +57,7 @@ an error when the signal dies.
 ```json
 {
   "ffmpeg": "",
-  "outputGain": 0.25,
+  "outputGain": 0.10,
   "stations": [
     {
       "id": "tiehen",
@@ -92,7 +92,7 @@ an error when the signal dies.
 | Field | Description |
 |---|---|
 | `ffmpeg` | Path to the ffmpeg executable. **Leave empty to use ffmpeg from `PATH`**; only set it when ffmpeg is not on `PATH` or you need a specific build (e.g. `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` or `/usr/local/bin/ffmpeg`) |
-| `outputGain` | Output gain for **local** tracks, `0.00`-`1.00` (default `0.25`). Local files are usually mastered loud for in-game playback while internet radio arrives one notch lower, so scaling local down lines them up and leaves headroom against clipping. Internet radio bytes are passed through untouched. Takes effect on the next config reload, no re-bake needed |
+| `outputGain` | Output gain for **local** tracks, `0.00`-`1.00` (default `0.10`). The default is calibrated by measurement: at 100% volume the output lands near **-30 LUFS**, matching the level a game BGM usually sits at (measurement details in the AD section of the handover). Local files are usually mastered loud for in-game playback, so scaling them down both aligns them with internet radio and leaves headroom against clipping. Internet radio bytes are passed through untouched — the more you attenuate local, the bigger the jump when switching to a network station. Takes effect on the next config reload, no re-bake needed |
 
 #### Station fields
 
