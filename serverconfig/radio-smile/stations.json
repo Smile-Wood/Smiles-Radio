@@ -1,5 +1,6 @@
 {
   "outputGain": 0.10,
+  "targetLoudness": -30,
   "stations": [
     {
       "id": "example",

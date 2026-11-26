@@ -2,7 +2,7 @@
 
 **English** | [简体中文](HANDOVER.zh-CN.md)
 
-> Last updated: 2026-11-26 20:35 (**Round 22** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
+> Last updated: 2026-11-26 21:10 (**Round 23** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
 > Project path: `C:\Projects\Smile's Radio mod`
 > Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **355 KB**, BUILD SUCCESSFUL)
 > Version control: git initialised, **one commit per round of fixes**
@@ -1606,15 +1606,99 @@ Two ways to remove the jump, both requiring a separate decision:
 > ⚠️ **A fixed gain cannot adapt to master variance**: a -9.9 LUFS track attenuated by 20 dB lands exactly at -30, while a
 > -15 LUFS track under the same 20 dB lands at -35. Loudness across a mixed playlist will still drift — an inherent limit of the 0.10 constant.
 
+#### AG. Round 23: per-track loudness normalisation (evening of 2026-11-26)
+
+##### What the user asked
+
+"Write each track's attenuation into the cache metadata and normalise accordingly", and explicitly
+**rejected the alternative**: having the client detect the current channel's level and normalise itself.
+
+So: **the server measures, stores, computes and sends; the client only multiplies.**
+
+##### Data flow
+
+```
+prewarm (background thread, once)
+  source file --ffmpeg loudnorm--> input_i (integrated LUFS) + input_tp (true peak)
+        └─→ cache/loudness/<first 24 chars of quickHash>.lufs   (lufs=… / tp=…)
+
+playback (per audio chunk, O(1))
+  current track --measured LUFS--> gain = 10^((target − lufs)/20) --S2C_OUTPUT_GAIN--> client
+                                                                        (multiplied into the mix)
+```
+
+##### Key implementation points
+
+| Location | Role |
+|---|---|
+| `LoudnessNormalizer` (new) | Measurement, metadata I/O, gain maths. **Attenuation only, never boosts** |
+| `AudioSource.currentFile()` (new) | The source itself answers "which file is playing", instead of looking it up by `trackIndex` |
+| `AudioTranscoder.sourceOf()` (new) | Reverse lookup: baked artefact → source file |
+| `AudioStreamManager.outputGainFor()` | Asks the normaliser first; falls back to `outputGain` only when unmeasured |
+| `RadioStationRegistry.targetLoudness` | Config key, default -30; `0` disables normalisation |
+| `S2C_OUTPUT_GAIN` | **Protocol unchanged**, still `(BlockPos, stationId, float)`; resent when the track changes |
+
+##### Two pitfalls worth remembering
+
+> ⚠️ **A non-MP3 source plays the transcoded artefact, not the source file.**
+> `PlaylistTimeline.streamFileOf()` returns `<base>-<hash12>.mp3` when the artefact exists, while the metadata
+> is keyed by the **source** file's hash — hashing the artefact path never matches, and the failure is silent
+> (the gain just stays at the fallback). `AudioTranscoder.BAKED_SOURCE` now records the mapping and
+> `sourceOf()` resolves it. **Any code that looks up per-file metadata must go through `sourceOf()` first.**
+
+> ⚠️ **The gain is clamped to 0.00~1.00, so do not try to exceed 1.**
+> The client's `PcmSink.setStreamGain` clamps to `0~1` and treats "full gain" as "no attenuation" (it drops the
+> table entry). A server value of 1.7 is silently clamped to 1.0 — normalisation looks like it works but nothing
+> is raised. The user has confirmed "quiet material doesn't need boosting", so this class attenuates only.
+> True peak is still stored, so a future boost decision would not require re-decoding the whole library.
+
+##### End-to-end verification (2026-11-26 21:04, real server)
+
+`gradlew runServer` → config loaded → background measurement → 5/5 succeeded (84.8 s, one-off).
+Four metadata files (two tracks had identical content and share one, as expected from hash naming):
+
+| Metadata | measured LUFS | normalised gain | output at the old fixed 0.10 | deviation |
+|---|---|---|---|---|
+| `17cffbb8…` | -12.98 | 0.141 | -32.98 | -3.0 |
+| `616410df…` | -11.37 | 0.117 | -31.37 | -1.4 |
+| `c8e22d78…` | -6.64 | 0.068 | -26.64 | +3.4 |
+| `e388c53e…` | -6.31 (true peak +2.24) | 0.065 | -26.31 | +3.7 |
+
+Under the fixed gain these four spanned **6.7 dB** (-33.0 to -26.3); after normalisation all land on -30.
+The source of `e388c53e` has a true peak of +2.24 dBFS and is already clipping — which is exactly why
+"measure each track" is necessary.
+
+##### Known boundaries
+
+- **Internet radio is excluded**: a passthrough live stream that clients pull directly, so the server never sees analysable content.
+- **First start is slower**: one full decode per track (~17 s each, 85 s for five), serial on a background thread, non-blocking.
+- **A one-chunk mismatch is possible at a track switch**: the gain is computed from `currentFile()` while chunks are queued,
+  so the first chunk of a new track may carry the previous track's gain (~20 ms, inaudible).
+- **Without ffmpeg it silently falls back to `outputGain`**, with one explicit WARN.
+- Metadata depends on file content only: **renaming does not re-measure, changing content always does**
+  (the hash covers file size plus the first 64 KB).
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 355 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 363 KB**
 - `gradlew build` → BUILD SUCCESSFUL
 - **git is initialized**, one commit per round; `main` is in sync with origin/main
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 23 (evening of 2026-11-26, per-track loudness normalisation)**:
+- ⚠️ **Is the loudness across a mixed playlist actually aligned** — the core item. With the old fixed 0.10 the four
+  test tracks spanned 6.7 dB (-33 to -26.3); they should all sit near -30 now. How to judge: play a list with
+  several different sources back to back — no track should suddenly sound much louder or quieter.
+- ⚠️ **Is `cache/loudness/` populated as expected** — after the first start the directory should contain
+  `<hash>.lufs` files (two lines: `lufs=` / `tp=`), and the log should show one "实测完成 N/N" line.
+- ⚠️ **The local → network jump is still there** — normalisation only covers local tracks; internet radio stays at
+  1.0, so the relative gap remains (section AF). Levelling those too needs a separate decision.
+- ⚠️ **Any artefact at a track switch** — the gain changes with the track, so in theory the first chunk could carry
+  the previous track's gain (~20 ms, should be inaudible). If a "volume hiccup" is audible, the gain needs to
+  travel with the chunk instead.
 
 **Round 22 (evening of 2026-11-26, `outputGain` calibration)**:
 - ⚠️ **Is a local station at 100% level with the video's BGM** — the core item. The default is now 0.10 (-20 dB),

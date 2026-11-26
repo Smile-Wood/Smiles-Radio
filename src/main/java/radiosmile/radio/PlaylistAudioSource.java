@@ -207,6 +207,23 @@ public final class PlaylistAudioSource implements AudioSource {
 	}
 
 	/**
+	 * 当前正在播放那一首的文件，供响度归一化按曲取增益。
+	 *
+	 * <p>直接问 {@code current}，而不是用 {@link #trackIndex()} 去外面按位置查列表：
+	 * 换曲时 {@code current} 与 {@code index} 是同一时刻换的，两者天然一致；
+	 * 而外部的 {@code resolveTracks()} 顺序一旦与播放列表的打乱/轮转不同步，
+	 * 增益就会静默地套到别的曲子上（见 {@link AudioSource#currentFile()}）。
+	 *
+	 * <p>换曲窗口内 {@code current} 可能为 {@code null}（旧的已关、新的还没开），
+	 * 此时返回 {@code null}，调用方回落到兜底增益。
+	 */
+	@Override
+	public java.nio.file.Path currentFile() {
+		AudioSource source = this.current;
+		return source == null ? null : source.currentFile();
+	}
+
+	/**
 	 * <b>当前正在播放那一首</b>的码率。
 	 *
 	 * <h2>这里曾经返回"整条列表的平均码率"，那是错的</h2>

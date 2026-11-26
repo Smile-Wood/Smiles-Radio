@@ -712,7 +712,9 @@ public final class AudioStreamManager {
 				// （AD 修复的第一道防线只防静态残留，未防住泵闭包的异步滞后）。
 				// 判据：订阅对象还在 SUBSCRIPTIONS 表里就说明它仍然有效。
 				if (SUBSCRIPTIONS.containsValue(sub)) {
-					float gain = outputGainFor(sub);
+					// 用块里冻结的文件算增益（不是现读音源当前文件）：
+					// 队列积压约 4 秒，现读会让上一首的最后几秒套用下一首的增益。
+					float gain = outputGainFor(sub, chunk.file());
 					if (sub.noteSentGain(gain)) {
 						writeOutputGain(target, targetPos, stationId, gain);
 					}
@@ -779,21 +781,34 @@ public final class AudioStreamManager {
 	private static final float STREAM_GAIN = 1.0F;
 
 	/**
-	 * 这个订阅当前的推流增益（0.00~1.00）。
+	 * 这个订阅当前该下发的推流增益（0.00~1.00）。
 	 *
-	 * <h2>为什么只有本地曲目要压</h2>
-	 * 本地素材是"给游戏内直接播放"处理过的成品，母带电平高、峰值常顶到 0 dBFS；
-	 * 网络电台的字节是<b>原样透传</b>的（上游怎么发就怎么播），电平本来就低一档。
-	 * 压本地正好让两者对齐，也不能去动网络电台——那等于篡改别人的流。
+	 * <h2>本地曲目：按「这一块属于哪首」归一化</h2>
+	 * 先问 {@link radiosmile.radio.LoudnessNormalizer}：它按该曲目的
+	 * <b>实测响度</b>与配置的目标电平算出增益（实测结果存在缓存元数据里，
+	 * 预热阶段由 ffmpeg 写入，运行时不碰磁盘）。
+	 * 只有<b>还没实测</b>的曲目（刚放进来的新文件、缺 ffmpeg）才回落到
+	 * 固定的 {@link RadioStationRegistry#outputGain()}。
+	 *
+	 * <p>{@code chunkFile} 是<b>入队时冻结</b>的文件，不是现读音源的当前文件：
+	 * 队列积压可达 4 秒，现读会让上一首最后几秒套用下一首的增益
+	 * （同一个坑在曲目序号上已经踩过一次，见 {@code AudioSubscription.Chunk}）。
+	 *
+	 * <h2>网络电台：恒为 1.0</h2>
+	 * 直播流是原样透传的，服务端拿不到可分析的整体内容（而且客户端是直连上游，
+	 * 字节根本不经过这里），没有实测依据就不该凭猜测压它。
 	 *
 	 * <h2>为什么每包重新取</h2>
-	 * 取的是 {@link RadioStationRegistry#outputGain()} 这个 volatile 字段，
-	 * 所以改配置之后下一个包就生效，<b>不需要重新预热缓存</b>。
-	 * 这正是它不放在烤制阶段的原因：增益是运行时参数，缓存是内容。
+	 * 取的配置与元数据都是运行时可变的，所以改配置之后下一个包就生效，
+	 * <b>不需要重新预热缓存</b>；换曲时增益自然变化，泵线程会随下一块补发。
 	 */
-	private static float outputGainFor(AudioSubscription sub) {
+	private static float outputGainFor(AudioSubscription sub, java.nio.file.Path chunkFile) {
 		if (sub == null || sub.station() == null || sub.station().isStreaming()) {
 			return 1.0F;
+		}
+		float normalized = radiosmile.radio.LoudnessNormalizer.gainFor(chunkFile);
+		if (normalized >= 0.0F) {
+			return normalized;
 		}
 		return RadioStationRegistry.outputGain();
 	}

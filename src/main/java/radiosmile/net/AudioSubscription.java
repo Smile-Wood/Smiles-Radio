@@ -48,14 +48,18 @@ public final class AudioSubscription {
 	/**
 	 * 待发数据块。
 	 *
-	 * <p><b>必须把曲目序号冻结在入队时刻</b>：队列最多积压 {@link #MAX_QUEUED_BYTES}（64KB ≈ 4 秒），
-	 * 若发包时才去读音源「当前」序号，标签会比数据早约 4 秒——客户端据此提前
-	 * {@code trackChanged} 重建解码器并 flush 声卡，换曲时会有约 1 秒静音，
-	 * 且上一首最后几秒的字节会被喂进新解码器。
+	 * <p><b>必须把曲目序号与音频文件冻结在入队时刻</b>：队列最多积压
+	 * {@link #MAX_QUEUED_BYTES}（64KB ≈ 4 秒），若发包时才去读音源「当前」值，
+	 * 标签会比数据早约 4 秒——客户端据此提前 {@code trackChanged} 重建解码器
+	 * 并 flush 声卡，换曲时会有约 1 秒静音，且上一首最后几秒的字节会被喂进新解码器。
+	 *
+	 * <p>{@code file} 是同一纪律的延伸：响度归一化按「这一块属于哪首」取增益。
+	 * 若在发包时才问 {@code source.currentFile()}，换曲前最后 4 秒会套用
+	 * <b>下一首</b>的增益（听感是换曲前音量先一台阶）。所以文件也随块冻结。
 	 */
-	// 包级可见：同包的 AudioStreamManager.pump() 要用它取冻结的曲目序号。
+	// 包级可见：同包的 AudioStreamManager.pump() 要用它取冻结的曲目序号与文件。
 	// 不加 public 是为了不把这个内部传输结构暴露到包外。
-	record Chunk(byte[] data, int trackIndex) {
+	record Chunk(byte[] data, int trackIndex, java.nio.file.Path file) {
 	}
 
 	private final Deque<Chunk> queue = new ArrayDeque<>();
@@ -237,9 +241,10 @@ public final class AudioSubscription {
 					}
 					return;
 				}
-				// 曲目序号在「读到这块数据的那一刻」就冻结下来，随数据一起入队。
-				// 换曲后读到的第一块新数据才带新序号，与字节流严格对应。
+				// 曲目序号与音频文件在「读到这块数据的那一刻」就冻结下来，随数据一起入队。
+				// 换曲后读到的第一块新数据才带新序号/新文件，与字节流严格对应。
 				int chunkTrackIndex = this.source.trackIndex();
+				java.nio.file.Path chunkFile = this.source.currentFile();
 				synchronized (this.queue) {
 					while (this.queuedBytes + data.length > MAX_QUEUED_BYTES && !this.closed) {
 						this.queue.wait(200);
@@ -247,7 +252,7 @@ public final class AudioSubscription {
 					if (this.closed) {
 						return;
 					}
-					this.queue.addLast(new Chunk(data, chunkTrackIndex));
+					this.queue.addLast(new Chunk(data, chunkTrackIndex, chunkFile));
 					this.queuedBytes += data.length;
 					this.queue.notifyAll();
 				}

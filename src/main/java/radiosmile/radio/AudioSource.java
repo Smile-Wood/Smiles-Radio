@@ -85,6 +85,22 @@ public interface AudioSource {
 	}
 
 	/**
+	 * 此刻正在播放的<b>本地文件</b>；网络流或未知返回 {@code null}。
+	 *
+	 * <h2>为什么由音源自己回答，而不是让调用方按 trackIndex 去查列表</h2>
+	 * 响度归一化要按「这一首」取增益。若调用方拿 {@code trackIndex} 去
+	 * {@code resolveTracks()} 的结果里按位置取，就出现了两份必须永远同步的
+	 * 顺序表——一旦播放列表的打乱/轮转逻辑与解析顺序有一处不同步，
+	 * 增益就会套到别的曲子上，而且是<b>静默</b>的错（音量不对，不报错）。
+	 *
+	 * <p>音源本身就知道自己在放哪个文件（{@code FileAudioSource.file}、
+	 * {@code PlaylistAudioSource.current}），由它直接回答只有一份真相。
+	 */
+	default java.nio.file.Path currentFile() {
+		return null;
+	}
+
+	/**
 	 * 流会话号：上游断线并重连后递增。
 	 *
 	 * <p>重连后的字节与断线前的<b>不连续</b>（缺了断线期间的内容），

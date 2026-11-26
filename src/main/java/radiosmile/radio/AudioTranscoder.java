@@ -93,6 +93,40 @@ public final class AudioTranscoder {
 	/** 已完成的转码：源文件键 -> MP3 路径。 */
 	private static final Map<String, Path> READY = new ConcurrentHashMap<>();
 
+	/**
+	 * 转码产物 -> 源文件（绝对路径字符串为键）。
+	 *
+	 * <h2>为什么需要这张反查表</h2>
+	 * 非 MP3 源实际推流的是<b>转码产物</b>，{@code PlaylistTimeline.fileAt()} 返回的
+	 * 就是产物路径（见 {@code streamFileOf}）。而响度归一化的实测元数据是按
+	 * <b>源文件</b>的 {@link RadioStationRegistry#quickHash} 命名的——
+	 * 直接拿产物路径去算哈希，永远查不到，归一化会静默失效（增益一直是兜底值）。
+	 *
+	 * <p>映射只在这里登记，调用方（{@link LoudnessNormalizer}）通过
+	 * {@link #sourceOf} 反查，不需要自己拼路径或猜命名规则。
+	 */
+	private static final Map<String, Path> BAKED_SOURCE = new ConcurrentHashMap<>();
+
+	/** 登记「产物 -> 源」映射。 */
+	private static void rememberSource(Path baked, Path source) {
+		if (baked != null && source != null) {
+			BAKED_SOURCE.put(baked.toAbsolutePath().toString(), source);
+		}
+	}
+
+	/**
+	 * 把「实际播放的文件」还原成它的源文件。
+	 *
+	 * <p>传入非转码产物时原样返回；传 {@code null} 返回 {@code null}。
+	 */
+	public static Path sourceOf(Path played) {
+		if (played == null) {
+			return null;
+		}
+		Path source = BAKED_SOURCE.get(played.toAbsolutePath().toString());
+		return source != null ? source : played;
+	}
+
 	private AudioTranscoder() {
 	}
 
@@ -150,11 +184,13 @@ public final class AudioTranscoder {
 		}
 		Path cached = READY.get(key);
 		if (cached != null && Files.isRegularFile(cached)) {
+			rememberSource(cached, source);
 			return cached;
 		}
 		Path target = dir.resolve(key);
 		if (Files.isRegularFile(target)) {
 			READY.put(key, target);
+			rememberSource(target, source);
 			return target;
 		}
 		return null;
@@ -186,6 +222,7 @@ public final class AudioTranscoder {
 		Path target = dir.resolve(key);
 		if (Files.isRegularFile(target)) {
 			READY.put(key, target);
+			rememberSource(target, source);
 			return false;
 		}
 		return true;
@@ -227,6 +264,8 @@ public final class AudioTranscoder {
 			int done = 0;
 			for (Path source : pending) {
 				Path target = dir.resolve(cacheKey(source));
+				// 先登记映射再转码：转码完成前后都要能反查出源文件（响度归一化用）
+				rememberSource(target, source);
 				if (runFfmpeg(source, target)) {
 					READY.put(cacheKey(source), target);
 					done++;

@@ -287,6 +287,12 @@ public final class FileAudioSource implements AudioSource {
 		return this.file;
 	}
 
+	/** 响度归一化按「这一首」取增益，见 {@link AudioSource#currentFile()}。 */
+	@Override
+	public Path currentFile() {
+		return this.file;
+	}
+
 	@Override
 	public void close() {
 		try {

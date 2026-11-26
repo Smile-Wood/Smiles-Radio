@@ -290,6 +290,9 @@ public final class RadioStationRegistry {
 		radiosmile.radio.PlaylistTimeline.clearCache();
 		clearStationShifts();
 		clearIconCache();
+		// 响度增益缓存也要清：目标电平可能改了，且曲目集合可能变了。
+		// 磁盘上的实测元数据保留——它只跟文件内容有关，与配置无关。
+		LoudnessNormalizer.clearCache();
 
 		List<RadioStation> all = readIndex();
 		// <b>加载时即校验</b>：把"配置了但放不出来"的频道挑出来。
@@ -377,6 +380,7 @@ public final class RadioStationRegistry {
 			if (root.isJsonObject()) {
 				readTopLevelFfmpeg(root.getAsJsonObject());
 				readTopLevelOutputGain(root.getAsJsonObject());
+				readTopLevelTargetLoudness(root.getAsJsonObject());
 			}
 
 			JsonArray arr = root.isJsonObject()
@@ -432,6 +436,15 @@ public final class RadioStationRegistry {
 	 * 固定增益无法自动适配母带差异，要彻底解决需要逐曲实测响度后归一化。
 	 */
 	public static final float DEFAULT_OUTPUT_GAIN = 0.10F;
+
+	/**
+	 * 逐曲响度归一化的默认目标电平（LUFS）。
+	 *
+	 * <p>取 -30：与「游戏内 BGM 一般被压低到母带以下约 20 dB」这一实测基准对齐
+	 * （推导见 {@link #DEFAULT_OUTPUT_GAIN} 的注释）。归一化开启后，
+	 * 任何母带的曲子都会被拉到这个电平，不再依赖固定增益。
+	 */
+	public static final float DEFAULT_TARGET_LOUDNESS = -30.0F;
 
 	/**
 	 * 本地曲目的推流增益（0.00~1.00），由 {@code stations.json} 顶层
@@ -493,6 +506,61 @@ public final class RadioStationRegistry {
 		}
 		outputGain = clamped;
 		SmileSRadio.LOGGER.info("本地推流增益 outputGain={}（网络电台不受影响）", clamped);
+	}
+
+	/**
+	 * 逐曲响度归一化的目标电平（LUFS），默认 {@link #DEFAULT_TARGET_LOUDNESS}。
+	 *
+	 * <p>负数才有效；{@code 0}（或正数）表示<b>关闭归一化</b>，此时所有本地曲目
+	 * 一律用固定的 {@link #outputGain}。
+	 */
+	private static volatile float targetLoudness = DEFAULT_TARGET_LOUDNESS;
+
+	/** 当前生效的目标电平（LUFS）；{@code >= 0} 表示归一化已关闭。 */
+	public static float targetLoudness() {
+		return targetLoudness;
+	}
+
+	/**
+	 * 读取顶层的 {@code targetLoudness}（LUFS，如 {@code -30}；{@code 0} = 关闭）。
+	 *
+	 * <p>缺失 / 非法都回落到默认值。这是「逐曲归一化」唯一的调节旋钮：
+	 * 实测电平存在缓存元数据里，这里只决定<b>要拉到多响</b>。
+	 */
+	private static void readTopLevelTargetLoudness(JsonObject root) {
+		if (!root.has("targetLoudness") || root.get("targetLoudness").isJsonNull()) {
+			targetLoudness = DEFAULT_TARGET_LOUDNESS;
+			SmileSRadio.LOGGER.info("响度归一化：未配置 targetLoudness，按默认 {} LUFS", DEFAULT_TARGET_LOUDNESS);
+			return;
+		}
+		float raw;
+		try {
+			raw = root.get("targetLoudness").getAsFloat();
+		} catch (Exception e) {
+			SmileSRadio.LOGGER.warn("配置项 targetLoudness 不是数字，已按默认 {} 处理：{}",
+					DEFAULT_TARGET_LOUDNESS, root.get("targetLoudness"));
+			targetLoudness = DEFAULT_TARGET_LOUDNESS;
+			return;
+		}
+		if (Float.isNaN(raw)) {
+			targetLoudness = DEFAULT_TARGET_LOUDNESS;
+			return;
+		}
+		if (raw >= 0.0F) {
+			targetLoudness = 0.0F;
+			SmileSRadio.LOGGER.info("响度归一化已关闭（targetLoudness={}），全部本地曲目使用 outputGain={}",
+					raw, outputGain);
+			return;
+		}
+		// 低于 -70 LUFS 的目标没有意义（人耳听不见），按默认处理
+		if (raw < -70.0F) {
+			SmileSRadio.LOGGER.warn("配置项 targetLoudness={} 过低，已按默认 {} 处理",
+					raw, DEFAULT_TARGET_LOUDNESS);
+			targetLoudness = DEFAULT_TARGET_LOUDNESS;
+			return;
+		}
+		targetLoudness = raw;
+		SmileSRadio.LOGGER.info("响度归一化：目标 {} LUFS（逐曲按实测电平换算增益）", raw);
 	}
 
 	/**
@@ -568,7 +636,20 @@ public final class RadioStationRegistry {
 						+ "本地素材通常按「游戏内播放」打得比较响，而网络电台电平低一档，"
 						+ "压一下本地两边才对得齐，也能避免满刻度叠加底噪后削波。"
 						+ "网络电台是原样透传的，不受这个值影响。改完下一次重载配置即生效，"
-						+ "不需要重新预热缓存");
+						+ "不需要重新预热缓存。"
+						+ "开启 targetLoudness 归一化后，这个值只作为「尚未实测」曲目的兜底");
+
+		// <b>逐曲响度归一化</b>：实测电平进缓存元数据，播放时按曲换算增益
+		root.addProperty("targetLoudness", DEFAULT_TARGET_LOUDNESS);
+		root.addProperty("_说明_targetLoudness",
+				"逐曲响度归一化的目标电平（LUFS），默认 -30；填 0 或正数表示关闭。"
+						+ "开启后服务器会在预热阶段用 ffmpeg 实测每首曲目的响度，"
+						+ "结果存进 cache/loudness/（按文件哈希命名），播放时按"
+						+ "「目标电平 − 实测电平」自动换算增益下发，"
+						+ "多首不同母带的曲子响度就能对齐。"
+						+ "实测只在首次预热时做一次，改这个目标值立刻生效、不用重测；"
+						+ "要重测某首，删掉 cache/loudness/ 下对应条目再重载配置即可。"
+						+ "归一化只作用于本地曲目：网络电台是原样透传的直播流，无法实测");
 
 		// 配置说明：写进文件本身，服主打开就能看懂，不必回来翻文档。
 		root.addProperty("_说明_播放模式", "mode 可选值见下面的示例条目；"
@@ -675,6 +756,8 @@ public final class RadioStationRegistry {
 		Map<String, String> current = new LinkedHashMap<>();
 		// 需要转码预热的源文件（非 MP3，且对应产物尚不存在）
 		List<Path> needBake = new ArrayList<>();
+		// 需要响度实测的源文件（含 MP3——它们不转码，但同样要归一化）
+		List<Path> needMeasure = new ArrayList<>();
 
 		for (RadioStation station : stations) {
 			if (station.isStreaming()) {
@@ -705,6 +788,9 @@ public final class RadioStationRegistry {
 				if (AudioTranscoder.needsBake(track)) {
 					needBake.add(track);
 				}
+				// 响度实测覆盖<b>全部</b>本地曲目（含直接用 MP3 推流的那些）：
+				// 归一化的对象是「放出来的声音」，不是「需要转码的文件」。
+				needMeasure.add(track);
 			}
 		}
 
@@ -721,6 +807,10 @@ public final class RadioStationRegistry {
 
 		// 校验完顺手预热：还没转码成 MP3 的文件在这里统一排队
 		AudioTranscoder.preheat(needBake);
+
+		// 响度归一化：还没实测过的曲目在后台补测一次，结果写进缓存元数据。
+		// 与转码预热分开排队——本方法返回前不会阻塞服务端启动。
+		LoudnessNormalizer.preheat(needMeasure);
 
 		// <b>txt 里的网络地址也要在后台下载</b>：
 		// 上面的 resolveTracks() 用的是 parseCached，首次遇到网络条目会同步下载——
