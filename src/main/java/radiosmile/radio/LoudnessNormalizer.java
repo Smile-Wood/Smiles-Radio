@@ -63,18 +63,18 @@ public final class LoudnessNormalizer {
 	private static final float MIN_GAIN_DB = -40.0F;
 
 	/**
-	 * <b>还没有实测数据</b>时的暂用电平（≈ -18.4 dB）。
+	 * <b>还没有实测数据</b>时的暂用电平（≈ -8 dB）。
 	 *
 	 * <p>什么时候会用到：预热线程还没轮到这首曲子、服务器上没有 ffmpeg、
 	 * 或者实测失败。这些都是「暂时算不出增益」，不是「不需要增益」，
 	 * 所以不能放 1.0 让它以母带原电平（-11 LUFS 上下）炸出来。
 	 *
-	 * <p>取值依据：参考曲库实测母带集中在 -11 ~ -13 LUFS，
-	 * {@code 10^((-30 - (-11.3)) / 20) ≈ 0.116}，取整到 0.12。
+	 * <p>取值依据：参考曲库实测母带集中在 -11 ~ -13 LUFS，目标 -19 时
+	 * {@code 10^((-19 - (-11.3)) / 20) ≈ 0.41}，取整到 0.40。
 	 * 它<b>只是过渡值</b>——真正生效的是按曲实测的结果，
 	 * 所以这个数字不需要精确，只需要「不刺耳、不削波」。
 	 */
-	public static final float UNMEASURED_GAIN = 0.12F;
+	public static final float UNMEASURED_GAIN = 0.40F;
 
 	/** 实测结果：整轨积分响度与真峰（dBFS）。 */
 	private record Measured(float lufs, float tp) {

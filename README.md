@@ -57,7 +57,7 @@ an error when the signal dies.
 ```json
 {
   "ffmpeg": "",
-  "targetLoudness": -30,
+  "targetLoudness": -19,
   "stations": [
     {
       "id": "tiehen",
@@ -92,7 +92,7 @@ an error when the signal dies.
 | Field | Description |
 |---|---|
 | `ffmpeg` | Path to the ffmpeg executable. **Leave empty to use ffmpeg from `PATH`**; only set it when ffmpeg is not on `PATH` or you need a specific build (e.g. `C:\\tools\\ffmpeg\\bin\\ffmpeg.exe` or `/usr/local/bin/ffmpeg`) |
-| `targetLoudness` | Target level for **per-track loudness normalisation** (LUFS, default `-30`; set `0` to disable). When enabled the server measures every local track with ffmpeg during prewarm and stores the result under `cache/loudness/` (named by file content hash); at playback the gain is derived as "target − measured". **This lines up tracks from different masters**, which a single fixed gain cannot do (so there is no `outputGain` anymore). Attenuation only, never boosting: tracks already quieter than the target stay as they are. Changing this value takes effect immediately with no re-measurement; to re-measure a track, delete its entry under `cache/loudness/` and reload. Setting `0` plays local tracks **raw, with no processing at all**. Internet radio is a passthrough live stream and is not normalised |
+| `targetLoudness` | Target level for **per-track loudness normalisation** (LUFS, default `-19`; set `0` to disable). When enabled the server measures every local track with ffmpeg during prewarm and stores the result under `cache/loudness/` (named by file content hash); at playback the gain is derived as "target − measured". **This lines up tracks from different masters**, which a single fixed gain cannot do (so there is no `outputGain` anymore). The default `-19` is the **measured level of an internet radio stream**: local tracks are aligned *to* internet radio, while the stream itself is passed through untouched. Attenuation only, never boosting: tracks already quieter than the target stay as they are (gain is clamped to 0~1). Changing this value takes effect immediately with no re-measurement; to re-measure a track, delete its entry under `cache/loudness/` and reload. Setting `0` plays local tracks **raw, with no processing at all** |
 
 #### Station fields
 

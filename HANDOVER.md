@@ -1634,8 +1634,8 @@ playback (per audio chunk, O(1))
 | `LoudnessNormalizer` (new) | Measurement, metadata I/O, gain maths. **Attenuation only, never boosts** |
 | `AudioSource.currentFile()` (new) | The source itself answers "which file is playing", instead of looking it up by `trackIndex` |
 | `AudioTranscoder.sourceOf()` (new) | Reverse lookup: baked artefact → source file |
-| `AudioStreamManager.outputGainFor()` | Asks the normaliser first; two separate fallbacks: normalisation disabled → 1.0 (raw), not yet measured → `UNMEASURED_GAIN` (0.12) |
-| `RadioStationRegistry.targetLoudness` | Config key, default -30; `0` disables normalisation |
+| `AudioStreamManager.outputGainFor()` | Asks the normaliser first; two separate fallbacks: normalisation disabled → 1.0 (raw), not yet measured → `UNMEASURED_GAIN` (0.12 then, 0.40 now — see AI) |
+| `RadioStationRegistry.targetLoudness` | Config key, `0` disables normalisation (default: -30 when written, **-19** now — see AI) |
 | `S2C_OUTPUT_GAIN` | **Protocol unchanged**, still `(BlockPos, stationId, float)`; resent when the track changes |
 
 ##### Two pitfalls worth remembering
@@ -1674,7 +1674,7 @@ The source of `e388c53e` has a true peak of +2.24 dBFS and is already clipping �
 - **First start is slower**: one full decode per track (~17 s each, 85 s for five), serial on a background thread, non-blocking.
 - **A one-chunk mismatch is possible at a track switch**: the gain is computed from `currentFile()` while chunks are queued,
   so the first chunk of a new track may carry the previous track's gain (~20 ms, inaudible).
-- **Without ffmpeg it falls back to the transitional level 0.12** (`LoudnessNormalizer.UNMEASURED_GAIN`), with one explicit WARN.
+- **Without ffmpeg it falls back to the transitional level** (`LoudnessNormalizer.UNMEASURED_GAIN`; 0.12 then, 0.40 now), with one explicit WARN.
 - Metadata depends on file content only: **renaming does not re-measure, changing content always does**
   (the hash covers file size plus the first 64 KB).
 
@@ -1729,43 +1729,113 @@ would not match the timbre.
 | Item | Action |
 |---|---|
 | `outputGain` config | **deleted** (reader, default-config writer, README tables in both languages, sample values) |
-| `LoudnessNormalizer.UNMEASURED_GAIN` (new) | `0.12` (≈ -18.4 dB), transitional level while a track is **not yet measured** |
+| `LoudnessNormalizer.UNMEASURED_GAIN` (new) | `0.12` (≈ -18.4 dB) at the time; **0.40** now (see AI), transitional level while a track is **not yet measured** |
 | `targetLoudness >= 0` (normalisation off) | now **plays raw (1.0)** instead of quietly attenuating |
-| `AudioStreamManager.outputGainFor()` | the two "cannot compute" cases are strictly separated: off → 1.0; unmeasured → 0.12 |
+| `AudioStreamManager.outputGainFor()` | the two "cannot compute" cases are strictly separated: off → 1.0; unmeasured → the transitional gain |
 
 > ⚠️ **Why "cannot compute" must not default to 1.0**: local masters sit around -11 to -13 LUFS, so 1.0 would
 > blast them at full level. They have to be pulled near the target first, then replaced by the measured value.
 > Conversely, when the user explicitly disables normalisation the code must not attenuate anyway — that would mean
 > the option does nothing. Mixing those two meanings is exactly the pitfall this project has hit ten times.
 
-##### Still unresolved
+##### Still unresolved (at the time)
 
 Internet radio stays at 1.0 while local sits at -30 LUFS — **about 11.5 dB apart** (measured).
-A live stream can be neither measured per track (there is no "whole song") nor estimated per chunk,
-so only a "master gain" can level them — which overturns "don't touch someone else's stream" and needs a decision.
+A live stream can be neither measured per track (there is no "whole song") nor estimated per chunk.
+→ **Solved in round 25, but in the opposite direction: local tracks move up to the stream's level; the stream is not touched.**
+
+#### AI. Round 25: local aligns to internet radio, the stream stays untouched (early 2026-11-27)
+
+##### What the user asked (two clarifications — I got it backwards the first time)
+
+1. "Align internet radio's loudness standard" — I implemented "multiply the stream by 0.282 down to -30 LUFS".
+2. Corrected immediately: **"I mean local aligns to internet radio, internet unchanged!!!"**
+3. Boundary added: **"for now don't push local gain above 1"** (attenuate only, never boost).
+
+So the direction is one-way: **not a single byte of the live stream changes; only the local target moves.**
+
+##### The change: one number
+
+| Item | Old | New |
+|---|---|---|
+| `DEFAULT_TARGET_LOUDNESS` | `-30.0` | **`-19.0`** |
+| `UNMEASURED_GAIN` (transitional) | `0.12` | **`0.40`** |
+| `STREAM_GAIN` (internet radio) | `1.0` | **`1.0` (unchanged)** |
+| Client `PcmSink.setStreamGain` 0~1 clamp | clamp | **unchanged** (it *is* the "never boost" boundary) |
+
+`-19.0` comes from the five samples in section AH: -19.1 / -19.6 / -18.2 / -18.3 / -19.07
+(mean -18.9, median -19.07) → rounded to **-19.0** (error ≤ 0.4 dB, below the audibility threshold).
+The stream's median is -19.07, local lands on -19.0 → a **0.07 dB** step when switching stations.
+
+##### "Moving up to -19" is still attenuation
+
+The old -30 was calibrated against a game recording's BGM, 11 dB below the stream,
+which is exactly the "local sounds small" complaint. At -19 most tracks are still attenuated:
+
+| Measured source | Gain needed for -19 | Result |
+|---|---|---|
+| -6.31 | 0.232 | -12.7 dB |
+| -6.64 | 0.241 | -12.4 dB |
+| -11.37 | 0.415 | -7.6 dB |
+| -12.98 | 0.500 | -6.0 dB |
+| -25 (quiet material) | 1.0 (clamped) | **raw, not boosted** |
+
+Only material quieter than -19 sits at 1.0 — exactly "don't push gain above 1".
+`LoudnessNormalizer.gainFrom()` (`db > 0 → 0`) plus the client's 0~1 clamp give two independent guards.
+
+##### Reverted work (a short-lived "attenuate the stream" version)
+
+The misunderstood version added `streamLoudness` / `streamGain(RadioStation)` /
+`RadioStation.loudness` / `AudioStreamManager.refreshStreamingGains()` and pushed 0.282 to streams.
+All of it was rolled back after the clarification:
+
+- `RadioStation` is back to 7 components (no `loudness`);
+- `RadioStationRegistry` has no stream-loudness constant/field/reader;
+- `AudioStreamManager.STREAM_GAIN = 1.0F` keeps its original meaning (sent on subscribe to clear leftovers).
+
+> ⚠️ **Do not move this back onto the stream.** The user's rule for internet radio is "passthrough, untouched".
+> The 11 dB gap is absorbed on the local side. If local ever feels too loud, change `targetLoudness`
+> (try -22 ~ -24) — never the stream.
+
+##### Cost of this round
+
+Local stations are **about 11 dB louder** than in round 24. That follows from the target change,
+it is not a bug. If it drowns game audio, set `targetLoudness` to `-22` ~ `-24` and reload —
+no re-measurement needed (measured LUFS does not depend on the target).
 
 ### Current build status
 
 - **`build/libs/radio-smile-1.0.0.jar`, about 354 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 25)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
 
+**Round 25 (early 2026-11-27, local aligns to internet radio — top priority)**:
+- ⚠️ **Does switching between a local station and internet radio sound level-matched** — the core item. The stream's
+  median is -19.07 and local targets -19, so the step should be 0.07 dB. To check: switch `FM90.7` ↔ the local
+  station at the same spot; loudness should barely change. If local is still clearly quieter, check the log line
+  "响度归一化：目标 -19" and whether `cache/loudness/` has measurements.
+- ⚠️ **Is local too loud overall** — about 11 dB louder than round 24 (target -30 → -19), as intended.
+  If it drowns game audio, set `targetLoudness` to `-22` ~ `-24` and reload (no re-measurement).
+- ⚠️ **Is quiet material left unboosted** — tracks measured below -19 must play raw (gain 1.0), never louder than
+  the source file.
+
 **Round 24 (late 2026-11-26, `outputGain` removed)**:
 - ⚠️ **A leftover `outputGain` in `stations.json` should be silently ignored** — the field is gone, so an old
   config that still carries it must neither error nor take effect. To check: set it to `0.9`; loudness must not change.
 - ⚠️ **Is the transitional level for unmeasured tracks acceptable** — a freshly added track that prewarm has not
-  reached yet plays at 0.12 (≈ -18 dB) first and switches to the measured value later. If one track is audible
+  reached yet plays at 0.40 (≈ -8 dB, current value) first and switches to the measured value later. If one track is audible
   as "quiet at first, then louder", prewarm simply had not finished; that is expected.
 - ⚠️ **Does disabling normalisation really play raw** — set `targetLoudness` to `0`; local stations should return to
   the master's native level (clearly louder) instead of staying attenuated.
 
 **Round 23 (evening of 2026-11-26, per-track loudness normalisation)**:
 - ⚠️ **Is the loudness across a mixed playlist actually aligned** — the core item. With the old fixed 0.10 the four
-  test tracks spanned 6.7 dB (-33 to -26.3); they should all sit near -30 now. How to judge: play a list with
+  test tracks spanned 6.7 dB (-33 to -26.3); they should all sit near the target now
+  (-30 when measured, -19 currently — see AI). How to judge: play a list with
   several different sources back to back — no track should suddenly sound much louder or quieter.
 - ⚠️ **Is `cache/loudness/` populated as expected** — after the first start the directory should contain
   `<hash>.lufs` files (two lines: `lufs=` / `tp=`), and the log should show one "实测完成 N/N" line.
