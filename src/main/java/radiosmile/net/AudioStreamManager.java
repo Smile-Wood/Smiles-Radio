@@ -156,7 +156,7 @@ public final class AudioStreamManager {
 			//
 			// 为什么必须在订阅时发：网络电台此后不再有音频块，pump 的
 			// 「增益变了才补发」路径永远不会为它触发。若客户端表里残留着
-			// 这个方块此前放本地台时收到的 outputGain（如 0.25），换到网络台后
+			// 这个方块此前放本地台时收到的推流增益（如 0.12），换到网络台后
 			// 没有任何包来覆盖它，整路就会被永久压到 25%——这正是
 			// 「网络电台声音小」的根因。订阅时下发 = 权威覆盖，客户端侧的
 			// 建流/停流兜底清理退居第二道防线。
@@ -787,8 +787,16 @@ public final class AudioStreamManager {
 	 * 先问 {@link radiosmile.radio.LoudnessNormalizer}：它按该曲目的
 	 * <b>实测响度</b>与配置的目标电平算出增益（实测结果存在缓存元数据里，
 	 * 预热阶段由 ffmpeg 写入，运行时不碰磁盘）。
-	 * 只有<b>还没实测</b>的曲目（刚放进来的新文件、缺 ffmpeg）才回落到
-	 * 固定的 {@link RadioStationRegistry#outputGain()}。
+	 *
+	 * <p>算不出来时分两种情况，<b>不能混为一谈</b>：
+	 * <ul>
+	 *   <li><b>归一化被显式关闭</b>（{@code targetLoudness >= 0}）→ 1.0，
+	 *       原样播放。用户说了"不要处理"，就不该偷偷压。</li>
+	 *   <li><b>还没实测</b>（预热未轮到 / 缺 ffmpeg / 实测失败）→
+	 *       {@link radiosmile.radio.LoudnessNormalizer#UNMEASURED_GAIN}。
+	 *       这是"暂时算不出来"，不是"不需要增益"；放 1.0 会让 -11 LUFS
+	 *       的母带以原电平炸出来。</li>
+	 * </ul>
 	 *
 	 * <p>{@code chunkFile} 是<b>入队时冻结</b>的文件，不是现读音源的当前文件：
 	 * 队列积压可达 4 秒，现读会让上一首最后几秒套用下一首的增益
@@ -810,7 +818,12 @@ public final class AudioStreamManager {
 		if (normalized >= 0.0F) {
 			return normalized;
 		}
-		return RadioStationRegistry.outputGain();
+		// 归一化被显式关掉：原样播放
+		if (RadioStationRegistry.targetLoudness() >= 0.0F) {
+			return 1.0F;
+		}
+		// 开着归一化但这首还没测完：用过渡电平，不做任何猜测性放大
+		return radiosmile.radio.LoudnessNormalizer.UNMEASURED_GAIN;
 	}
 
 	/**

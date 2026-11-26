@@ -62,6 +62,20 @@ public final class LoudnessNormalizer {
 	/** 增益下限（dB）。极端响的素材（母带压到 -6 LUFS）也不至于被压成听不见。 */
 	private static final float MIN_GAIN_DB = -40.0F;
 
+	/**
+	 * <b>还没有实测数据</b>时的暂用电平（≈ -18.4 dB）。
+	 *
+	 * <p>什么时候会用到：预热线程还没轮到这首曲子、服务器上没有 ffmpeg、
+	 * 或者实测失败。这些都是「暂时算不出增益」，不是「不需要增益」，
+	 * 所以不能放 1.0 让它以母带原电平（-11 LUFS 上下）炸出来。
+	 *
+	 * <p>取值依据：参考曲库实测母带集中在 -11 ~ -13 LUFS，
+	 * {@code 10^((-30 - (-11.3)) / 20) ≈ 0.116}，取整到 0.12。
+	 * 它<b>只是过渡值</b>——真正生效的是按曲实测的结果，
+	 * 所以这个数字不需要精确，只需要「不刺耳、不削波」。
+	 */
+	public static final float UNMEASURED_GAIN = 0.12F;
+
 	/** 实测结果：整轨积分响度与真峰（dBFS）。 */
 	private record Measured(float lufs, float tp) {
 	}
@@ -87,7 +101,9 @@ public final class LoudnessNormalizer {
 	 *                   这里会先反查回源文件再取元数据（见 {@link AudioTranscoder#sourceOf}）。
 	 *                   网络流传 {@code null} 或任意上游路径，都无从实测
 	 * @return {@code 0.0~1.0} 的增益；<b>返回负数表示「无法归一化」</b>
-	 *         （未实测 / 关闭了归一化 / 没有 ffmpeg），调用方应回落到固定增益
+	 *         （未实测 / 关闭了归一化 / 没有 ffmpeg），调用方按
+	 *         {@link RadioStationRegistry#targetLoudness()} 决定是原样播放
+	 *         还是用 {@link #UNMEASURED_GAIN} 兜底
 	 */
 	public static float gainFor(Path playedFile) {
 		if (playedFile == null) {
@@ -144,7 +160,7 @@ public final class LoudnessNormalizer {
 	 * 同时跑多个 ffmpeg 会抢满 CPU。
 	 *
 	 * <p>只有真有东西要测时才探测 ffmpeg——没有 ffmpeg 时这套机制静默失效，
-	 * 播放回落到 {@code outputGain}，不影响可用性。
+	 * 播放回落到 {@link #UNMEASURED_GAIN}，不影响可用性。
 	 */
 	public static void preheat(List<Path> sources) {
 		if (sources == null || sources.isEmpty()) {
@@ -170,8 +186,8 @@ public final class LoudnessNormalizer {
 					ffmpegMissingLogged = true;
 					SmileSRadio.LOGGER.warn(
 							"没有可用的 ffmpeg，响度归一化不可用（{} 个文件未实测）："
-									+ "播放将回落到固定的 outputGain。装上 ffmpeg 后重启即可",
-							todo.size());
+									+ "播放将回落到过渡电平 {}。装上 ffmpeg 后重启即可",
+							todo.size(), UNMEASURED_GAIN);
 				}
 				return;
 			}

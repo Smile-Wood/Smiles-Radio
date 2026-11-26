@@ -2,7 +2,7 @@
 
 **English** | [简体中文](HANDOVER.zh-CN.md)
 
-> Last updated: 2026-11-26 21:10 (**Round 23** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
+> Last updated: 2026-11-26 23:05 (**Round 24** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
 > Project path: `C:\Projects\Smile's Radio mod`
 > Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **355 KB**, BUILD SUCCESSFUL)
 > Version control: git initialised, **one commit per round of fixes**
@@ -1593,7 +1593,7 @@ the user wanted a loudness reference, not content matching.
 ##### Trade-off the user accepted
 
 The user chose to **calibrate local stations only** (keeping the "internet radio is passed through untouched" convention),
-target -30 LUFS. The resulting gap is documented in `RadioStationRegistry#outputGain`:
+target -30 LUFS. The resulting gap is documented in `RadioStationRegistry#DEFAULT_TARGET_LOUDNESS`:
 
 > With local at 0.10 (~-30 LUFS) and internet streams typically at ~-15 LUFS, **switching from a local station to a
 > network station jumps about 15 dB louder**.
@@ -1634,7 +1634,7 @@ playback (per audio chunk, O(1))
 | `LoudnessNormalizer` (new) | Measurement, metadata I/O, gain maths. **Attenuation only, never boosts** |
 | `AudioSource.currentFile()` (new) | The source itself answers "which file is playing", instead of looking it up by `trackIndex` |
 | `AudioTranscoder.sourceOf()` (new) | Reverse lookup: baked artefact → source file |
-| `AudioStreamManager.outputGainFor()` | Asks the normaliser first; falls back to `outputGain` only when unmeasured |
+| `AudioStreamManager.outputGainFor()` | Asks the normaliser first; two separate fallbacks: normalisation disabled → 1.0 (raw), not yet measured → `UNMEASURED_GAIN` (0.12) |
 | `RadioStationRegistry.targetLoudness` | Config key, default -30; `0` disables normalisation |
 | `S2C_OUTPUT_GAIN` | **Protocol unchanged**, still `(BlockPos, stationId, float)`; resent when the track changes |
 
@@ -1674,19 +1674,94 @@ The source of `e388c53e` has a true peak of +2.24 dBFS and is already clipping �
 - **First start is slower**: one full decode per track (~17 s each, 85 s for five), serial on a background thread, non-blocking.
 - **A one-chunk mismatch is possible at a track switch**: the gain is computed from `currentFile()` while chunks are queued,
   so the first chunk of a new track may carry the previous track's gain (~20 ms, inaudible).
-- **Without ffmpeg it silently falls back to `outputGain`**, with one explicit WARN.
+- **Without ffmpeg it falls back to the transitional level 0.12** (`LoudnessNormalizer.UNMEASURED_GAIN`), with one explicit WARN.
 - Metadata depends on file content only: **renaming does not re-measure, changing content always does**
   (the hash covers file size plus the first 64 KB).
 
+#### AH. Round 24: removing `outputGain`, and measuring a real internet radio (late 2026-11-26)
+
+##### What the user asked
+
+1. "outputGain can be deleted" — with per-track normalisation in place the fixed knob has no separate job;
+2. along the way, check the claim that "a chunk should carry both the gain and the audio data", and
+   "pull a real case and look at how loud internet radio actually is".
+
+##### Chain check: the gain is **not** inside the audio chunk
+
+Actual packet order (`AudioStreamManager.pump`):
+
+| Packet | Payload | Sent when |
+|---|---|---|
+| `S2C_OUTPUT_GAIN` | `BlockPos + stationId + float` | **only when the value changes** (`AudioSubscription.noteSentGain`) |
+| `S2C_AUDIO_CHUNK` | `BlockPos + stationId + trackIndex + sessionId + formatId + byte[]` | every chunk |
+
+Both go out inside the same `server.execute`, gain packet first; Fabric custom payloads use an
+ordered reliable channel, so the client always has the new gain before the matching audio.
+**The gain is deliberately not packed into the chunk** — that would feed non-audio bytes to the decoder,
+and a single offset mistake in front of the `byte[]` desynchronises the whole stream.
+
+##### Measurement: a real internet radio
+
+`FM90.7` (`https://lhttp-hw.qtfm.cn/live/15318146/64k.mp3`, 64 kbps MP3 / 48 kHz / stereo), 60 seconds captured:
+
+| Metric | Value |
+|---|---|
+| Integrated loudness | **-18.5 LUFS** |
+| True peak | -9.2 dBFS |
+| Loudness range (LRA) | 1.7 LU |
+
+Another 120 seconds in four 30-second windows: -19.1 / -19.6 / -18.2 / -18.3 LUFS.
+**The level barely moves** — the station runs broadcast processing (AGC plus a limiter), so programmes and ads
+do not jump in level.
+
+Band-by-band comparison against a local track (already normalised to -30 LUFS):
+
+| Band | 60-120 | 120-250 | 250-500 | 500-1k | 1k-2k | 2k-4k | 4k-8k | 8k-16k |
+|---|---|---|---|---|---|---|---|---|
+| Internet louder by | **+7.2** | **+11.9** | **+14.1** | **+13.9** | **+12.6** | **+11.4** | **+10.1** | **+7.0** |
+
+Median **+11.9 dB**. It is not a flat offset: the low mids differ most (14 dB) and both ends least (7 dB),
+which is the shape of the station's processing — and also why "multiply the network station by a constant"
+would not match the timbre.
+
+##### Changes
+
+| Item | Action |
+|---|---|
+| `outputGain` config | **deleted** (reader, default-config writer, README tables in both languages, sample values) |
+| `LoudnessNormalizer.UNMEASURED_GAIN` (new) | `0.12` (≈ -18.4 dB), transitional level while a track is **not yet measured** |
+| `targetLoudness >= 0` (normalisation off) | now **plays raw (1.0)** instead of quietly attenuating |
+| `AudioStreamManager.outputGainFor()` | the two "cannot compute" cases are strictly separated: off → 1.0; unmeasured → 0.12 |
+
+> ⚠️ **Why "cannot compute" must not default to 1.0**: local masters sit around -11 to -13 LUFS, so 1.0 would
+> blast them at full level. They have to be pulled near the target first, then replaced by the measured value.
+> Conversely, when the user explicitly disables normalisation the code must not attenuate anyway — that would mean
+> the option does nothing. Mixing those two meanings is exactly the pitfall this project has hit ten times.
+
+##### Still unresolved
+
+Internet radio stays at 1.0 while local sits at -30 LUFS — **about 11.5 dB apart** (measured).
+A live stream can be neither measured per track (there is no "whole song") nor estimated per chunk,
+so only a "master gain" can level them — which overturns "don't touch someone else's stream" and needs a decision.
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 363 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 354 KB**
 - `gradlew build` → BUILD SUCCESSFUL
 - **git is initialized**, one commit per round; `main` is in sync with origin/main
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 24 (late 2026-11-26, `outputGain` removed)**:
+- ⚠️ **A leftover `outputGain` in `stations.json` should be silently ignored** — the field is gone, so an old
+  config that still carries it must neither error nor take effect. To check: set it to `0.9`; loudness must not change.
+- ⚠️ **Is the transitional level for unmeasured tracks acceptable** — a freshly added track that prewarm has not
+  reached yet plays at 0.12 (≈ -18 dB) first and switches to the measured value later. If one track is audible
+  as "quiet at first, then louder", prewarm simply had not finished; that is expected.
+- ⚠️ **Does disabling normalisation really play raw** — set `targetLoudness` to `0`; local stations should return to
+  the master's native level (clearly louder) instead of staying attenuated.
 
 **Round 23 (evening of 2026-11-26, per-track loudness normalisation)**:
 - ⚠️ **Is the loudness across a mixed playlist actually aligned** — the core item. With the old fixed 0.10 the four

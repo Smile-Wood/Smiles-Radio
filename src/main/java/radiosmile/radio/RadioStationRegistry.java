@@ -379,7 +379,6 @@ public final class RadioStationRegistry {
 			// 读不到/为空都表示"用 PATH 里的 ffmpeg"，不影响既有部署。
 			if (root.isJsonObject()) {
 				readTopLevelFfmpeg(root.getAsJsonObject());
-				readTopLevelOutputGain(root.getAsJsonObject());
 				readTopLevelTargetLoudness(root.getAsJsonObject());
 			}
 
@@ -412,9 +411,9 @@ public final class RadioStationRegistry {
 	}
 
 	/**
-	 * 本地曲目的推流增益默认值（0.00~1.00）。
+	 * 逐曲响度归一化的默认目标电平（LUFS）。
 	 *
-	 * <h2>0.10 是怎么来的</h2>
+	 * <h2>-30 是怎么来的</h2>
 	 * 不是拍的。2026-11-26 拿一段《明日方舟：终末地》实机录像作听感基准，
 	 * 把录像音轨与源曲拆成 8 个 1/3 倍频程段做电平对照：
 	 *
@@ -431,88 +430,17 @@ public final class RadioStationRegistry {
 	 * 压 20 dB 即 -30 LUFS，正是听感基准的绝对电平。
 	 *
 	 * <p><b>所以这里的目标是"100% 音量时输出 -30 LUFS"</b>，而不是"乘一个安全系数"。
-	 * 0.10 = -20 dB，对 -9.9 LUFS 的母带正好落在 -30 LUFS。
-	 * 母带较安静的曲子（-15 LUFS）会落到 -35 LUFS，偏轻一档——
-	 * 固定增益无法自动适配母带差异，要彻底解决需要逐曲实测响度后归一化。
-	 */
-	public static final float DEFAULT_OUTPUT_GAIN = 0.10F;
-
-	/**
-	 * 逐曲响度归一化的默认目标电平（LUFS）。
-	 *
-	 * <p>取 -30：与「游戏内 BGM 一般被压低到母带以下约 20 dB」这一实测基准对齐
-	 * （推导见 {@link #DEFAULT_OUTPUT_GAIN} 的注释）。归一化开启后，
-	 * 任何母带的曲子都会被拉到这个电平，不再依赖固定增益。
+	 * 逐曲实测之后，任何母带的曲子都会被拉到这个电平：实测电平存进缓存元数据，
+	 * 播放时按「目标 − 实测」换算。早期那个固定增益（{@code outputGain}）
+	 * 适配不了母带差异，已经被它取代，配置里不再保留这个旋钮。
 	 */
 	public static final float DEFAULT_TARGET_LOUDNESS = -30.0F;
 
 	/**
-	 * 本地曲目的推流增益（0.00~1.00），由 {@code stations.json} 顶层
-	 * {@code outputGain} 配置。
-	 *
-	 * <h2>为什么本地要压，网络电台不压</h2>
-	 * 本地素材通常是"给游戏内直接播放"处理过的成品，母带电平打得高
-	 * （实测服务器上四首：平均 -9.1 ~ -15.3 dBFS，峰值全部顶到 0.0 dBFS）；
-	 * 网络电台是给流媒体做过统一压限的，电平明显低一档。两者混在一起，
-	 * 本地那一路会压过网络电台，而且已经满刻度，一叠上底噪层就会削波。
-	 *
-	 * <p><b>网络电台的字节是原样透传的</b>——上游怎么发就怎么播，
-	 * 所以这个增益只对本地曲目生效，正好让两者响度对齐。
-	 *
-	 * <p><b>注意：压低本地会放大两者的相对差距。</b>网络电台恒为 1.00，
-	 * 本地压到 0.10 之后，本地约 -30 LUFS、网络流（常见 -15 LUFS）约 -15 LUFS，
-	 * 从本地台切到网络台会响一档。要连网络台一起压，必须把这里改成
-	 * "整机主增益"并对 {@code isStreaming()} 也生效——那会推翻"不改别人的流"
-	 * 这条约定，需要单独决策（见交接文档 AD 节）。
-	 *
-	 * <h2>为什么是运行时乘，而不是烤进缓存</h2>
-	 * 服务端推的是已经编码好的 MP3 字节，直接在 PCM 混音阶段乘最省事：
-	 * 改这个值立刻生效，<b>不需要重新预热</b>，也不用为它多存一份缓存。
-	 */
-	private static volatile float outputGain = DEFAULT_OUTPUT_GAIN;
-
-	/** 当前生效的本地推流增益（0.00~1.00）。 */
-	public static float outputGain() {
-		return outputGain;
-	}
-
-	/**
-	 * 读取顶层的 {@code outputGain}（0.00~1.00 的浮点，便于直接当倍数用）。
-	 *
-	 * <p>缺失 / 非法都回落到 {@link #DEFAULT_OUTPUT_GAIN}，并只在
-	 * "配了但不可用"时打 WARN——正常部署不该被这行日志打扰。
-	 */
-	private static void readTopLevelOutputGain(JsonObject root) {
-		if (!root.has("outputGain") || root.get("outputGain").isJsonNull()) {
-			outputGain = DEFAULT_OUTPUT_GAIN;
-			return;
-		}
-		float raw;
-		try {
-			raw = root.get("outputGain").getAsFloat();
-		} catch (Exception e) {
-			SmileSRadio.LOGGER.warn("配置项 outputGain 不是数字，已按默认 {} 处理：{}",
-					DEFAULT_OUTPUT_GAIN, root.get("outputGain"));
-			outputGain = DEFAULT_OUTPUT_GAIN;
-			return;
-		}
-		if (Float.isNaN(raw)) {
-			outputGain = DEFAULT_OUTPUT_GAIN;
-			return;
-		}
-		float clamped = Math.max(0.0F, Math.min(1.0F, raw));
-		if (Math.abs(clamped - raw) > 0.0001F) {
-			SmileSRadio.LOGGER.warn("配置项 outputGain={} 超出 0.00~1.00，已夹到 {}", raw, clamped);
-		}
-		outputGain = clamped;
-		SmileSRadio.LOGGER.info("本地推流增益 outputGain={}（网络电台不受影响）", clamped);
-	}
-
-	/**
 	 * 逐曲响度归一化的目标电平（LUFS），默认 {@link #DEFAULT_TARGET_LOUDNESS}。
 	 *
-	 * <p>负数才有效；{@code 0}（或正数）表示<b>关闭归一化</b>，此时所有本地曲目
-	 * 一律用固定的 {@link #outputGain}。
+	 * <p>负数才有效；{@code 0}（或正数）表示<b>关闭归一化</b>，此时本地曲目
+	 * 原样播放（不做任何压缩）。
 	 */
 	private static volatile float targetLoudness = DEFAULT_TARGET_LOUDNESS;
 
@@ -548,8 +476,7 @@ public final class RadioStationRegistry {
 		}
 		if (raw >= 0.0F) {
 			targetLoudness = 0.0F;
-			SmileSRadio.LOGGER.info("响度归一化已关闭（targetLoudness={}），全部本地曲目使用 outputGain={}",
-					raw, outputGain);
+			SmileSRadio.LOGGER.info("响度归一化已关闭（targetLoudness={}），本地曲目原样播放", raw);
 			return;
 		}
 		// 低于 -70 LUFS 的目标没有意义（人耳听不见），按默认处理
@@ -626,18 +553,6 @@ public final class RadioStationRegistry {
 		root.addProperty("_说明_ffmpeg", "ffmpeg 可执行文件的完整路径。留空则使用系统 PATH 里的 ffmpeg；"
 				+ "仅当服务器上 ffmpeg 不在 PATH、或需要指定某个特定版本时才填"
 				+ "（例如 C:\\tools\\ffmpeg\\bin\\ffmpeg.exe 或 /usr/local/bin/ffmpeg）");
-
-		// <b>顶层：本地曲目的推流增益</b>（0.00~1.00）
-		root.addProperty("outputGain", DEFAULT_OUTPUT_GAIN);
-		root.addProperty("_说明_outputGain",
-				"本地曲目推流时统一乘上的增益，0.00~1.00（0.10 = 10%）。"
-						+ "默认 0.10 是按实测校准的：100% 音量时输出约 -30 LUFS，"
-						+ "与游戏内 BGM 的常见电平相当。"
-						+ "本地素材通常按「游戏内播放」打得比较响，而网络电台电平低一档，"
-						+ "压一下本地两边才对得齐，也能避免满刻度叠加底噪后削波。"
-						+ "网络电台是原样透传的，不受这个值影响。改完下一次重载配置即生效，"
-						+ "不需要重新预热缓存。"
-						+ "开启 targetLoudness 归一化后，这个值只作为「尚未实测」曲目的兜底");
 
 		// <b>逐曲响度归一化</b>：实测电平进缓存元数据，播放时按曲换算增益
 		root.addProperty("targetLoudness", DEFAULT_TARGET_LOUDNESS);

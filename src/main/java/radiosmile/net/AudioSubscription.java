@@ -384,7 +384,7 @@ public final class AudioSubscription {
 	/**
 	 * 记录推流增益，并回答「要不要补发一包」。
 	 *
-	 * <p>增益是运行时参数（{@code stations.json} 的 {@code outputGain}），
+	 * <p>增益是运行时参数（按曲实测 + 配置的 {@code targetLoudness} 换算而来），
 	 * 改完不需要重烤缓存：这里发现值变了就补发，客户端下一块音频就按新值混音。
 	 * 没变时只是一次浮点比较，放在每块之前调用也不会成为负担。
 	 *
