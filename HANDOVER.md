@@ -4,7 +4,7 @@
 
 > Last updated: 2026-11-26 23:05 (**Round 24** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
 > Project path: `C:\Projects\Smile's Radio mod`
-> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **357 KB**, BUILD SUCCESSFUL)
+> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **359 KB**, BUILD SUCCESSFUL)
 > Version control: git initialised, **one commit per round of fixes**
 > User guide: the full documentation for server owners/players is in [README.md](README.md) (this file is the developer handover)
 
@@ -1987,15 +1987,103 @@ all-missing txt                     → commented=0, file untouched             
 partially missing txt               → only the missing line commented           ✅
 ```
 
+#### AL. Round 28: the ID3 tag was being decoded as audio — "a local file only plays noise" (2026-11-27 13:0x)
+
+##### Symptom
+
+The user dropped in a fresh local test file `tangtang.mp3` (same directory as the txt, so the path was
+never the problem). It played **continuous noise**, and the log also carried a few
+"file not found, skipped: /tangtang.mp3" lines.
+
+##### Root cause: frame alignment mistook the UTF-16 BOM inside the ID3 tag for an MP3 frame header
+
+One suspicious line in the log:
+
+```text
+MP3 定位到 4 ms（字节偏移 21/9954897）
+```
+
+`tangtang.mp3` starts with `49 44 33 04 ...` (ID3v2.4) and its tag is **599,687 bytes** — 6% of the file,
+cover art included. Audio data only begins at offset **599,697**, yet the seek landed on **21**.
+
+`xxd -s 21`:
+
+```text
+00000015: fffe 004e fa8b 3a4e b65b 5450 4531 0000
+          ^^^^                        TPE1 (artist frame)
+```
+
+`FF FE` is the **UTF-16LE BOM**. The old predicate was
+
+```java
+buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0
+```
+
+`0xFE & 0xE0 == 0xE0` → match. So "align to a frame boundary" parked the read cursor **inside the tag's text**,
+the client's JLayer decoded garbage, and garbage is noise.
+
+##### Two more consequences of the same bug
+
+| Side effect | Why |
+|---|---|
+| **Players out of sync, everything ~14 s early** | The byte offset was a proportion of the **whole file**: `fileSize × target / duration`. 599,687 bytes ≈ 14 s (42563 B/s), so every seek undershot by those 14 seconds |
+| **Pacing 6.6% too fast → buffer thins → weak hiss** | `bytesPerSecond = whole-file bytes / duration` = 341 kbps, while the audio region is exactly **320 kbps** (`(9954897-599687)×8/233.88s`). The server paced for 341, i.e. pushed 6.6% more bytes than realtime, slowly draining the client buffer into periodic underruns → permanent weak hiss |
+
+So "it sounds like noise" had two stacked sources: decoding from inside the tag (the initial crackle) and the
+constant underrun hiss caused by over-pacing.
+
+##### Fix
+
+1. **Parse the ID3v2 length first** (`detectId3v2Size`): `"ID3" + version(2) + flags(1) + syncsafe size(4)`,
+   each size byte using only its low 7 bits; +10 more for the v2.4 footer flag. That yields `audioDataStart`;
+2. **Validate the frame header properly** (`isMp3FrameHeader`): reject version `01`, layer `00`,
+   bitrate index `0000`/`1111`, sample-rate index `11`, emphasis `10`. `FF FE` dies on bitrate index 0;
+3. **Search floor = `audioDataStart`**, only stepping back 8 KB max, so it can never fall back into the tag;
+   scan in blocks to EOF and return `-1` if no legal frame exists (caller then degrades to
+   "play from 0 + client discards the head");
+4. **Map millis against the audio region**: `audioStart + (fileSize-audioStart) × target / duration`;
+5. `bytesPerSecond` and `positionMillis()` use the audio region too.
+
+##### Measured (`build-verify/Mp3AlignCheck.java`, reading tangtang.mp3 directly)
+
+```text
+ID3v2 total = 599697 (audio starts here)
+
+target      4 ms   old: offset    170 → aligned     21 (inside the tag → guaranteed noise)
+                   new: offset 599857 → aligned 599697 (FF FB E4 = MPEG1 L3 320kbps, legal frame)
+target   1000 ms   old: offset  42564 → aligned  38479 (inside the tag)
+                   new: offset 639697 → aligned 632126 (audio region)
+```
+
+Every other local / cached file measures a tag of **34 – 193 bytes** (ffmpeg output, NetEase direct links),
+so the impact is negligible there — which is exactly why this only ever surfaced on a user-supplied file
+with large cover art.
+
+##### Also: `/tangtang.mp3` no longer counts as "missing"
+
+Those "file not found: /tangtang.mp3" lines were a separate matter: writing the "audio root" with a leading `/`.
+`Path.resolve("/x")` is `C:\x` on Windows and `/x` on Linux — never `audio/x`. Entries starting with `/` are now
+**retried with the slash stripped** against the three bases first, and only then treated as absolute paths,
+which keeps the intuitive spelling working without breaking genuine absolute paths.
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 357 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 359 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 27)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 28)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 28 (2026-11-27 13:0x, ID3 tag decoded as audio)**:
+- ⚠️ **Does `tangtang.mp3` now play properly** — the core item. Its ID3 tag is 586 KB (cover art), so the old
+  4 ms seek landed on offset 21 (the `FF FE` inside the tag) and decoded to noise. The log should now read
+  "MP3 定位到 x ms（字节偏移 599697/9954897，音频起点 599697）" and the track should start with music, no crackle.
+- ⚠️ **Do multiple players still line up** — the old whole-file mapping put every seek ~14 s early.
+  Listen with two clients on the same track; they must be on the same lyric at the same moment.
+- ⚠️ **Is the weak hiss gone** — pacing used 341 kbps against an actual 320 kbps, so the buffer kept draining
+  into periodic underruns. There should be no recurring "shh" any more.
 
 **Round 27 (midday 2026-11-27, track-change split + shuffle semantics)**:
 - ⚠️ **Are track changes now snappy and hiss-free** — the core item of this round. Previously every change cut the

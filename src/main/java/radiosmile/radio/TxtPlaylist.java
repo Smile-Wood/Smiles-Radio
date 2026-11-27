@@ -543,6 +543,31 @@ public final class TxtPlaylist {
 				return inBase.normalize();
 			}
 		}
+		// <b>以 / 开头的写法</b>：服主常把「音频根」写成 {@code /song.mp3}，
+		// 以为它表示 audio/ 目录。但 {@code Path.resolve("/song.mp3")} 在 Windows 上
+		// 是 {@code C:\song.mp3}、在 Linux 上是 {@code /song.mp3}，两边都是文件系统根，
+		// 于是被判成「文件不存在」而跳过——列表莫名少一首，界面上再选它就越界。
+		// 因此去掉前导 / 再按上面三档重试一次，最后才当绝对路径。
+		if (normalized.startsWith("/")) {
+			String withoutSlash = normalized.replaceFirst("^/+", "");
+			List<Path> retry = new ArrayList<>(3);
+			if (txt.getParent() != null) {
+				retry.add(txt.getParent().resolve(withoutSlash));
+			}
+			if (audioDir != null) {
+				retry.add(audioDir.resolve(withoutSlash));
+			}
+			if (base != null) {
+				retry.add(base.resolve(withoutSlash));
+			}
+			for (Path candidate : retry) {
+				if (Files.isRegularFile(candidate)) {
+					SmileSRadio.LOGGER.debug("txt 条目以 / 开头，已按相对音频目录解析：{} → {}",
+							line, candidate);
+					return candidate.normalize();
+				}
+			}
+		}
 		// 绝对路径兜底
 		try {
 			Path absolute = Path.of(normalized);
@@ -552,7 +577,7 @@ public final class TxtPlaylist {
 		} catch (Exception ignored) {
 			// 非法路径字符串
 		}
-		SmileSRadio.LOGGER.warn("txt 播放列表里的文件不存在，已跳过：{}（来自 {}）",
+		SmileSRadio.LOGGER.warn("txt 播放列表里的文件不存在，已跳过：{}（来自 {}，已试过列表目录 / audio / 配置根目录）",
 				line, txt.getFileName());
 		return null;
 	}

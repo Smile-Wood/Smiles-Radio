@@ -76,29 +76,51 @@ public final class FileAudioSource implements AudioSource {
 		this.raf = new RandomAccessFile(file.toFile(), "r");
 		this.durationMillis = radiosmile.radio.AudioDuration.millis(file);
 
+		// 音频数据区起点：跳过 ID3v2 标签。
+		//
+		// <b>这一步不能省</b>：ID3 里全是 UTF-16 文本，而 UTF-16LE 的 BOM 就是
+		// {@code FF FE}——{@code 0xFE & 0xE0 == 0xE0}，正好通过「帧同步字」的判据。
+		// 早期 alignToMp3Frame() 只认 {@code FF E0+}，于是从 0 开始向后扫描时，
+		// 第一个"命中"往往落在标签内部的文本里（实测 tangtang.mp3：标签长度 36，
+		// 音频从 46 开始，却定位到了 21），客户端从垃圾字节开始解码 → 持续噪音。
+		long audioStart = 0L;
+		long fileSize = this.raf.length();
+		try {
+			audioStart = detectId3v2Size(this.raf, fileSize);
+		} catch (IOException ignored) {
+			// 读不到就当没有标签：退化为旧行为，不至于拒绝播放
+		}
+		this.audioDataStart = audioStart;
+
 		// 精确码率：体积 / 时长。服务端配速的毫秒换算是以它为基数的，
 		// 若让读线程的「全速预读速度」去估，会被放大约 6 倍（预读 80KB/s vs 实播 16KB/s）。
+		// 用「音频数据区」而不是整文件：ID3 里可能塞着几百 KB 封面图，
+		// 算进去会把码率抬高、配速随之偏快。
 		int bps = 0;
-		if (this.durationMillis > 0) {
-			try {
-				bps = (int) (this.raf.length() * 1000L / this.durationMillis);
-			} catch (IOException ignored) {
-				// 退回自适应估算
-			}
+		if (this.durationMillis > 0 && fileSize > audioStart) {
+			bps = (int) ((fileSize - audioStart) * 1000L / this.durationMillis);
 		}
 		this.bytesPerSecond = bps > 512 ? bps : 0;
 
 		if (seekable && startOffsetMillis > 0 && this.durationMillis > 0) {
 			// MP3：直接按字节偏移定位，客户端无需丢弃
 			long target = startOffsetMillis % this.durationMillis;
-			long fileSize = this.raf.length();
-			long byteOffset = fileSize * target / this.durationMillis;
+			long byteOffset = mapMillisToBytes(target, fileSize);
 			// 向前找最近的 MP3 帧同步字，保证从帧边界开始
-			byteOffset = this.alignToMp3Frame(byteOffset, fileSize);
-			this.raf.seek(byteOffset);
+			long aligned = this.alignToMp3Frame(byteOffset, fileSize);
+			if (aligned < 0L) {
+				// 一个合法帧都找不到（极端损坏的文件）：退回「从头播 + 客户端丢前段」，
+				// 至少不会把垃圾字节当成音频推给客户端。
+				this.raf.seek(0L);
+				this.skipMillis = target;
+				SmileSRadio.LOGGER.warn("MP3 找不到帧同步字，改为从头播放并丢弃前 {} ms：{}",
+						target, file.getFileName());
+				return;
+			}
+			this.raf.seek(aligned);
 			this.skipMillis = 0L;
-			SmileSRadio.LOGGER.info("MP3 定位到 {} ms（字节偏移 {}/{}）",
-					target, byteOffset, fileSize);
+			SmileSRadio.LOGGER.info("MP3 定位到 {} ms（字节偏移 {}/{}，音频起点 {}）",
+					target, aligned, fileSize, audioStart);
 		} else {
 			this.skipMillis = (startOffsetMillis > 0 && this.durationMillis > 0)
 					? startOffsetMillis % this.durationMillis
@@ -109,25 +131,109 @@ public final class FileAudioSource implements AudioSource {
 		}
 	}
 
+	/** 音频数据区起点（ID3v2 标签之后）；没有标签时为 0。 */
+	private final long audioDataStart;
+
+	/**
+	 * 解析 ID3v2 标签总长度。
+	 *
+	 * <p>格式：{@code "ID3" + 版本(2) + 标志(1) + 同步安全整数(4)}，头固定 10 字节。
+	 * 同步安全整数每字节只用低 7 位（{@code b & 0x7F}），所以不能按普通 int 读。
+	 * ID3v2.4 若置了 footer 位（标志 {@code 0x10}），还要再多 10 字节。
+	 *
+	 * @return 音频数据起始偏移；没有 ID3v2 标签时返回 0
+	 */
+	private static long detectId3v2Size(RandomAccessFile raf, long fileSize) throws IOException {
+		if (fileSize < 10L) {
+			return 0L;
+		}
+		byte[] head = new byte[10];
+		long saved = raf.getFilePointer();
+		try {
+			raf.seek(0L);
+			if (raf.read(head) < 10) {
+				return 0L;
+			}
+		} finally {
+			raf.seek(saved);
+		}
+		if (head[0] != 'I' || head[1] != 'D' || head[2] != '3') {
+			return 0L;
+		}
+		// 版本字节：0xFF 表示非法，按无标签处理
+		if ((head[3] & 0xFF) == 0xFF || (head[4] & 0xFF) == 0xFF) {
+			return 0L;
+		}
+		long size = ((long) (head[6] & 0x7F) << 21)
+				| ((long) (head[7] & 0x7F) << 14)
+				| ((long) (head[8] & 0x7F) << 7)
+				| (head[9] & 0x7F);
+		long total = 10L + size;
+		if (((head[5] & 0xFF) & 0x10) != 0) {
+			total += 10L; // footer
+		}
+		return Math.min(total, fileSize);
+	}
+
+	/**
+	 * 把「歌内毫秒」换算成字节偏移。
+	 *
+	 * <p>换算基准是<b>音频数据区</b>（总长减掉 ID3 标签），不是整个文件：
+	 * 标签里的封面图与文本不占播放时间，算进去会让定位整体偏前。
+	 * 对小偏移尤其致命——4 ms 在 9.5 MB 上按整文件算是 21 字节（落在标签里），
+	 * 按音频区算才是正确的帧附近。
+	 */
+	private long mapMillisToBytes(long targetMillis, long fileSize) {
+		long audioBytes = fileSize - this.audioDataStart;
+		if (audioBytes <= 0L) {
+			return this.audioDataStart;
+		}
+		long offset = this.audioDataStart
+				+ audioBytes * targetMillis / Math.max(1L, this.durationMillis);
+		return Math.max(this.audioDataStart, Math.min(offset, fileSize - 1L));
+	}
+
 	/**
 	 * 向后搜索最近的 MP3 帧同步字，使读起点落在帧边界上。
 	 *
-	 * <p>本方法会临时读写文件，但调用点都在 {@link #seekTo(long)} 内部、
-	 * 且已持有对象锁，因此不会与读线程冲突。读完立即把指针交回调用方设置。
+	 * <h2>为什么判据不能只有 {@code FF E0+}</h2>
+	 * 早期只检查「首字节 0xFF，次字节高 3 位全 1」。这个条件<b>太松</b>：
+	 * UTF-16LE 的 BOM（{@code FF FE}）、以及很多随机字节都能通过，
+	 * 一旦落在 ID3 标签里就会把标签当音频推出去——客户端听到的是持续噪音。
+	 * 现在改为校验完整的帧头（版本 / 层 / 码率索引 / 采样率索引 / emphasis），
+	 * 保留值一律拒绝，误判率降到可以忽略。
+	 *
+	 * <p>搜索下限是 {@link #audioDataStart}：即便偏移算小了，也不会退进标签。
+	 *
+	 * @return 帧头位置；整个音频区都找不到时返回 -1
 	 */
 	private long alignToMp3Frame(long offset, long fileSize) throws IOException {
-		long pos = Math.max(0, offset - 4096);
+		long floor = this.audioDataStart;
+		long pos = Math.max(floor, offset - 8192L);
 		long saved = this.raf.getFilePointer();
 		try {
-			this.raf.seek(pos);
-			byte[] buf = new byte[(int) Math.min(65536, fileSize - pos)];
-			int read = this.raf.read(buf);
-			for (int i = 0; i < read - 4; i++) {
-				if ((buf[i] & 0xFF) == 0xFF && (buf[i + 1] & 0xE0) == 0xE0) {
-					return pos + i;
+			// 分段扫描：单块 64KB，命中就返回，不必把整个文件读进内存。
+			// 最多扫到文件尾——正常情况下第一个块就能命中。
+			while (pos < fileSize) {
+				this.raf.seek(pos);
+				int want = (int) Math.min(65536L, fileSize - pos);
+				if (want < 4) {
+					return -1L;
 				}
+				byte[] buf = new byte[want];
+				int read = this.raf.read(buf);
+				if (read < 4) {
+					return -1L;
+				}
+				// 留 3 字节余量：块末尾的帧头可能跨块，交给下一块的开头处理
+				for (int i = 0; i < read - 3; i++) {
+					if (isMp3FrameHeader(buf, i)) {
+						return pos + i;
+					}
+				}
+				pos += Math.max(1, read - 3);
 			}
-			return offset;
+			return -1L;
 		} finally {
 			// 恢复原位置，避免影响调用方的后续 seek
 			try {
@@ -136,6 +242,51 @@ public final class FileAudioSource implements AudioSource {
 				// 忽略
 			}
 		}
+	}
+
+	/**
+	 * 校验 MP3 帧头是否<b>合法</b>（不只是"看起来像"）。
+	 *
+	 * <p>逐字段检查，任何一个字段取到保留值就否决：
+	 * <ul>
+	 *   <li>{@code sync}：{@code FF} + 高 3 位全 1；</li>
+	 *   <li>{@code version}（bit 4-3）：{@code 01} 是保留值 → 拒绝；</li>
+	 *   <li>{@code layer}（bit 2-1）：{@code 00} 是保留值 → 拒绝；</li>
+	 *   <li>{@code bitrate}（第 3 字节高 4 位）：{@code 0000}（free）与 {@code 1111}（bad）→ 拒绝；</li>
+	 *   <li>{@code sampleRate}（第 3 字节 bit 3-2）：{@code 11} 是保留值 → 拒绝；</li>
+	 *   <li>{@code emphasis}（第 4 字节低 2 位）：{@code 10} 是保留值 → 拒绝。</li>
+	 * </ul>
+	 *
+	 * <p>这几个条件一起用之后，{@code FF FE}（UTF-16 BOM）会因为码率索引为 0 被拒——
+	 * 正是之前把 ID3 文本当成帧头的那个假阳性。
+	 */
+	private static boolean isMp3FrameHeader(byte[] buf, int i) {
+		if ((buf[i] & 0xFF) != 0xFF) {
+			return false;
+		}
+		int b1 = buf[i + 1] & 0xFF;
+		if ((b1 & 0xE0) != 0xE0) {
+			return false;
+		}
+		int version = (b1 >> 3) & 0x03;
+		if (version == 1) {
+			return false; // reserved
+		}
+		int layer = (b1 >> 1) & 0x03;
+		if (layer == 0) {
+			return false; // reserved
+		}
+		int b2 = buf[i + 2] & 0xFF;
+		int bitrate = (b2 >> 4) & 0x0F;
+		if (bitrate == 0x00 || bitrate == 0x0F) {
+			return false; // free / bad
+		}
+		int sampleRate = (b2 >> 2) & 0x03;
+		if (sampleRate == 0x03) {
+			return false; // reserved
+		}
+		int b3 = buf[i + 3] & 0xFF;
+		return (b3 & 0x03) != 0x02; // emphasis reserved
 	}
 
 	@Override
@@ -214,10 +365,13 @@ public final class FileAudioSource implements AudioSource {
 		}
 		try {
 			long size = this.raf.length();
-			if (size <= 0) {
+			long audioBytes = size - this.audioDataStart;
+			if (audioBytes <= 0L) {
 				return -1L;
 			}
-			return this.bytesRead * this.durationMillis / size;
+			// 按音频数据区换算：ID3 标签不占播放时间，算进去会让上报位置恒定偏前
+			long played = Math.max(0L, this.bytesRead - this.audioDataStart);
+			return played * this.durationMillis / audioBytes;
 		} catch (IOException e) {
 			return -1L;
 		}
@@ -237,11 +391,15 @@ public final class FileAudioSource implements AudioSource {
 		try {
 			long size = this.raf.length();
 			long target = positionMillis % this.durationMillis;
-			long byteOffset = size * target / this.durationMillis;
+			long byteOffset = mapMillisToBytes(target, size);
 			// 对齐探测会读文件，必须在跳转前完成，且不能干扰读指针
-			byteOffset = this.alignToMp3Frame(byteOffset, size);
-			this.raf.seek(byteOffset);
-			this.bytesRead = byteOffset;
+			long aligned = this.alignToMp3Frame(byteOffset, size);
+			if (aligned < 0L) {
+				// 没有合法帧：从头开始，让客户端自己丢前段（见 skipMillis 的说明）
+				return false;
+			}
+			this.raf.seek(aligned);
+			this.bytesRead = aligned;
 			return true;
 		} catch (IOException e) {
 			return false;
