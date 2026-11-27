@@ -2106,15 +2106,97 @@ unloaded or its chunk is not loaded, making the hiss louder than the programme. 
 > distance attenuation and panning each being missed once). `sourceGain()` was made the single entry point
 > to end it — but any branch that **computes gain without going through `sourceGain`** will grow it again.
 
+#### AM. Round 29: after `/radio reload` nothing plays — "you have to switch stations for it to work" (2026-11-27 13:3x)
+
+**User's words**: "reload之后不播放了，必须换台才有效".
+
+**The evidence chain (visible in the log)**
+
+The `run/logs/debug.log` reload at 13:32:11:
+
+```
+[Server thread] MP3 定位到 22 ms（字节偏移 45/7434493，音频起点 45）
+[Server thread] 播放列表定位：第 293166 轮 第 1/5 首，歌内 22 ms
+[Server thread] 重载完成：已按新计时基准重建 1 个订阅
+```
+
+So the server **moved the stream to the beginning of a different file** (the previous track was
+`94bdec…` at 128 kbps; after the reload the timeline picked `b1cf95…` at 320 kbps). On the client side
+there was **neither a station-switch log nor an "audio format" log** — because `stationId`, `trackIndex`
+and `sessionId` were all unchanged, `handleChunk` concluded "nothing happened" and
+**fed the new stream's bytes into a JLayer decoder that was still standing in the middle of the old stream**.
+
+**Why "fed in" equals "silence"**
+
+After the first frame JLayer switches to `STRICT_SYNC`: every following frame's `syncword` must match the
+first one, and `syncword = headerstring & 0xFFF80CC0` **includes the bitrate index** (`Header.read_header`).
+Once the bytes come from a file with a different bitrate that condition is **never** satisfied, so the
+`do{…}while(!sync)` loop keeps reading and `unreadFrame`-ing, swallowing the whole new stream —
+**no exception, no frames, and the thread does not even die**.
+
+Measured (`build-verify/JlayerResyncCheck.java`, using the three files from that very log):
+
+| segment | content | frames decoded |
+|---|---|---|
+| A | middle of `94bdec…` (128 kbps) | 517 |
+| B | start of `b1cf95…` (320 kbps, **bitrate changed**) | **0** (200 KB swallowed, 0 exceptions) |
+| C | middle of `9c1581…` (128 kbps, **back to A's bitrate**) | 520 |
+
+C recovers precisely because it shares A's bitrate — the syncword was still holding A's value. That control
+case pins the root cause: it is not "a bad frame threw", it is "the bitrate changed and strict sync can never
+match again". It also explains why **switching stations fixed it**: that closes the old decoder and creates a
+new one, which starts from `INITIAL_SYNC` and has nothing to match against.
+
+**The fix: local sources need a session id too**
+
+Session ids used to exist only for network streams (reconnect). Local sources now get one as well:
+**one id per source instance**, and any read-pointer jump takes a fresh id.
+
+- `AudioSource.LOCAL_SESSION_SEQ` + `nextLocalSessionId()`;
+- `FileAudioSource`: takes an id at construction, takes a new one in `reopen()` (single-file loop) and `seekTo()`;
+- `PlaylistAudioSource`: takes an id at construction; **not** on track change (in-playlist switching is a
+  continuous byte stream, the client already rebuilds on `trackIndex`, and a second id change would rebuild twice).
+
+The client's existing "session id changed → rebuild the decoder **before feeding**" branch then does its job:
+`/radio reload` and `/radio play <station> <n>` both open a new source → new id → the old decoder and whatever
+bytes it had buffered are thrown away → the new stream is decoded correctly from its very first byte.
+
+> "Before feeding" is the point: detecting it after the first chunk arrives (e.g. by guessing from the content)
+> means that chunk's frames have already been eaten by the old decoder. The session id is known **before** any
+> byte lands.
+
+**Decoder self-healing (a safety net, not the main path)**
+
+Even with session ids, "the decode thread ended" must never turn into permanent silence. In `Mp3StreamDecoder`:
+
+- `isAlive()`: thread dead / ended naturally / **64 KB fed with zero frames decoded** (stalled) → false;
+- `ClientAudioPlayer.Stream#feed` checks it on every chunk, rebuilds the decoder and logs one WARN;
+- the decode loop no longer dies on a single exception: failure count → 4 ms backoff (no 100% CPU spin) →
+  after 32 consecutive failures the Bitstream is dropped and `INITIAL_SYNC` is redone;
+- `feed()` returns immediately once the decode thread is gone and **never writes to the pipe again** — a full
+  64 KB pipe blocks forever, and the caller is the single global audio-ingest thread, so blocking it would
+  freeze everything, station switching included.
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 359 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 361 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 28)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 29)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 29 (2026-11-27 13:3x, silence after reload)**:
+- ⚠️ **Does playback resume immediately after `/radio reload`** — the core item. It used to need a station
+  switch. A line `字节流已更换（会话 0 -> N），在喂数据前重建解码器 @BlockPos{...}` should now appear in the log
+  and the sound should not stop for good (there may be a short transition gap, but no permanent silence).
+- ⚠️ **Does it work when the next track has a different bitrate** — that was the exact cause
+  (128 kbps ↔ 320 kbps). The `realtest` list contains both; reload repeatedly and sound should always return.
+- ⚠️ **Does a single-file loop survive its second pass** — `reopen()` now takes a new session id and rebuilds
+  every lap. Listen through two full laps; the second must not go mute or noisy.
+- ⚠️ **Any new WARN** — if you see `MP3 解码器已停止，重建以恢复播放` or `MP3 解码器遇到坏帧，开始重新同步`,
+  send the context: it means something else is still jumping the byte stream.
 
 **Round 28 (2026-11-27 13:0x, ID3 tag decoded as audio)**:
 - ⚠️ **Does the noise follow the volume now** — the addendum. The server-sent block volume used to land in

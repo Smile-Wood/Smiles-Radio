@@ -220,6 +220,15 @@ public final class ClientAudioPlayer {
 				this.mp3 = new Mp3StreamDecoder(this.blockPosKey, skip);
 				PcmSink.INSTANCE.start();
 			}
+			// <b>解码器自愈</b>：解码线程若已结束（坏数据把它逼停），这条流会
+			// 永久静音，直到玩家手动换一次台——那正是玩家反馈的「重载后不播了」。
+			// 这里每块检查一次，发现死了就换一个新的：新解码器会从管道/下一块的
+			// 帧同步字重新开始，至少能继续出声，而不是一直哑着。
+			if (this.mp3 != null && !this.mp3.isAlive()) {
+				SmileSRadio.LOGGER.warn("MP3 解码器已停止，重建以恢复播放 @{}", BlockPos.of(this.blockPosKey));
+				this.mp3.close();
+				this.mp3 = new Mp3StreamDecoder(this.blockPosKey, 0L);
+			}
 			if (this.mp3 != null) {
 				this.mp3.feed(data, 0, data.length);
 			}
@@ -328,10 +337,10 @@ public final class ClientAudioPlayer {
 		boolean streamRestarted = stream != null && stream.sessionId >= 0
 				&& stream.sessionId != sessionId;
 		if (stationChanged || trackChanged || streamRestarted) {
-			// 只记「断线重连」——那是真的异常，值得留痕。
+			// 只记「会话号变了」——那是真的换了一条字节流，值得留痕。
 			// 换台/换曲不记：播放列表每几分钟一首，日志里刷这种正常事件没有价值。
 			if (streamRestarted) {
-				SmileSRadio.LOGGER.info("网络流断线重连（会话 {} -> {}），重建解码器 @{}",
+				SmileSRadio.LOGGER.info("字节流已更换（会话 {} -> {}），在喂数据前重建解码器 @{}",
 						stream.sessionId, sessionId, pos);
 			}
 			stream.close();

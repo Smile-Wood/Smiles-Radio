@@ -17,6 +17,36 @@ import java.io.IOException;
  */
 public interface AudioSource {
 	/**
+	 * 本地音源的会话号分配器。
+	 *
+	 * <h2>为什么本地音源也需要会话号</h2>
+	 * 会话号原本只服务于网络流（断线重连后字节不连续）。但<b>本地音源同样会「跳字节」</b>：
+	 * <ul>
+	 *   <li>{@code /radio reload}：整条订阅被拆掉重建，{@code openSource()} 会
+	 *       <b>新开一个文件源</b>，从时间轴算出的位置重新开始推；</li>
+	 *   <li>{@code /radio play <频道> <序号>}：同上；</li>
+	 *   <li>单文件循环：{@link #reopen()} 会把同一个文件的读指针挪到「此刻该播的位置」。</li>
+	 * </ul>
+	 *
+	 * <p>早期本地音源恒返回 {@code 0}，客户端因此<b>识别不出这是新的一条字节流</b>，
+	 * 会把新流的字节喂给<b>正处在旧流中间的</b> JLayer 解码器。实测（build-verify/
+	 * JlayerResyncCheck.java）：硬跳转后喂 200KB 只能解出 <b>10 帧</b>（正常约 480 帧），
+	 * 其余字节在反复「找同步字」中被吞掉——听感就是<b>重载后彻底没声音</b>，
+	 * 必须换一次台（那会新建解码器）才恢复。这正是玩家反馈的现象。
+	 *
+	 * <p>因此本地音源也分配会话号：<b>每个音源实例一个号</b>，且任何「读指针跳变」
+	 * 都换新号。客户端已有的「会话号变化 → 在喂数据之前重建解码器」逻辑
+	 * （{@code ClientAudioPlayer#handleChunk}）随即生效，新流从第一个字节就被正确解码。
+	 */
+	java.util.concurrent.atomic.AtomicInteger LOCAL_SESSION_SEQ =
+			new java.util.concurrent.atomic.AtomicInteger(1);
+
+	/** 取一个新的本地音源会话号（从 1 开始，{@code 0} 保留给「无会话概念」的旧语义）。 */
+	static int nextLocalSessionId() {
+		return LOCAL_SESSION_SEQ.getAndIncrement();
+	}
+
+	/**
 	 * 读取至多 {@code maxBytes} 字节。
 	 *
 	 * @return 实际读到的字节；返回 {@code null} 或空数组表示流结束
@@ -101,14 +131,18 @@ public interface AudioSource {
 	}
 
 	/**
-	 * 流会话号：上游断线并重连后递增。
+	 * 流会话号：本条字节流<b>换了一条</b>就变。
 	 *
-	 * <p>重连后的字节与断线前的<b>不连续</b>（缺了断线期间的内容），
-	 * 但 MP3 帧自包含，解码器会把它们当成同一条流继续解——
+	 * <p>网络流：上游断线并重连后递增——重连后的字节与断线前的<b>不连续</b>
+	 * （缺了断线期间的内容），但 MP3 帧自包含，解码器会把它们当成同一条流继续解，
 	 * 听感是声音突然「卡回」到断线前的位置附近。
-	 * 客户端发现会话号变化时必须重建解码器并清空已缓冲数据。
 	 *
-	 * <p>非流式音源恒为 0。
+	 * <p>本地音源：<b>每个音源实例</b>一个号（见 {@link #nextLocalSessionId()}），
+	 * 且读指针跳变（重载重建、跳曲、循环回绕）时换新号。原因同样是「字节跳变」，
+	 * 实测硬跳转会让 JLayer 吞掉新流的绝大部分数据。
+	 *
+	 * <p>客户端发现会话号变化时，必须在<b>喂入这一块数据之前</b>重建解码器，
+	 * 并把旧解码器里残留的字节一起丢掉。
 	 */
 	default int sessionId() {
 		return 0;

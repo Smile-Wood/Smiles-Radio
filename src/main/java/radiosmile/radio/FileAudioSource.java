@@ -22,6 +22,16 @@ public final class FileAudioSource implements AudioSource {
 	/** 本文件在播放列表中的序号；单文件恒为 0。 */
 	private final int trackIndex;
 
+	/**
+	 * 本条字节流的会话号。
+	 *
+	 * <p>默认每个实例一个号；{@link #reopen()}、{@link #seekTo(long)} 这类
+	 * 「读指针跳变」会换新号——客户端据此在喂数据之前重建解码器。
+	 * 不换号的话，新位置的数据会被喂给处在旧位置的 JLayer，
+	 * 实测只能解出个位数帧，听感是彻底没声音（详见 {@link AudioSource#LOCAL_SESSION_SEQ}）。
+	 */
+	private volatile int sessionId = AudioSource.nextLocalSessionId();
+
 	/** 精确码率（字节/秒）：由文件体积与时长算出，用于服务端配速与读块大小。 */
 	private final int bytesPerSecond;
 
@@ -300,6 +310,11 @@ public final class FileAudioSource implements AudioSource {
 	}
 
 	@Override
+	public int sessionId() {
+		return this.sessionId;
+	}
+
+	@Override
 	public int bytesPerSecond() {
 		return this.bytesPerSecond;
 	}
@@ -400,6 +415,8 @@ public final class FileAudioSource implements AudioSource {
 			}
 			this.raf.seek(aligned);
 			this.bytesRead = aligned;
+			// 读指针跳变 = 换了一条字节流：换号让客户端在喂下一块之前重建解码器
+			this.sessionId = AudioSource.nextLocalSessionId();
 			return true;
 		} catch (IOException e) {
 			return false;
@@ -431,14 +448,21 @@ public final class FileAudioSource implements AudioSource {
 	public void reopen() throws IOException {
 		if (this.durationMillis <= 0) {
 			this.raf.seek(0);
+			// 回绕也是一次跳变：客户端必须重建解码器
+			this.sessionId = AudioSource.nextLocalSessionId();
 			return;
 		}
 		long epoch = radiosmile.radio.RadioStationRegistry.startEpochMillis();
 		long elapsed = epoch > 0 ? System.currentTimeMillis() - epoch : 0L;
 		long target = elapsed % this.durationMillis;
 		long fileSize = this.raf.length();
-		long byteOffset = Math.max(0, fileSize * target / this.durationMillis - 2048);
+		// 与构造时用同一套换算（含 ID3 跳过），否则每绕一圈都会偏前几百毫秒
+		long byteOffset = Math.max(0L, mapMillisToBytes(target, fileSize) - 2048L);
 		this.raf.seek(byteOffset);
+		this.bytesRead = byteOffset;
+		// 单文件循环每圈都要换号：不换的话第二圈开始 JLayer 就在解「错位字节」，
+		// 听感是越循环越哑，最终完全没声
+		this.sessionId = AudioSource.nextLocalSessionId();
 	}
 
 	public Path file() {

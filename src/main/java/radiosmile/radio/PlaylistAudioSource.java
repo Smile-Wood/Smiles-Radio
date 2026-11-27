@@ -34,12 +34,28 @@ public final class PlaylistAudioSource implements AudioSource {
 	private AudioSource current;
 	private volatile boolean closed;
 
+	/**
+	 * 本条字节流的会话号（每个实例一个）。
+	 *
+	 * <p><b>不在换曲时换号</b>：台内换曲是一条连续字节流（旧曲尾巴接新曲开头），
+	 * 客户端已经靠 {@code trackIndex} 变化重建解码器，再换号只会重建两次。
+	 * 这里要覆盖的是「<b>整条订阅被重建</b>」——{@code /radio reload}、
+	 * {@code /radio play}：那会新开一个本类实例，构造时就拿到不同的号，
+	 * 客户端据此在喂新流第一个字节之前把旧解码器换掉。
+	 */
+	private final int sessionId = AudioSource.nextLocalSessionId();
+
 	public PlaylistAudioSource(PlaylistTimeline timeline, int startRound, int startIndex,
 			AudioSource startSource) {
 		this.timeline = timeline;
 		this.round = startRound;
 		this.index = startIndex;
 		this.current = startSource;
+	}
+
+	@Override
+	public int sessionId() {
+		return this.sessionId;
 	}
 
 	/**
