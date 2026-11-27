@@ -2177,15 +2177,110 @@ Even with session ids, "the decode thread ended" must never turn into permanent 
   64 KB pipe blocks forever, and the caller is the single global audio-ingest thread, so blocking it would
   freeze everything, station switching included.
 
+#### AN. Round 30: reload noise goes only to stations that actually jumped + the hiss layer is folded into the output bus (2026-11-27 13:5x)
+
+Two user reports, both about the effect layer's gain and ownership:
+
+1. "网络电台在重载的时候也会有底噪，但网络电台不归本地重载底噪管" — internet radio picks up hiss on reload, though it should not.
+2. "然后弱网底噪也会穿透混音链路" — the weak-network hiss punches through the mix chain.
+
+**1) Why reload must not touch internet radio**
+
+`/radio reload` calls `AudioStreamManager.rebuildAll()`, which walks `SUBSCRIPTIONS`
+(**local stations only**). Internet radio lives in `STREAMING_SUBS` and reload does not
+touch it at all — the audio is pulled by the client straight from the upstream, and the
+pull thread keeps running. So a player listening to internet radio experiences
+**zero discontinuity** during the reload.
+
+But `RadioCommand.notifyClientsReloaded()` used to broadcast an **empty** packet to
+everyone, and the client answered it with `playTuningNoise()` + `beginTransitionSilence(2000)`.
+Internet-radio listeners therefore got a gratuitous burst of tuning hiss and a free
+two-second silence window (inside which all hiss predicates are zeroed, so even a real
+weak-network condition would stay silent).
+
+> A subtler detail found on the way: the position-less `playTuningNoise()` does **not**
+> reset `tuningNoiseBlock` to -1. If the player had switched stations before, the anchor
+> still pointed at that block, so this "reload noise" came out of the *previous* station's
+> position — which sounds exactly like "some station is leaking hiss".
+
+**Fix: ship the rebuilt-station list in the packet.**
+
+- `S2C_RELOADED` becomes `varInt count + writeUtf(id) * count` (was empty);
+- `rebuildAll()` returns the set of rebuilt station ids; `rebuildStation()` sends its own id;
+- the client walks `PcmSink.activeBlockKeys()` and plays the tuning noise **only for blocks
+  whose `stationOf(key)` is in the list**; when `covered == 0` it does nothing and logs
+  `服务端重载了 N 个频道，但本机没有在听（保持安静）`;
+- the silence window is opened only when `covered > 0`.
+
+Result: internet-radio listeners stay **completely silent** across a reload, while
+local-station listeners still get the noise that covers the jump.
+
+**2) "Hiss punches through the mix chain" = the fourth missed multiplication, now closed structurally**
+
+Vanilla volume (blocks x master) used to live inside `sourceGain()`, and `sourceGain()` is
+only called by branches that choose to call it. That has now caused four misses in this
+project: block volume, distance attenuation, panning, and the anchor-less hiss branch.
+Each time the cause was "one branch computed a gain and forgot one factor".
+
+This round moves the invariant from the **call sites** to the **exit**:
+
+| Location | Change |
+|---|---|
+| `outputBusGain()` (new) | `vanillaBlocksVolume * vanillaMasterVolume` |
+| `sourceGain()` | those two factors removed; only `volumeFor x distGain x streamGain` |
+| `overlayNetworkNoise()` anchor-less | no longer multiplies vanilla volume itself |
+| `toBytes()` | **multiplies `outputBusGain()` once, then clamps** |
+
+`toBytes()` is the only place that writes bytes to the sound card, so every layer
+(programme, hiss, tuning noise, anything added later) must pass through it. A missed
+multiplication stops being "a mistake you can make" and becomes "code you cannot write".
+
+> **Order bug fixed on the way**: the old `toBytes()` did `mix[i] * 32767` and *then*
+> clamped, while vanilla volume was not yet in `mix`. That is why "turn it down and it still
+> clips" — the clipping happened before the volume was applied. Now it is **bus gain first,
+> clamp second**, so lowering the volume genuinely removes the overload.
+
+**Hiss gain ownership now has three tiers** (`overlayNetworkNoise`):
+
+1. position known → `sourceGain(anchor, distanceGain)`: volume/distance/pan identical to the programme;
+2. **station known but its position is gone** (block unloaded / chunk not loaded) → use
+   `volumeFor(anchor)`: the slider can be read without any geometry;
+3. no ownership at all → `blockVolume x 0.6` (`FALLBACK_DISTANCE_GAIN`, roughly the
+   attenuation at 22 blocks, so "cannot locate" does not become "louder than the programme").
+
+Tier 2 is new. It used to fall straight to tier 3's `blockVolume` (= "the block the player
+last touched"), so turning station A down and walking away made station B's hiss play at B's
+volume — which looks exactly like "not under control", when in fact the wrong object was read.
+
+**Verification**
+
+- `compileJava` / `compileClientJava` pass; `gradlew build` BUILD SUCCESSFUL;
+- static check: `vanillaBlocksVolume` / `vanillaMasterVolume` are read in exactly one place
+  inside `PcmSink` now (`outputBusGain()`), down from three;
+- awaiting in-game: silent reload while on internet radio; tuning noise still there on local
+  stations; volume 0 kills the hiss; vanilla "Blocks" volume 0 also kills it; no clipping at 10%.
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 361 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 362 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 29)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 30)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 30 (2026-11-27 13:5x, reload noise ownership + hiss folded into the output bus)**:
+- ⚠️ **On internet radio, `/radio reload` must be completely silent** — the core item. The log
+  should show `服务端重载了 N 个频道 [...]，但本机没有在听（保持安静）`. If you still hear a hiss
+  burst, the block is missing from `activeBlockKeys()` (its station was never registered) —
+  send me that log line and the block coordinates.
+- ⚠️ **On a local station, `/radio reload` must still play the tuning noise** — narrowing must
+  not remove the cover that is genuinely needed. The log should say `其中 1 台在本机`.
+- ⚠️ **Volume 0 must silence the hiss completely** — every layer now goes through the output bus.
+- ⚠️ **Vanilla "Blocks" volume 0 must also silence it** (the anchor-less branch used to miss it).
+- ⚠️ **At 10% volume nothing should clip** — clamping now happens after the volume is applied;
+  it used to happen before, which felt like "turning it down still blows up".
 
 **Round 29 (2026-11-27 13:3x, silence after reload)**:
 - ⚠️ **Does playback resume immediately after `/radio reload`** — the core item. It used to need a station

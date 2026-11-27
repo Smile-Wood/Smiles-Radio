@@ -87,10 +87,11 @@ public final class RadioCommand {
 
 		// 关键：只改计时基准是不够的——已建立的订阅持有固定的文件指针，
 		// 必须重建才能让所有人真正从新位置开始播（详见 AudioStreamManager#rebuildAll）。
-		radiosmile.net.AudioStreamManager.rebuildAll();
+		java.util.List<String> rebuilt = radiosmile.net.AudioStreamManager.rebuildAll();
 
-		// 通知所有客户端「发生了重载」：让它们播调台噪盖住这次跳变。
-		notifyClientsReloaded(server);
+		// 通知客户端「哪些频道发生了跳变」：只有听这些频道的玩家才播调台噪。
+		// 网络电台不在这份清单里（重载不动它的订阅），所以听网络台的玩家保持安静。
+		notifyClientsReloaded(server, rebuilt);
 
 		int count = RadioStationRegistry.stations().size();
 		long epoch = RadioStationRegistry.startEpochMillis();
@@ -125,20 +126,24 @@ public final class RadioCommand {
 	}
 
 	/**
-	 * 通知所有在线客户端「服务端重载了电台配置」。
+	 * 通知在线客户端「服务端重载了哪些频道」。
 	 *
-	 * <p>客户端收到后播一段调台噪，把重建订阅造成的跳变盖住——
-	 * 否则听感就是「音乐突然跳到别的位置」，比有噪声更难理解。
+	 * <p>客户端据此<b>只对真正被重建的频道</b>播一段调台噪、开一个静音窗，
+	 * 把重建订阅造成的跳变盖住——否则听感就是「音乐突然跳到别的位置」，
+	 * 比有噪声更难理解。
+	 *
+	 * <p><b>为什么要带频道清单</b>：重载从不动网络电台的订阅
+	 * （{@code STREAMING_SUBS} 只是登记簿，音频由客户端直连上游），
+	 * 那条链路一次跳变都没有。早期这里无条件广播空包，客户端一律响噪 + 静音窗，
+	 * 于是网络台玩家在重载时会平白听到一段噪声
+	 * （用户反馈：「网络电台不归本地重载底噪管」）。
+	 *
+	 * @param stationIds 本次被重建的频道；空集合表示"没有任何频道跳变"
 	 */
-	static void notifyClientsReloaded(MinecraftServer server) {
+	static void notifyClientsReloaded(MinecraftServer server,
+			java.util.Collection<String> stationIds) {
 		for (net.minecraft.server.level.ServerPlayer player : server.getPlayerList().getPlayers()) {
-			if (!net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking
-					.canSend(player, radiosmile.net.RadioNetworking.S2C_RELOADED)) {
-				continue;
-			}
-			var buf = new net.minecraft.network.FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
-			net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(
-					player, radiosmile.net.RadioNetworking.S2C_RELOADED, buf);
+			radiosmile.net.AudioStreamManager.sendReloaded(player, stationIds);
 		}
 	}
 

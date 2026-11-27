@@ -158,17 +158,52 @@ public final class ClientRadioNetwork {
 					radiosmile.client.audio.PcmSink.INSTANCE.beginTransitionSilence(millis);
 				});
 
-		// 服务端重载了电台配置：接下来会有一轮重建订阅带来的跳变。
-		// 播一段调台噪把它盖住，并把各方块的故障显示清掉（重载后即将重新订阅）。
+		// 服务端重载了电台配置：包体里带着「哪些频道被重建了」。
+		//
+		// <b>只给真正发生跳变的频道做掩护</b>：早期无论听什么台，收到这个包就播调台噪 +
+		// 开 2 秒静音窗。但重载只重建本地台订阅，网络电台（客户端直连上游）一次都没断，
+		// 却被同一段噪声糊了一遍——用户反馈「网络电台在重载的时候也会有底噪，
+		// 但网络电台不归本地重载底噪管」。
+		//
+		// 现在按频道清单筛选：听网络台的玩家不在清单里，什么都不做（保持安静）。
 		ClientPlayNetworking.registerGlobalReceiver(RadioNetworking.S2C_RELOADED,
 				(Minecraft client, ClientPacketListener handler, FriendlyByteBuf buf, PacketSender sender) -> {
+					int count = buf.readVarInt();
+					java.util.Set<String> rebuilt = new java.util.HashSet<>();
+					for (int i = 0; i < count; i++) {
+						rebuilt.add(buf.readUtf());
+					}
 					client.execute(() -> {
-						radiosmile.SmileSRadio.LOGGER.info("服务端已重载电台配置，播放跳变将由调台噪掩盖");
-						radiosmile.client.audio.PcmSink.INSTANCE.playTuningNoise();
-						// 重载会重建<b>每个频道</b>的订阅（网络台还要含建连），
-						// 空窗比普通换曲长得多，所以这里直接给一个更长的窗。
-						// 上限由 PcmSink 自己钳住（TRANSITION_SILENCE_MAX_MILLIS），
-						// 真坏掉的台仍会按时响底噪。
+						if (rebuilt.isEmpty()) {
+							// 没有任何频道被重建（例如全服都没人在听本地台）：
+							// 没有跳变就没有掩护的理由，宁可安静。
+							radiosmile.SmileSRadio.LOGGER.info("服务端重载完成，无频道跳变（保持安静）");
+							return;
+						}
+						int covered = 0;
+						for (long key : radiosmile.client.audio.PcmSink.INSTANCE.activeBlockKeys()) {
+							String current = radiosmile.client.audio.PcmSink.INSTANCE.stationOf(key);
+							if (current == null || !rebuilt.contains(current)) {
+								// 这一台没被重建（网络电台 / 别的频道）：它的字节流是连续的，
+								// 加噪声只会凭空制造一段"故障感"。
+								continue;
+							}
+							radiosmile.client.audio.PcmSink.INSTANCE.playTuningNoise(
+									net.minecraft.core.BlockPos.of(key));
+							covered++;
+						}
+						if (covered == 0) {
+							radiosmile.SmileSRadio.LOGGER.info(
+									"服务端重载了 {} 个频道 {}，但本机没有在听（保持安静）",
+									rebuilt.size(), rebuilt);
+							return;
+						}
+						radiosmile.SmileSRadio.LOGGER.info(
+								"服务端重载了 {} 个频道 {}，其中 {} 台在本机，播放跳变将由调台噪掩盖",
+								rebuilt.size(), rebuilt, covered);
+						// 重建订阅（含重新打开文件 / 按新基准定位）的空窗比普通换曲长，
+						// 给一个更长的窗；上限由 PcmSink 自己钳住
+						// （TRANSITION_SILENCE_MAX_MILLIS），真坏掉的台仍会按时响底噪。
 						radiosmile.client.audio.PcmSink.INSTANCE.beginTransitionSilence(2000);
 					});
 				});

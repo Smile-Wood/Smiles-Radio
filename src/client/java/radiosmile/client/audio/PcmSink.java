@@ -344,6 +344,24 @@ public final class PcmSink {
 		}
 	}
 
+	/**
+	 * 某个音源此刻在播哪个频道；{@code null} 表示没有登记。
+	 *
+	 * <p>供「重载跳变掩护」判断：只有真正被重建的频道才该响噪声。
+	 */
+	public String stationOf(long blockPos) {
+		return this.blockStations.get(blockPos);
+	}
+
+	/**
+	 * 当前所有有频道登记的音源键（= 正在播放的方块）。
+	 *
+	 * <p>返回副本：调用方在客户端主线程遍历，混音/网络线程可能同时在改。
+	 */
+	public java.util.Set<Long> activeBlockKeys() {
+		return new java.util.HashSet<>(this.blockStations.keySet());
+	}
+
 	/** 移除某个音源的全部待混音数据（停止 / 切台时调用）。 */
 	public void removeSource(long blockPos) {
 		synchronized (this.lock) {
@@ -1247,10 +1265,33 @@ public final class PcmSink {
 	 */
 	private float sourceGain(long blockPos, float distGain) {
 		return this.volumeFor(blockPos)
-				* this.vanillaBlocksVolume
-				* this.vanillaMasterVolume
 				* distGain
 				* this.streamGainFor(blockPos, this.blockStations.get(blockPos));
+	}
+
+	/**
+	 * 输出<b>总线</b>增益：原版方块音量 × 原版总音量。
+	 *
+	 * <h2>为什么把它从 {@code sourceGain} 里挪到 {@link #toBytes}</h2>
+	 * 这两项是<b>全局</b>的（不属于任何音源），作用对象是「最终输出」，
+	 * 而不是「某一路节目」。之前它们乘在 {@code sourceGain} 里，
+	 * 于是每一层效果音都得<b>自己记得</b>乘一遍：
+	 * <ul>
+	 *   <li>节目走 {@code sourceGain} —— 有乘；</li>
+	 *   <li>调台噪 / 底噪走 {@code sourceGain} —— 有乘；</li>
+	 *   <li>无归属的底噪分支自己算 gain —— 曾经漏乘（用户反馈「噪音不受混音控制」，
+	 *       修过一次）；</li>
+	 *   <li>将来任何新增的层（提示音、淡入淡出、录音回放……）—— <b>必然</b>再漏一次。</li>
+	 * </ul>
+	 * 这类「漏乘」在本项目已经出现过四次（方块音量、距离、声像、无归属分支）。
+	 * 根因不是谁不小心，而是<b>把不变量交给了每个调用点去遵守</b>。
+	 *
+	 * <p>收口到输出总线之后，所有进入 {@code mix} 的样本（节目、底噪、调台噪、
+	 * 任何以后加的东西）都<b>物理上</b>必须经过这里一次——
+	 * 漏乘从一个「可能犯的错」变成了「写不出来的代码」。
+	 */
+	private float outputBusGain() {
+		return this.vanillaBlocksVolume * this.vanillaMasterVolume;
 	}
 
 	/**
@@ -1460,33 +1501,41 @@ public final class PcmSink {
 			this.effectScratch = new float[WRITE_FRAMES];
 		}
 		long anchor = this.networkNoiseBlock;
+		float center = (float) Math.sqrt(0.5);
 		float[] pan;
 		float gain;
 		// 有归属<b>且</b>坐标仍可知：与节目同一个增益/声像函数，音量与方位完全一致。
 		if (anchor >= 0 && this.blockPositions.containsKey(anchor)) {
 			pan = this.panForPosition(this.blockPositions.get(anchor));
 			gain = this.sourceGain(anchor, this.distanceGain(anchor));
+		} else if (anchor >= 0) {
+			// <b>知道是哪台机器，只是坐标没登记上</b>（方块刚卸载 / 区块未加载）。
+			//
+			// 这时仍然能用<b>该台自己的音量滑块</b>——音量不是方块的几何属性，
+			// 不需要坐标就能查到。早期这里退化成全局 {@code blockVolume}
+			// （"玩家最后操作过的那台"），于是你可能在 A 台把音量拖到 0，
+			// 走远后听到 B 台的底噪按 B 的音量响——看似"不受控"，其实是取错了对象。
+			pan = new float[]{center, center};
+			gain = this.volumeFor(anchor) * FALLBACK_DISTANCE_GAIN;
 		} else {
-			// 无归属（方块已卸载 / 坐标没登记上）：居中，但<b>仍要乘方块音量</b>。
-			//
-			// 早期这里只乘原版音量，理由是「没有方块就没有方块音量」。问题是
-			// {@code blockVolume} 并不是方块属性，而是<b>玩家最后一次设定的音量</b>：
-			// 用户在 GUI 里把收音机音量拖到 0，节目会安静，底噪却按满幅继续响——
-			// 听感正是「噪音不受混音控制」。
-			//
-			// 故障提示的价值在于「让玩家知道链路坏了」，而不是「无视玩家已经关掉音量」。
-			// 乘上它之后，调 0 就是真安静，调到 0.3 也只响三成，提示依然在。
-			//
-			// 距离衰减这里给不了（没有坐标），所以额外乘一个保守系数，
-			// 避免「定位不到」反而变成比节目更响的满幅噪声。
-			float c = (float) Math.sqrt(0.5);
-			pan = new float[]{c, c};
-			gain = this.blockVolume * this.vanillaBlocksVolume * this.vanillaMasterVolume * 0.6F;
+			// 完全不知道归属（没有任何音源登记过）：只能退到"玩家最后一次设定的音量"。
+			// 乘一个保守距离系数，避免"定位不到"反而比节目更响。
+			pan = new float[]{center, center};
+			gain = this.blockVolume * FALLBACK_DISTANCE_GAIN;
 		}
 		java.util.Arrays.fill(this.effectScratch, 0.0F);
 		int n = this.networkNoise.generateMono(this.effectScratch, WRITE_FRAMES);
 		addMonoToMix(mix, this.effectScratch, n, gain, pan[0], pan[1]);
 	}
+
+	/**
+	 * 「定位不到」时给底噪的保守距离系数。
+	 *
+	 * <p>没有坐标就算不出真实衰减，但不能因此按满幅响——那会让
+	 * 「找不到位置」变成「比节目更响的噪声」。取 0.6 约等于站在 22 格处
+	 * （48 格可听边界的中间），是一个不会冒犯人的折中。
+	 */
+	private static final float FALLBACK_DISTANCE_GAIN = 0.6F;
 
 	/**
 	 * 把单声道样本按增益与声像叠加到交错立体声混音缓冲。
@@ -2220,8 +2269,21 @@ public final class PcmSink {
 	 * <p>正常混音与「没有音源供数」两条路径共用，保证幅度行为一致。
 	 */
 	private void toBytes(float[] mix, byte[] out) {
+		// <b>输出总线：所有层的最后一道、也是唯一一道全局增益</b>。
+		//
+		// 节目、底噪、调台噪，以及以后可能加的任何东西，都在这里被乘一次
+		// 原版「方块音量 × 总音量」。混音阶段不要再乘这两个因子——
+		// 那些地方只负责「这一路相对其它路有多响」（滑块、距离、推流增益）。
+		//
+		// 这样做的好处不是省几条乘法，而是把「音量必须生效」从
+		// <b>每个调用点都要记得做的事</b>变成了<b>只有一个地方做的事</b>：
+		// 漏乘在结构上不再可能发生（用户反馈过三次「噪音不受混音控制」，
+		// 每次都是某个分支自己算增益时漏了一项）。
+		float bus = this.outputBusGain();
 		for (int i = 0; i < mix.length; i++) {
-			int v = Math.round(mix[i] * 32767.0F);
+			// 先乘总线再限幅：限幅必须作用在最终输出上，
+			// 否则"调小音量"反而不会减少削波，听感是"拧小也爆"。
+			int v = Math.round(mix[i] * bus * 32767.0F);
 			if (v > 32767) {
 				v = 32767;
 			} else if (v < -32768) {

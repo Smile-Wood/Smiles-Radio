@@ -73,8 +73,8 @@ public final class RadioReloadListener implements SimpleSynchronousResourceReloa
 
 		// 与 /radio reload 保持一致：只改基准不够，必须重建已有订阅，
 		// 否则已建好的音源仍带着旧文件指针继续播（进度看起来没重置）。
-		radiosmile.net.AudioStreamManager.rebuildAll();
-		radiosmile.RadioCommand.notifyClientsReloaded(running);
+		java.util.List<String> rebuilt = radiosmile.net.AudioStreamManager.rebuildAll();
+		radiosmile.RadioCommand.notifyClientsReloaded(running, rebuilt);
 		SmileSRadio.LOGGER.info("/reload：电台配置已重新加载，订阅已按新基准重建");
 	}
 }

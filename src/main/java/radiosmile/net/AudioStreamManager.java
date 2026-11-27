@@ -976,6 +976,30 @@ public final class AudioStreamManager {
 				player.getUUID().getLeastSignificantBits() ^ Long.rotateLeft(mix, 32) ^ 0x5DEECE66DL);
 	}
 
+	public static void sendReloaded(ServerPlayer player, java.util.Collection<String> stationIds) {
+		if (!ServerPlayNetworking.canSend(player, RadioNetworking.S2C_RELOADED)) {
+			return;
+		}
+		FriendlyByteBuf buf = new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
+		// <b>带上「哪些频道被重建了」</b>。
+		//
+		// 早期这个包是空的，客户端一律播一段调台噪 + 开一个 2 秒静音窗。
+		// 问题是：重载只会重建<b>本地台订阅</b>，网络电台的订阅在
+		// {@code STREAMING_SUBS} 里、重载根本不动它，客户端拉流线程也不受影响——
+		// 那条链路<b>一次跳变都没有</b>，却被同一段噪声和静音窗糊了一遍
+		// （用户反馈：「网络电台在重载的时候也会有底噪，但网络电台不归本地重载噪声管」）。
+		//
+		// 把重建清单带过去，客户端就能只对"真正被重建的台"做跳变掩护；
+		// 空清单 = 什么都没重建 = 客户端保持安静。
+		buf.writeVarInt(stationIds == null ? 0 : stationIds.size());
+		if (stationIds != null) {
+			for (String id : stationIds) {
+				buf.writeUtf(id);
+			}
+		}
+		ServerPlayNetworking.send(player, RadioNetworking.S2C_RELOADED, buf);
+	}
+
 	/**
 	 * 只重建某一个频道的订阅（{@code /radio play} 跳曲后使用）。
 	 *
@@ -1001,10 +1025,8 @@ public final class AudioStreamManager {
 			AudioSubscription sub = SUBSCRIPTIONS.remove(key(snap.player(), snap.pos()));
 			if (sub != null) {
 				// 先让客户端播一段调台噪，把随后的跳变盖住（与全量重载一致）。
-				if (ServerPlayNetworking.canSend(snap.player(), RadioNetworking.S2C_RELOADED)) {
-					ServerPlayNetworking.send(snap.player(), RadioNetworking.S2C_RELOADED,
-							new FriendlyByteBuf(io.netty.buffer.Unpooled.buffer()));
-				}
+				// 只发给正在听这个频道的玩家——这里本来就是按频道筛过的快照。
+				sendReloaded(snap.player(), java.util.List.of(snap.stationId()));
 				// 与自动换曲同样先声明一段「空音量」：命令切歌的空隙比自动换曲更长
 				// （整条订阅被拆掉重建），不声明的话客户端只看到「没数据」，
 				// 会按弱网故障响底噪——这正是用户听到的那 850ms 嘶声。
@@ -1046,7 +1068,7 @@ public final class AudioStreamManager {
 	 * <p>重建是<b>逐个玩家</b>做的：先记下每个人的「方块+频道」，全部关闭后再逐个重建。
 	 * 不能边遍历边删（会破坏快照），也不能先重建后关闭（同坐标会有两份订阅）。
 	 */
-	public static void rebuildAll() {
+	public static java.util.List<String> rebuildAll() {
 		// 1. 快照：记下每个订阅的玩家、方块、频道
 		List<SubscriptionSnapshot> snapshots = new ArrayList<>();
 		for (AudioSubscription sub : SUBSCRIPTIONS.values()) {
@@ -1057,7 +1079,14 @@ public final class AudioStreamManager {
 		}
 
 		// 2. 全部关闭并清空
+		//
+		// <b>顺便记下"到底重建了哪些频道"</b>：客户端据此决定要不要做跳变掩护。
+		// 重载<b>不动</b> {@code STREAMING_SUBS}（网络电台由客户端直连上游，服务端
+		// 只是订阅状态的登记簿），所以网络台玩家不该收到任何噪声提示——
+		// 他们的链路一次都没断。
+		java.util.LinkedHashSet<String> rebuiltStations = new java.util.LinkedHashSet<>();
 		for (AudioSubscription sub : SUBSCRIPTIONS.values()) {
+			rebuiltStations.add(sub.station().id());
 			// 与 rebuildStation 同理：整批订阅要拆掉重建，先给每个客户端声明过渡静音，
 			// 否则重载期间所有人都会听到「没数据 = 弱网」的底噪。
 			writeSilence(sub.player(), sub.station().id(), sub.pos(), sub.trackIndex(),
@@ -1068,7 +1097,7 @@ public final class AudioStreamManager {
 		SUBSCRIPTIONS.clear();
 
 		if (snapshots.isEmpty()) {
-			return;
+			return List.of();
 		}
 
 		// 3. 按新基准逐个重建
@@ -1084,7 +1113,9 @@ public final class AudioStreamManager {
 				rebuilt++;
 			}
 		}
-		SmileSRadio.LOGGER.info("重载完成：已按新计时基准重建 {} 个订阅", rebuilt);
+		SmileSRadio.LOGGER.info("重载完成：已按新计时基准重建 {} 个订阅（频道 {}）",
+				rebuilt, rebuiltStations);
+		return List.copyOf(rebuiltStations);
 	}
 
 	/** 重建时需要的订阅快照。 */
