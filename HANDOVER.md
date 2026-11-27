@@ -2169,7 +2169,7 @@ bytes it had buffered are thrown away → the new stream is decoded correctly fr
 
 Even with session ids, "the decode thread ended" must never turn into permanent silence. In `Mp3StreamDecoder`:
 
-- `isAlive()`: thread dead / ended naturally / **64 KB fed with zero frames decoded** (stalled) → false;
+- `isAlive()`: thread dead / ended naturally / **128 KB fed with zero frames decoded** (stalled) → false;
 - `ClientAudioPlayer.Stream#feed` checks it on every chunk, rebuilds the decoder and logs one WARN;
 - the decode loop no longer dies on a single exception: failure count → 4 ms backoff (no 100% CPU spin) →
   after 32 consecutive failures the Bitstream is dropped and `INITIAL_SYNC` is redone;
@@ -2516,7 +2516,9 @@ path is missing `setNetworkNoiseSource()`.
   and if written they are auto-commented out (see Section T). A live stream should be configured directly as the station's `file`
 - **Transcoding depends hard on ffmpeg**: without it, every non-MP3 station is refused (no silent downgrade)
 - First start has to wait for transcoding to finish (tens of seconds for large files); afterwards the cache makes it instant
-- Playlist track changes are not seamless: the decoder is rebuilt on a track change, leaving a very short gap between tracks
+- Playlist track changes are not seamless: the decoder is rebuilt on a track change, leaving a very short gap
+  (since Round 27 there is no `flush()`, so the previous tail plays out and the next track joins directly;
+  the server also declares a 500 ms transition window) between tracks
 - **HLS/AAC streams are not supported** (evaluated; the user decided not to do it)
 - Temporary signed links (such as Bilibili URLs with a `deadline`) **expire after about 2 hours**:
   cached copies keep playing, but re-downloading requires a fresh link

@@ -258,6 +258,10 @@ On a fault the LCD shows `NOSIGNAL` and the red light blinks:
 
 > "No signal" belongs to **internet radio only** — a missing local file has no signal to lose.
 
+The static obeys that radio's **volume slider**: at 0 both the programme and the static go
+completely quiet, at 30% the static is at 30%, and it attenuates with distance just like the
+programme. Vanilla "Blocks" / master volume still applies as well.
+
 ### Commands
 
 | Command | Permission | Description |
@@ -277,6 +281,7 @@ Both `<station>` and `<track>` are tab-completable: station ids come from `stati
 - Non-MP3 local audio **hard-depends on ffmpeg**
 - The first start waits for transcoding (tens of seconds for large files); afterwards it opens instantly from cache
 - Track changes in a playlist are not gapless: the decoder is rebuilt, leaving a very short gap
+  (the tail of the previous track plays out first; the server also declares a 500 ms transition window)
 - HLS / HE-AAC streams are not supported
 - Live streams **cannot** go into a txt playlist (no duration, so they cannot join the sync timeline)
 
