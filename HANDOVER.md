@@ -2260,15 +2260,109 @@ volume — which looks exactly like "not under control", when in fact the wrong 
 - awaiting in-game: silent reload while on internet radio; tuning noise still there on local
   stations; volume 0 kills the hiss; vanilla "Blocks" volume 0 also kills it; no clipping at 10%.
 
+#### AO. Round 31: after muting, the weak-network hiss kept playing — volume treated as stream state (2026-11-27 15:2x)
+
+User report: **"我静音后还是会在弱网的时候有噪音"** — after muting, weak network still produces hiss.
+
+This round does not touch the output bus again (round 30 already funnelled everything into
+`toBytes`). The problem is that **the hiss path could never see the player's volume**: two places
+treat a *persistent setting* as *stream / lookup state*, so "muted" is read as "never set".
+
+**1) On a normal start, the hiss has no owner**
+
+`overlayNetworkNoise()` has three ownership tiers (see AN). Tiers 1 and 2 both require
+`networkNoiseBlock >= 0`, and `setNetworkNoiseSource()` was only called from **station change /
+reconnect / failure** paths:
+
+| Call site | When |
+|---|---|
+| `handleChunk`'s `stationChanged` branch | switching stations |
+| `restartStream` | session id changed (upstream dropped and came back) |
+| `stopForFailure` / `markUnknownStationFailure` | a failure already happened |
+| `AutoSubscriber`'s stale branch | a failure already happened |
+
+**The most common path — join the world, auto-subscribe, keep playing — never calls it once.**
+The anchor therefore stayed `-1` for the whole session, and the hiss fell through to tier 3,
+which guesses `blockVolume`. `blockVolume` is "the value set most recently" and is only refreshed
+by the handshake packet (`S2C_SELECT_ACK`); dragging the GUI slider to 0 writes the
+**per-block table**, which that field knows nothing about. Net effect: programme muted, hiss still
+playing at `1.0 x 0.6`.
+
+> The log agrees: the 15:02 session was internet radio `fm907`, never switched, anchor never set.
+
+**Fix**: register `setNetworkNoiseSource(pos)` the moment a `Stream` is created in `STREAMS`.
+Semantics are plain: this stream plays from that block, so its fault indicator belongs to that block.
+
+**2) Stopping a stream deleted the player's volume setting**
+
+`stopInternal()` called `PcmSink.clearVolumeFor(pos)`, and `volumeFor()` returns **1.0** for a
+missing entry. The failure path runs exactly those two steps back to back:
+
+```
+stopForFailure(pos) -> stopInternal() -> clearVolumeFor(pos)     <- setting deleted
+                    -> setNetworkNoiseSource(pos)                <- anchor points at it
+                    -> overlayNetworkNoise() -> volumeFor(pos)   <- missing -> 1.0
+```
+
+So **any real failure (server TIMEOUT / stopped stream) gives a full-scale hiss**, even if the
+player has just muted the radio.
+
+Volume is a **player setting** (stored in the block entity, resent in the handshake on join), not
+"state of this stream". Forgetting it on stop is the same "one value, two meanings" bug this
+project keeps finding. Fix: stop no longer deletes the entry. A leftover entry for a broken block
+is overwritten by the next handshake, and `releaseDevice()` clears the whole table on world exit.
+
+> This also fixes a symptom the user saw long ago: the volume bar jumping to 100% when pressing
+> "scan" (the comment in `RadioScreen#renderVolume` described it). Same deletion, same root cause.
+
+**3) Reading the block entity could silently rewrite the volume as 1.0**
+
+`AutoSubscriber.applyBlockVolume()` syncs the block-entity volume into the mixer table every
+0.5 s. It used to default to `1.0F` when the block entity was unreadable and **write it anyway**,
+so "cannot read" was treated as "volume is full": during the first ticks after joining or after a
+chunk reload, a mute could be silently reverted to 100%. Now it simply does not write — mute is a
+setting and must not be overwritten by a failed lookup.
+
+**Verification (`build-verify/NoiseGainCheck.java`, re-implements the three tiers)**
+
+| Scenario | Before | After |
+|---|---|---|
+| Muted after a normal start + weak network | **0.60** | **0.00** |
+| Failure mute (`stopForFailure`) | **1.00** | **0.00** |
+| Volume 30% + weak network | 0.60 | 0.30 |
+| Volume 100% (hiss must still play) | 0.60 | 1.00 |
+| Volume 0 + position lost | 0.00 | 0.00 |
+
+> Row 4 needs a caveat: at 100% the hiss used to be held down by that 0.6 guess; now it follows
+> the station's own volume (`NetworkNoise.PEAK = 0.12`, about -18 dBFS). So **unmuted, the hiss is
+> about 6 dB louder than the previous build** — the inevitable result of correct ownership. If it
+> feels too loud, change `PEAK` or add a fixed trim to that layer; do not touch the ownership.
+
+**New diagnostic**: tier 3 now logs (rate-limited)
+`底噪没有归属方块，按最近一次设定的音量 x 播放`. It should never appear; if it does, some start
+path is missing `setNetworkNoiseSource()`.
+
 ### Current build status
 
 - **`build/libs/radio-smile-1.0.0.jar`, about 362 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 30)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 31)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 31 (2026-11-27 15:2x, hiss kept playing after mute)**:
+- ⚠️ **Drag the radio volume to 0, then induce a weak network (kill the upstream / unplug /
+  stop server pushes) — there must be no hiss at all** — the core item. Programme and hiss must go
+  quiet together; the log must **not** show `底噪没有归属方块……`.
+- ⚠️ **At 30% volume the hiss should be at 30% too**, not full scale.
+- ⚠️ **Unmuted, the hiss must still play** — do not silence the indicator while fixing the mute.
+  Note it is **about 6 dB louder than the previous build** (no longer held down by the 0.6 guess);
+  if that feels loud, say so and I will adjust `NetworkNoise.PEAK`, not the ownership logic.
+- ⚠️ **Pressing "scan" must no longer make the volume bar jump to 100%** — fixed in this round too.
+- ⚠️ **Mute then back to 100% — audio must come back immediately** (the setting is no longer
+  deleted on stop).
 
 **Round 30 (2026-11-27 13:5x, reload noise ownership + hiss folded into the output bus)**:
 - ⚠️ **On internet radio, `/radio reload` must be completely silent** — the core item. The log

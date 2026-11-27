@@ -436,10 +436,12 @@ public class RadioScreen extends Screen {
 
 		// <b>用界面自己保存的音量值</b>，不要每次渲染都去混音器（PcmSink）查。
 		//
-		// 原因：点「扫描」会先 stop() 再重订阅，而 stop() 里的
-		// clearVolumeFor() 会删掉该方块的音量记录，volumeFor() 于是回退到默认 1.0。
-		// 若界面每帧都去查它，音量条就会在点扫描的瞬间跳到 100%——
-		// 玩家看到的是「我没动音量，条自己跳了」。
+		// 混音器那张表是"混音当下用的值"，会被握手包、方块实体同步、
+		// 自动订阅扫描轮流刷新；拖动过程中它有一小段时间落后于手指。
+		// 每帧都去查它，音量条就会在拖动/扫描的瞬间抖或跳。
+		// （历史上更糟：stop() 里的 clearVolumeFor() 会把记录删掉，
+		// 于是点一次「扫描」音量条就跳到 100%。那个删除动作已经去掉，
+		// 但"界面自持一份权威值"这个做法仍然是对的。）
 		//
 		// 界面里的 {@link #currentVolume} 才是这份 UI 的权威值：
 		// 它在 init() 时从方块 NBT 读一次，之后由拖动/确认维护。
@@ -582,7 +584,15 @@ public class RadioScreen extends Screen {
 		// 1) 本地立即生效（只作用于本方块，不影响其它收音机）
 		ClientRadioPlayback.setBlockVolume(volume);
 		if (this.blockPos != null) {
-			radiosmile.client.audio.PcmSink.INSTANCE.setVolumeFor(this.blockPos.asLong(), volume);
+			// <b>走唯一入口，不要只写 per-block 表</b>。
+			//
+			// 混音里的节目按 {@code volumeFor(blockPos)} 取音量，而效果音在
+			// 「不知道归属哪台机器」时会退到 {@code blockVolume}（最近一次设定的音量）。
+			// 早期这里只写 per-block 表，{@code blockVolume} 就一直停在 1.0，
+			// 于是静音之后节目没了、底噪照样按 60% 响（用户实测）。
+			//
+			// {@link ClientAudioPlayer#setVolume} 会同时写这两处，是唯一的正确入口。
+			radiosmile.client.audio.ClientAudioPlayer.setVolume(this.blockPos, volume);
 		}
 
 		// 2) 同步到服务端（节流）

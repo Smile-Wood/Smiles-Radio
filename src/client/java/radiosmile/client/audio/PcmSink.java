@@ -1520,8 +1520,20 @@ public final class PcmSink {
 		} else {
 			// 完全不知道归属（没有任何音源登记过）：只能退到"玩家最后一次设定的音量"。
 			// 乘一个保守距离系数，避免"定位不到"反而比节目更响。
+			//
+			// <p><b>正常情况下走不到这里</b>：起播时 {@code ClientAudioPlayer} 就会
+			// 调用 {@code setNetworkNoiseSource()} 登记归属。走得到说明有路径没登记，
+			// 而这一档用的 {@code blockVolume} 只是"最近一次设定"，未必是玩家静音的那台——
+			// 所以留一条限流日志，下次再有人说"静音了还有底噪"能直接定位。
 			pan = new float[]{center, center};
 			gain = this.blockVolume * FALLBACK_DISTANCE_GAIN;
+			long nowMs = System.currentTimeMillis();
+			if (gain > 0.0001F && nowMs - this.lastNoAnchorLogAt > 5000L) {
+				this.lastNoAnchorLogAt = nowMs;
+				SmileSRadio.LOGGER.info(
+						"底噪没有归属方块，按最近一次设定的音量 {} 播放（当前底噪增益 {}）",
+						this.blockVolume, gain);
+			}
 		}
 		java.util.Arrays.fill(this.effectScratch, 0.0F);
 		int n = this.networkNoise.generateMono(this.effectScratch, WRITE_FRAMES);
@@ -1536,6 +1548,14 @@ public final class PcmSink {
 	 * （48 格可听边界的中间），是一个不会冒犯人的折中。
 	 */
 	private static final float FALLBACK_DISTANCE_GAIN = 0.6F;
+
+	/**
+	 * 「底噪没有归属方块」这条日志的限流时刻。
+	 *
+	 * <p>只有混音线程读写，不需要同步。正常情况下永远不会打出来——
+	 * 一旦出现，说明有条起播路径漏了 {@code setNetworkNoiseSource()}。
+	 */
+	private long lastNoAnchorLogAt;
 
 	/**
 	 * 把单声道样本按增益与声像叠加到交错立体声混音缓冲。

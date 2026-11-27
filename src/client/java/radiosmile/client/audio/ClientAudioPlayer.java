@@ -701,7 +701,23 @@ public final class ClientAudioPlayer {
 		}
 		// 只移除本音源的数据，不能把别的收音机一起静掉
 		PcmSink.INSTANCE.removeSource(pos.asLong());
-		PcmSink.INSTANCE.clearVolumeFor(pos.asLong());
+		// <b>不要在这里 clearVolumeFor()</b>。
+		//
+		// 方块的音量是<b>玩家设定</b>（服务端存在方块实体里，进服会随握手包重发），
+		// 不是"这条流的状态"。停流就把它删掉，等于把设定忘成默认值 1.0，
+		// 而故障路径紧接着就用它算底噪增益：
+		//
+		//   stopForFailure(pos) → stopInternal() → clearVolumeFor(pos)
+		//                      → setNetworkNoiseSource(pos)
+		//                      → volumeFor(pos) 查不到 → 1.0 → 底噪满幅
+		//
+		// 用户把音量拖到 0 之后一旦弱网，听到的就是「节目没了，沙声还在」——
+		// 正是反馈的「我静音后还是会在弱网的时候有噪音」。
+		// 顺带一提，点「扫描」时音量条会瞬间跳到 100%，也是同一个删除动作造成的
+		// （见 RadioScreen#renderVolume 里那段注释）。
+		//
+		// 留着的记录在方块真被拆掉后确实会剩下一条，但后续订阅的握手包会覆盖它，
+		// 而 PcmSink.releaseDevice() 在退出世界时整表清空，不会跨存档串味。
 		// <b>不在这里清增益记录</b>：停流可能发生在新频道的增益包<b>已经到达</b>
 		// 之后（换台 = ACK 淡出 + 重订阅，服务端的增益包可能先于新音频块落地），
 		// 这时清掉会把新台的 0.25 一起抹了。
@@ -1125,6 +1141,20 @@ public final class ClientAudioPlayer {
 			stream.blockPosKey = key;
 			STREAMS.put(key, stream);
 			PcmSink.INSTANCE.setPlaybackWanted(true);
+			// <b>底噪归属必须在这里就登记</b>，不能只等"出故障了再说"。
+			//
+			// 早期只有换台、重连、故障三个路径调用 setNetworkNoiseSource()，
+			// 而这三条都不是"正常起播"——于是刚进世界就开始播的收音机，
+			// 锚点一直是 -1，弱网底噪只能走 overlayNetworkNoise() 的第三档
+			// （"不知道是哪台机器"）去猜一个全局音量。
+			//
+			// 猜的那个值是 {@code blockVolume}，而它只在握手包里更新过；
+			// 玩家在 GUI 里把音量拖到 0 写的是<b>按方块存的那张表</b>，
+			// 于是「节目已经静音、底噪还在响」——这正是用户反馈的
+			// 「我静音后还是会在弱网的时候有噪音」。
+			//
+			// 语义上这里也很直白：这条流从这个方块播出，它的故障提示就属于这个方块。
+			PcmSink.INSTANCE.setNetworkNoiseSource(pos);
 			PcmSink.INSTANCE.setSourcePosition(key, pos);
 			PcmSink.INSTANCE.start();
 		}

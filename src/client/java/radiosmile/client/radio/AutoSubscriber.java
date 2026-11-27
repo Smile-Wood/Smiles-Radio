@@ -164,15 +164,27 @@ public final class AutoSubscriber implements ClientModInitializer {
 	 * 若读不到（区块未加载完 / 旧存档无 BE），退回 1.0。
 	 */
 	private void applyBlockVolume(Minecraft client, net.minecraft.core.BlockPos pos) {
-		float volume = 1.0F;
+		float volume;
 		try {
 			if (client.level != null
 					&& client.level.getBlockEntity(pos)
 					instanceof radiosmile.block.entity.RadioBlockEntity be) {
 				volume = be.getVolume();
+			} else {
+				// <b>读不到方块实体就什么都别写</b>。
+				//
+				// 早期这里退回 1.0 并<b>照写不误</b>，于是"读不到"被当成"音量是满的"：
+				// 只要扫描时方块实体恰好还没同步上来（刚进世界、区块重新加载），
+				// 玩家已经拖到 0 的音量就会被悄悄改回 100%，
+				// 而弱网底噪正是拿这张表算增益的——听感就是"静音了还有沙声"。
+				//
+				// 静音是玩家设定，不是可以被"读不到"覆盖的默认值：
+				// 这里宁可什么都不做，等下一轮扫描（0.5 秒后）读到真值再说。
+				return;
 			}
 		} catch (Throwable ignored) {
-			// 区块状态异常时用默认值
+			// 区块状态异常：同样不改写已有设定
+			return;
 		}
 		radiosmile.client.audio.PcmSink.INSTANCE.setVolumeFor(pos.asLong(), volume);
 	}
