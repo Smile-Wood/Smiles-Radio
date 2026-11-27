@@ -158,8 +158,28 @@ https://example.com/song.mp3
 
 - **Playback order = top to bottom in the file**
 - Blank lines and lines starting with `#` are ignored; trailing comments are supported (whitespace required before `#`)
-- Local paths: resolved relative to the txt file first, then relative to `audio/`
+- Local paths: resolved **relative to the txt file first, then relative to `audio/`** (so `../hit.mp3` inside
+  `audio/lists/rock.txt` points at `audio/hit.mp3`)
 - **Remote URLs are downloaded, transcoded to MP3 and then take part in playback** (that is what gives them a definite duration and lets them join the sync timeline)
+
+### Dead entries are commented out automatically
+
+When the startup check finds an entry that simply cannot be played, the mod **comments that line out and states the
+reason**, instead of only spamming the log:
+
+```text
+# [已禁用：文件不存在] gone.mp3
+# [已禁用：HTTP 403，源文件已失效] https://.../expired.mp3
+# [已禁用：流式传输，无法缓存] https://.../live.mp3
+```
+
+- The original text is kept verbatim; **delete the `# [已禁用…] ` prefix** to restore the line once it is fixed;
+- Remote sources are only commented out on **deterministic 4xx** (400/401/403/404/410) — an expired signed link
+  typically answers 403. **408 / 429 / 5xx / timeouts** are treated as transient: logged, file untouched;
+- Local files are commented out only when missing, and **only during the startup check** (never mid-playback);
+- A remote entry that already has a complete local copy is **never** commented out — an upstream failure does not stop it
+  from playing;
+- Commenting is **idempotent**: prefixes are never stacked.
 
 ---
 

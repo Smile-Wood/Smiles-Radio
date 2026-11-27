@@ -245,6 +245,128 @@ public final class TxtPlaylist {
 	}
 
 	/**
+	 * <b>启动检查：把 txt 里指向「不存在的本地文件」的行注释掉。</b>
+	 *
+	 * <h2>为什么本地文件也要处理</h2>
+	 * 网络源的失效表现为 HTTP 4xx（见 {@link RemoteAudioCache#commentOutInTxt}），
+	 * 本地源的失效就是<b>文件不在了</b>：服主删了曲子、改了文件名、
+	 * 或从 Windows 上传时路径大小写不一致。这类行留在 txt 里同样是"每次解析都失败一次"，
+	 * 而且在日志里只是几行 WARN，服主打开 txt 看到的还是正常一行。
+	 *
+	 * <p>所以这里与网络侧保持同一套做法：<b>不删、只注释</b>，并写明原因：
+	 * <pre>
+	 *   # [已禁用：文件不存在] rock/02 - foo.mp3
+	 * </pre>
+	 * 把文件放回去之后，删掉行首前缀即可恢复。
+	 *
+	 * <h2>只在启动时做</h2>
+	 * 本方法<b>不会</b>在播放路径（{@link #parse}）里执行。原因有两个：
+	 * <ol>
+	 *   <li>播放路径每订阅一次就要解析一次，每次都可能因为磁盘临时抖动
+	 *       把一行好好的条目注释掉；</li>
+	 *   <li>服主可能正在上传大文件，写文件会与上传互相踩。</li>
+	 * </ol>
+	 * 启动检查是一次性的、有明确边界的时机，误判代价最小。
+	 *
+	 * <h2>相对路径基准</h2>
+	 * 与解析完全一致（见 {@link #resolveEntry}）：<b>先按 txt 所在目录</b>，
+	 * 再按 {@code audio/}，最后按绝对路径——所以
+	 * {@code audio/lists/rock.txt} 里的 {@code ../hit.mp3} 会命中 {@code audio/hit.mp3}。
+	 *
+	 * @param base     配置根目录（{@code config/radio-smile}），会递归找出其中的 txt
+	 * @param audioDir 相对路径的第二基准目录（通常 {@code config/radio-smile/audio}）
+	 * @return 本次被注释掉的行数
+	 */
+	public static synchronized int sanitizeLocalMissing(Path base, Path audioDir) {
+		if (base == null || !Files.isDirectory(base)) {
+			return 0;
+		}
+		List<Path> txtFiles = new ArrayList<>();
+		try (java.util.stream.Stream<Path> walk = Files.walk(base, 3)) {
+			walk.filter(Files::isRegularFile)
+					.filter(TxtPlaylist::isTxtPlaylist)
+					.forEach(txtFiles::add);
+		} catch (IOException e) {
+			SmileSRadio.LOGGER.debug("扫描 txt 播放列表失败", e);
+			return 0;
+		}
+		int total = 0;
+		for (Path txt : txtFiles) {
+			total += commentMissingIn(txt, audioDir);
+		}
+		if (total > 0) {
+			// 内容改了，解析缓存必须失效，否则下一次解析仍用旧行
+			clearCache();
+		}
+		return total;
+	}
+
+	/** 注释掉单个 txt 里所有「指向不存在的本地文件」的行（见 {@link #sanitizeLocalMissing}）。 */
+	private static int commentMissingIn(Path txt, Path audioDir) {
+		List<String> lines;
+		try {
+			lines = stripBom(Files.readAllLines(txt, StandardCharsets.UTF_8));
+		} catch (IOException e) {
+			SmileSRadio.LOGGER.debug("读取 txt 失败 {}", txt, e);
+			return 0;
+		}
+		boolean firstContentLine = true;
+		int changed = 0;
+		for (int i = 0; i < lines.size(); i++) {
+			String raw = lines.get(i) == null ? "" : lines.get(i).trim();
+			// 剥掉行尾注释后再判断（"song.mp3  # 备注"）
+			int hash = indexOfLineComment(raw);
+			String line = hash >= 0 ? raw.substring(0, hash).trim() : raw;
+			if (line.isEmpty()) {
+				continue;
+			}
+			if (firstContentLine) {
+				firstContentLine = false;
+				// 第一行内容行是「打乱顺序」开关，不是条目
+				if (parseShuffleFlag(line) != null) {
+					continue;
+				}
+			}
+			// 网络条目交给下载流程判定（4xx 才注释），这里只管本地文件
+			if (line.startsWith("http://") || line.startsWith("https://")) {
+				continue;
+			}
+			if (resolveEntry(line, txt, audioDir) != null) {
+				continue;
+			}
+			lines.set(i, "# [已禁用：文件不存在] " + raw);
+			changed++;
+		}
+		if (changed > 0) {
+			writeAtomically(txt, lines);
+			SmileSRadio.LOGGER.info("已在 txt 播放列表 {} 中注释掉 {} 条不存在的本地文件",
+					txt.getFileName(), changed);
+		}
+		return changed;
+	}
+
+	/**
+	 * 原子写入 txt：先写同目录临时文件再替换。
+	 *
+	 * <p>这份文本正被播放线程读，直接原地覆写会让它有机会读到半截内容
+	 * （表现为"播放列表突然变空、播不下去"）。同目录内原子替换可以避免这个窗口。
+	 */
+	static void writeAtomically(Path txt, List<String> lines) {
+		try {
+			Path temp = txt.resolveSibling(txt.getFileName() + ".tmp");
+			Files.write(temp, lines, StandardCharsets.UTF_8);
+			try {
+				Files.move(temp, txt, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+						java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+			} catch (java.nio.file.AtomicMoveNotSupportedException e) {
+				Files.move(temp, txt, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+			}
+		} catch (IOException e) {
+			SmileSRadio.LOGGER.warn("写入 txt 播放列表失败 {}", txt, e);
+		}
+	}
+
+	/**
 	 * txt 里是否含网络地址（只看文本，<b>不发请求</b>）。
 	 *
 	 * <p>供 {@code isPlayable()} 在"本地条目还没下载"时判断：

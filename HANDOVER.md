@@ -1803,15 +1803,109 @@ Local stations are **about 11 dB louder** than in round 24. That follows from th
 it is not a bug. If it drowns game audio, set `targetLoudness` to `-22` ~ `-24` and reload —
 no re-measurement needed (measured LUFS does not depend on the target).
 
+#### AJ. Round 26: startup check auto-disables dead sources (midday 2026-11-27)
+
+##### What the user asked (two clarifications narrowed the scope)
+
+1. "If the startup check finds the source file returns 404 or is dead, comment that line out";
+2. then: **"I mean network source files that go into the playlist"** — not a station's `file` stream;
+3. then: **"and local source files too, with relative paths resolved against the list file's location"**.
+
+So the scope is **every entry of a txt playlist** (a station whose `file` points at .txt/.list/.m3u),
+covering both network URLs and local files.
+
+##### Representation: comment, never delete, reason on the same line
+
+JSON cannot carry comments, but txt can. This extends the "auto-comment streaming URLs" behaviour from round 20:
+
+```text
+# [已禁用：文件不存在] gone.mp3
+# [已禁用：HTTP 403，源文件已失效] https://.../expired.mp3
+# [已禁用：流式传输，无法缓存] https://.../live.mp3
+```
+
+- the original text is **preserved verbatim** — an expired signed link becomes usable again once the parameters are refreshed;
+- to restore a line, delete the `# [已禁用…] ` prefix (far more practical than digging through backups);
+- idempotent: an already commented line is never prefixed twice (measured: second run reports `commented=0`).
+
+##### Rule one — network sources: only "deterministic 4xx"
+
+| Status | Action | Why |
+|---|---|---|
+| `400 / 401 / 403 / 404 / 410` | **comment out** | refused on the client side; re-sending is futile. An expired signed link returns 403 |
+| `408 / 429` | WARN only | explicitly means "come back later"; unrelated to link validity |
+| `5xx` / timeout / connection reset | WARN only | upstream fault, rate limit or local network blip; one failure must not rewrite config |
+
+The rule lives in `RemoteAudioCache.isPermanentFailure(int)`; all 13 codes were exercised:
+`200/206/301=false`, `400/401/403/404/410=true`, `408/429/500/502/503=false`.
+
+> This was **measured, not assumed**: the NetEase direct links in the user's `realtest.txt` carry timestamps
+> and return **403** once expired, not 404 (verified with curl at 12:20 — the two links from 11-23 returned 403,
+> the one minted at 12:25 returned 206). A 404-only rule would have done nothing in the real case.
+
+##### Rule two — local sources: the file is gone
+
+`TxtPlaylist.sanitizeLocalMissing(base, audioDir)` runs once on the startup preheat thread and walks every txt:
+a local line that resolves to an existing file is kept, one that does not is commented as
+`# [已禁用：文件不存在]`.
+
+**Startup only, never on the playback path.** `parse()` runs on every subscription; one disk hiccup could comment
+out a perfectly good line, and the owner may well be uploading a large file at that moment. The startup check is a
+one-shot, well-bounded moment where a misjudgement costs the least.
+
+##### Relative paths: the list file's directory is the first base
+
+`resolveEntry()` tries **the txt's own directory → `audio/` → absolute path**, so `../hit.mp3` inside
+`audio/lists/rock.txt` resolves to `audio/hit.mp3`, while a bare `hit.mp3` falls through to the second base.
+The startup check reuses the very same function, so "check" and "playback" cannot disagree about paths.
+
+##### Two boundaries that must not be missed
+
+1. **A network entry with a complete local copy is never commented out.**
+   On 4xx `download()` first calls `findAnyCachedFile()`: a non-empty file under `cache/remote/` is returned and
+   playback continues. An upstream failure does not mean the entry is unplayable — usually only the signature expired,
+   so the proof check must fail while the audio itself is long since on disk. Commenting it out would throw away a
+   playable track.
+2. **Writes are atomic** (`TxtPlaylist.writeAtomically`: sibling `.tmp` + `ATOMIC_MOVE`). The playback thread reads
+   this file; an in-place overwrite lets it observe half a file (which shows up as "the playlist suddenly went empty").
+
+##### Concurrency and ordering
+
+Inside the `preheatTxtNetworkEntries()` thread the local check runs **first**, parsing/downloading **second**, serially
+on one thread — so a local comment can never race a 4xx comment on the same file.
+
+##### End-to-end verification (2026-11-27 12:2x, local fixture)
+
+A temporary `config/audio/lists/rock.txt` covering every case, calling `sanitizeLocalMissing` directly:
+
+```text
+qtfm_tiehen.ogg                → kept (relative to audio/)
+../qtfm_tiehen.ogg             → kept (relative to the txt's own directory)
+gone.mp3                       → # [已禁用：文件不存在]
+also_gone.ogg   # note         → # [已禁用：文件不存在] also_gone.ogg   # note
+https://... (network)          → untouched; then commented as HTTP 403 by commentOutInTxt
+```
+
+Second run reports `commented=0`, so idempotency holds.
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 354 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 355 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 25)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 26)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 26 (midday 2026-11-27, dead sources disabled automatically)**:
+- ⚠️ **Are txt playlists rewritten as expected after startup** — use `realtest.txt`: the two NetEase links from 11-23
+  already return 403, so they should turn into `# [已禁用：HTTP 403，源文件已失效] https://...`.
+  To check: open `config/radio-smile/audio/realtest.txt` after starting and search the log for
+  "已在 txt 中注释掉一条失效源".
+- ⚠️ **Was any playable entry harmed** — specifically the "cached locally but upstream now 403" ones: they must
+  **not** be commented, the log line is "但本地已有缓存，继续使用". If a playable track did get commented, the cache
+  judgement is broken; revisit `findAnyCachedFile`.
 
 **Round 25 (early 2026-11-27, local aligns to internet radio — top priority)**:
 - ⚠️ **Does switching between a local station and internet radio sound level-matched** — the core item. The stream's

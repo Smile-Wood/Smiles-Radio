@@ -336,24 +336,41 @@ public final class RemoteAudioCache {
 	private static final long MAX_CACHE_BYTES = 512L * 1024 * 1024;
 
 	/**
-	 * 在 txt 播放列表里把某个"流式传输"的地址<b>注释掉</b>（行首加 {@code # }）。
+	 * 在 txt 播放列表里把某个"流式传输"的地址<b>注释掉</b>。
 	 *
-	 * <h2>为什么要改文件</h2>
-	 * 流式传输的地址无法被缓存（没有长度、永不结束），也就无法参与播放列表的
-	 * 时间轴（无时长、不可 seek）。仅仅在日志里报一句警告，服主很难发现——
-	 * 下次看 txt 还是一行正常的地址，会以为是下载失败又重试。
-	 *
-	 * <p>直接把它注释掉，服主打开文件就能看到：
-	 * <pre>
-	 *   # [已禁用：流式传输，无法缓存] https://x/live.mp3
-	 * </pre>
-	 * 连同原因一起写在行首，比单独写日志有效得多。
-	 *
-	 * <h2>为什么保留原行内容</h2>
-	 * 不删除、只注释：服主可能想把它改作频道的 {@code file}（直播流应当直接配在
-	 * 频道上，而不是放进 txt），保留原文便于复制。
+	 * <p>等价于 {@code commentOutInTxt(url, "流式传输，无法缓存")}，见后者。
 	 */
 	public static synchronized void markStreamingInTxt(String url) {
+		commentOutInTxt(url, "流式传输，无法缓存");
+	}
+
+	/**
+	 * 在 txt 播放列表里把某个地址所在行<b>注释掉</b>（行首加 {@code # }）。
+	 *
+	 * <h2>为什么要改用户的文件</h2>
+	 * 进入播放列表的网络源只有两种结局：要么能下载、能转码、能算时长，要么压根放不出来。
+	 * 后者仅靠日志里一行 WARN 是<b>看不见</b>的——服主下次打开 txt 看到的仍是一行正常的地址，
+	 * 会以为"只是这次网络不好"，于是每次开服都重试一遍、每次都在日志里刷同样的失败。
+	 *
+	 * <p>直接注释掉，服主打开文件就能看到原因：
+	 * <pre>
+	 *   # [已禁用：流式传输，无法缓存] https://x/live.mp3
+	 *   # [已禁用：HTTP 403，源文件已失效] https://y/dead.mp3
+	 * </pre>
+	 *
+	 * <h2>为什么保留原行内容</h2>
+	 * 不删除、只注释：服主可能想把它改好再启用（直播流应当配在频道上而不是放进 txt，
+	 * 失效的签名直链需要重新取一次），保留原文便于直接编辑或复制。
+	 * 要恢复这一行，删掉行首的 {@code # [已禁用…] } 前缀即可。
+	 *
+	 * <h2>写入方式</h2>
+	 * 先写同目录临时文件再原子替换：这份文本<b>正被播放线程读</b>，
+	 * 直接原地覆写会让它有机会读到半截文件（表现为"播放列表突然变空"）。
+	 *
+	 * @param url    要禁用的地址（按整行匹配，允许行尾带注释）
+	 * @param reason 写进注释行的原因，如 {@code HTTP 404，源文件已失效}
+	 */
+	public static synchronized void commentOutInTxt(String url, String reason) {
 		if (url == null || url.isBlank()) {
 			return;
 		}
@@ -367,7 +384,7 @@ public final class RemoteAudioCache {
 			return;
 		}
 		java.util.List<Path> txtFiles = new java.util.ArrayList<>();
-		try (java.util.stream.Stream<Path> walk = Files.walk(base, 2)) {
+		try (java.util.stream.Stream<Path> walk = Files.walk(base, 3)) {
 			walk.filter(Files::isRegularFile)
 					.filter(TxtPlaylist::isTxtPlaylist)
 					.forEach(txtFiles::add);
@@ -375,29 +392,15 @@ public final class RemoteAudioCache {
 			SmileSRadio.LOGGER.debug("扫描 txt 播放列表失败", e);
 		}
 		for (Path txt : txtFiles) {
-			commentLineIn(txt, url);
-		}
-	}
-
-	/** 旧实现（按 audioDir 扫描）保留为内部小工具，见 {@link #markStreamingInTxt}。 */
-	private static synchronized void markStreamingInAudioDirOnly(String url) {
-		Path audioDir = RadioStationRegistry.audioDir();
-		if (audioDir == null || !Files.isDirectory(audioDir)) {
-			return;
-		}
-		try (java.util.stream.Stream<Path> files = Files.list(audioDir)) {
-			files.filter(Files::isRegularFile)
-					.filter(TxtPlaylist::isTxtPlaylist)
-					.forEach(txt -> commentLineIn(txt, url));
-		} catch (IOException e) {
-			SmileSRadio.LOGGER.debug("扫描 txt 播放列表失败", e);
+			commentLineIn(txt, url, reason);
 		}
 	}
 
 	/** 把 txt 中提到该 URL 的行注释掉（已注释的跳过，避免重复加前缀）。 */
-	private static void commentLineIn(Path txt, String url) {
+	private static void commentLineIn(Path txt, String url, String reason) {
 		try {
-			java.util.List<String> lines = Files.readAllLines(txt, java.nio.charset.StandardCharsets.UTF_8);
+			java.nio.charset.Charset charset = java.nio.charset.StandardCharsets.UTF_8;
+			java.util.List<String> lines = Files.readAllLines(txt, charset);
 			boolean changed = false;
 			for (int i = 0; i < lines.size(); i++) {
 				String line = lines.get(i);
@@ -408,16 +411,19 @@ public final class RemoteAudioCache {
 				}
 				// 只处理"整行就是这个 URL"或"以它开头"的情况，避免误伤其它内容
 				if (trimmed.equals(url) || trimmed.startsWith(url + " ")) {
-					lines.set(i, "# [已禁用：流式传输，无法缓存] " + trimmed);
+					lines.set(i, "# [已禁用：" + reason + "] " + trimmed);
 					changed = true;
 				}
 			}
-			if (changed) {
-				Files.write(txt, lines, java.nio.charset.StandardCharsets.UTF_8);
-				SmileSRadio.LOGGER.info("已在该 txt 中注释掉流式地址：{}", txt.getFileName());
-				// 内容变了，解析缓存要失效
-				TxtPlaylist.clearCache();
+			if (!changed) {
+				return;
 			}
+			// 复用 TxtPlaylist 的原子写入：同一份文本可能正被播放线程读，
+			// 直接原地覆写会让它读到半截内容。
+			TxtPlaylist.writeAtomically(txt, lines);
+			SmileSRadio.LOGGER.info("已在 txt 中注释掉一条失效源（{}）：{}", reason, txt.getFileName());
+			// 内容变了，解析缓存要失效
+			TxtPlaylist.clearCache();
 		} catch (IOException e) {
 			SmileSRadio.LOGGER.debug("注释 txt 行失败 {}", txt, e);
 		}
@@ -438,7 +444,30 @@ public final class RemoteAudioCache {
 			conn = open(url);
 			int code = conn.getResponseCode();
 			if (code != 200) {
-				SmileSRadio.LOGGER.warn("下载网络音频失败（HTTP {}）：{}", code, url);
+				if (isPermanentFailure(code)) {
+					// <b>先看本地有没有完整副本</b>：上游失效 ≠ 这条不能播。
+					// 可能是校验包（.proof）丢失、或上游换了签名导致校验必然失败，
+					// 但音频本体早就完整落在 cache/remote 里了。
+					// 那种情况下注释掉这一行等于亲手删掉一个能播的曲目。
+					Path usable = findAnyCachedFile(dir, id);
+					if (usable != null && Files.isRegularFile(usable) && Files.size(usable) > 0) {
+						SmileSRadio.LOGGER.warn(
+								"网络音频源已失效（HTTP {}），但本地已有缓存，继续使用：{}", code, url);
+						return usable;
+					}
+					// <b>确定性的 4xx = 这条源确实失效了</b>：过期签名直链返回 403/404，
+					// 地址写错返回 400/404，权限不足返回 401——同一个请求再发一万次
+					// 也是同样的结果，重试只是白等。此时直接在 txt 里注释掉这一行，
+					// 服主打开文件就知道"这行为什么没了"，而不是每次开服都在日志里刷一遍。
+					SmileSRadio.LOGGER.warn(
+							"网络音频源已失效（HTTP {}），已在 txt 中自动注释并跳过：{}", code, url);
+					commentOutInTxt(url, "HTTP " + code + "，源文件已失效");
+				} else {
+					// 5xx / 408 / 429：上游故障或限流，属于暂时性问题，
+					// <b>绝不能</b>因为一次失败就去改配置文件。
+					SmileSRadio.LOGGER.warn("下载网络音频失败（HTTP {}，属暂时性，稍后重试）：{}",
+							code, url);
+				}
 				return null;
 			}
 			long declared = conn.getContentLengthLong();
@@ -498,6 +527,32 @@ public final class RemoteAudioCache {
 				conn.disconnect();
 			}
 		}
+	}
+
+	/**
+	 * 该 HTTP 状态码是否代表「这条链接<b>确定性失效</b>」。
+	 *
+	 * <h2>判据：4xx 里排除掉两个「重试就好」的</h2>
+	 * 4xx 是<b>客户端侧</b>被拒绝——同样的 URL、同样的请求头，重发多少次都是同样结果：
+	 * <ul>
+	 *   <li>{@code 400} 地址本身不合法；</li>
+	 *   <li>{@code 401}/{@code 403} 需要鉴权 / 签名已过期（临时签名直链的典型表现）；</li>
+	 *   <li>{@code 404}/{@code 410} 文件不存在 / 已被删除。</li>
+	 * </ul>
+	 * 唯一的例外是 {@code 408 Request Timeout} 与 {@code 429 Too Many Requests}——
+	 * 这两个明确表示「过会儿再来」，与链接是否有效无关。
+	 *
+	 * <p>反过来，{@code 5xx} 是<b>上游故障</b>：换一台源站、重启一次网关就好了，
+	 * 因一次 502 就把服主的播放列表改掉是不可接受的。所以只有 4xx 才触发自动注释。
+	 *
+	 * @param code HTTP 状态码
+	 * @return {@code true} 表示应当把该行在 txt 里注释掉
+	 */
+	private static boolean isPermanentFailure(int code) {
+		if (code < 400 || code >= 500) {
+			return false;
+		}
+		return code != 408 && code != 429;
 	}
 
 	/**

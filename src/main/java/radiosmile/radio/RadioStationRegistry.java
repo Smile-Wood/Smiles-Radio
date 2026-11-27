@@ -798,7 +798,7 @@ public final class RadioStationRegistry {
 	private static volatile boolean txtPreheatStarted;
 
 	/**
-	 * 后台预热 txt 播放列表里的网络条目（下载 + 转码）。
+	 * 后台预热 txt 播放列表：<b>先跑启动检查</b>（注释掉失效行），再下载未缓存的网络条目。
 	 *
 	 * <p>为什么要单独做：{@code resolveTracks()} 遇到网络地址会同步下载，
 	 * 而它在首次 {@link #load} 时是被主线程调用的。若某个 txt 里放了几个
@@ -806,6 +806,11 @@ public final class RadioStationRegistry {
 	 *
 	 * <p>这里把下载放到后台单线程：启动立刻返回，音频在后台陆续就绪。
 	 * 下载完成后 {@link TxtPlaylist#parseCached} 会命中缓存，播放时无需再等。
+	 *
+	 * <h2>启动检查的顺序很重要</h2>
+	 * 先 {@link TxtPlaylist#sanitizeLocalMissing}（纯本地判存在性，不发请求），
+	 * 再解析 + 下载。两步都在这一个线程里串行执行，所以「注释掉本地缺失行」
+	 * 与「注释掉 4xx 失效网络行」不会同时写同一个文件、互相覆盖。
 	 */
 	private static void preheatTxtNetworkEntries() {
 		if (txtPreheatStarted) {
@@ -813,6 +818,16 @@ public final class RadioStationRegistry {
 		}
 		txtPreheatStarted = true;
 		Thread thread = new Thread(() -> {
+			// <b>第一步：启动检查</b>——把指向不存在的本地文件的注释掉。
+			// 放在下载之前：只读本地文件系统，几毫秒完成，且不会与后面的写冲突。
+			try {
+				int commented = TxtPlaylist.sanitizeLocalMissing(baseDir, audioDir());
+				if (commented > 0) {
+					SmileSRadio.LOGGER.info("启动检查：共注释掉 {} 条指向不存在文件的播放列表行", commented);
+				}
+			} catch (Throwable t) {
+				SmileSRadio.LOGGER.warn("启动检查 txt 播放列表失败", t);
+			}
 			// 收集所有 txt 频道（只读配置，不碰世界状态）
 			for (RadioStation station : stations) {
 				if (station.isStreaming()) {
