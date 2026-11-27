@@ -2066,6 +2066,46 @@ Those "file not found: /tangtang.mp3" lines were a separate matter: writing the 
 **retried with the slash stripped** against the three bases first, and only then treated as absolute paths,
 which keeps the intuitive spelling working without breaking genuine absolute paths.
 
+##### Addendum: "the noise from a failing source ignores the mixer" (same day, 13:2x)
+
+The user then reported that the noise produced when a source misbehaves cannot be turned down.
+Three separate missed multiplications, all the same class of mistake — *one value, two meanings,
+and the one that takes effect is not the one being written*.
+
+**① The per-block volume sent by the server was silently discarded.**
+`ClientRadioNetwork` writes what its comment calls "apply this block's own volume (each radio is
+independent)", but the call is:
+
+```java
+PcmSink.INSTANCE.setBlockVolume(volume);   // writes the global field
+```
+
+while the single gain entry point `sourceGain()` reads `volumeFor(blockPos)` — the **per-block table** —
+and **never reads `blockVolume`**. The server-sent volume therefore landed in a field nobody reads and the
+block played at 1.0 (full gain) forever. `ClientAudioPlayer.setVolume(pos, volume)` had the same problem.
+Both now also call `setVolumeFor(pos.asLong(), volume)`.
+
+**② The unattributed noise layer did not multiply the block volume at all.**
+In `overlayNetworkNoise()`, when the block cannot be located:
+
+```java
+gain = this.vanillaBlocksVolume * this.vanillaMasterVolume;   // block volume missing
+```
+
+Drag the radio volume to 0 and the programme goes quiet while the hiss keeps playing at full scale —
+literally "the noise ignores the mixer". A fault cue exists to say *the link is broken*, not to override
+a player who already turned the volume off. It is now `blockVolume × vanilla × 0.6`: zero means silent,
+30% means 30%.
+
+**③ With an anchor whose position is gone, distance attenuation degraded to 1.0.**
+`distanceGain()` returns `1.0F` when the position is unknown — exactly what happens after a block is
+unloaded or its chunk is not loaded, making the hiss louder than the programme. The condition is now
+`anchor >= 0 && blockPositions.containsKey(anchor)`, else it falls back to ② .
+
+> This is the Nth time an effect layer missed one factor (the HANDOVER already records block volume,
+> distance attenuation and panning each being missed once). `sourceGain()` was made the single entry point
+> to end it — but any branch that **computes gain without going through `sourceGain`** will grow it again.
+
 ### Current build status
 
 - **`build/libs/radio-smile-1.0.0.jar`, about 359 KB**
@@ -2077,6 +2117,9 @@ which keeps the intuitive spelling working without breaking genuine absolute pat
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
 
 **Round 28 (2026-11-27 13:0x, ID3 tag decoded as audio)**:
+- ⚠️ **Does the noise follow the volume now** — the addendum. The server-sent block volume used to land in
+  a field nobody reads, and the hiss layer never multiplied the block volume at all, so "turning it down did
+  nothing". Volume 0 must now be **completely silent** (hiss included); 30% leaves the hiss at 30%.
 - ⚠️ **Does `tangtang.mp3` now play properly** — the core item. Its ID3 tag is 586 KB (cover art), so the old
   4 ms seek landed on offset 21 (the `FF FE` inside the tag) and decoded to noise. The log should now read
   "MP3 定位到 x ms（字节偏移 599697/9954897，音频起点 599697）" and the track should start with music, no crackle.

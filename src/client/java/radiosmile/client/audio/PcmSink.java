@@ -1462,15 +1462,26 @@ public final class PcmSink {
 		long anchor = this.networkNoiseBlock;
 		float[] pan;
 		float gain;
-		if (anchor >= 0) {
-			// 有归属：与节目<b>同一个</b>增益/声像函数，保证音量与方位完全一致。
+		// 有归属<b>且</b>坐标仍可知：与节目同一个增益/声像函数，音量与方位完全一致。
+		if (anchor >= 0 && this.blockPositions.containsKey(anchor)) {
 			pan = this.panForPosition(this.blockPositions.get(anchor));
 			gain = this.sourceGain(anchor, this.distanceGain(anchor));
 		} else {
-			// 无归属：居中 + 只乘原版音量（不乘方块独立音量，因为没有方块）。
+			// 无归属（方块已卸载 / 坐标没登记上）：居中，但<b>仍要乘方块音量</b>。
+			//
+			// 早期这里只乘原版音量，理由是「没有方块就没有方块音量」。问题是
+			// {@code blockVolume} 并不是方块属性，而是<b>玩家最后一次设定的音量</b>：
+			// 用户在 GUI 里把收音机音量拖到 0，节目会安静，底噪却按满幅继续响——
+			// 听感正是「噪音不受混音控制」。
+			//
+			// 故障提示的价值在于「让玩家知道链路坏了」，而不是「无视玩家已经关掉音量」。
+			// 乘上它之后，调 0 就是真安静，调到 0.3 也只响三成，提示依然在。
+			//
+			// 距离衰减这里给不了（没有坐标），所以额外乘一个保守系数，
+			// 避免「定位不到」反而变成比节目更响的满幅噪声。
 			float c = (float) Math.sqrt(0.5);
 			pan = new float[]{c, c};
-			gain = this.vanillaBlocksVolume * this.vanillaMasterVolume;
+			gain = this.blockVolume * this.vanillaBlocksVolume * this.vanillaMasterVolume * 0.6F;
 		}
 		java.util.Arrays.fill(this.effectScratch, 0.0F);
 		int n = this.networkNoise.generateMono(this.effectScratch, WRITE_FRAMES);

@@ -488,7 +488,11 @@ public final class ClientAudioPlayer {
 
 	/** 设置某个方块的音量。 */
 	public static void setVolume(BlockPos pos, float volume) {
-		// 目前所有方块共用一个声卡通道；保留接口以便将来按方块分通道
+		if (pos != null) {
+			// <b>必须写 per-block 表</b>：混音时的增益只认 {@code PcmSink#volumeFor(blockPos)}，
+			// 全局限量字段不参与计算（见 sourceGain）。只调 setBlockVolume 等于什么都没做。
+			PcmSink.INSTANCE.setVolumeFor(pos.asLong(), volume);
+		}
 		PcmSink.INSTANCE.setBlockVolume(volume);
 	}
 

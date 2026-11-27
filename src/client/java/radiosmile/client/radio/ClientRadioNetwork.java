@@ -48,7 +48,14 @@ public final class ClientRadioNetwork {
 									"握手告知的音频格式 {} 不是 MP3，客户端只接受 MP3", announced);
 						}
 						radiosmile.client.audio.ClientAudioPlayer.setPendingMetadata(skipMillis);
-						// 应用该方块自己的音量（各收音机独立）
+						// <b>应用该方块自己的音量</b>（各收音机独立）。
+						//
+						// 混音时读的是<b>按方块坐标存的那张表</b>（{@code PcmSink#volumeFor}），
+						// 早期这里只写了全局字段 {@code blockVolume}，而它<b>从不参与增益计算</b>——
+						// 于是服务端下发的音量被静默丢弃，该方块永远按 1.0（满增益）播放。
+						// 表现正是「音量不受混音控制」：节目与底噪都按满幅出声。
+						// 必须按 ackPos 写进 per-block 表，全局字段只作为「最近一次设置」留档。
+						radiosmile.client.audio.PcmSink.INSTANCE.setVolumeFor(ackPos.asLong(), volume);
 						radiosmile.client.audio.PcmSink.INSTANCE.setBlockVolume(volume);
 
 						// <b>顺序很重要</b>：先让调台噪淡入，再让旧音频淡出。
