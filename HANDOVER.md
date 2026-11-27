@@ -4,7 +4,7 @@
 
 > Last updated: 2026-11-26 23:05 (**Round 24** complete; includes the Round 19 **network-radio architecture overhaul: client-direct streaming**)
 > Project path: `C:\Projects\Smile's Radio mod`
-> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **355 KB**, BUILD SUCCESSFUL)
+> Build artifact: `build/libs/radio-smile-1.0.0.jar` (about **357 KB**, BUILD SUCCESSFUL)
 > Version control: git initialised, **one commit per round of fixes**
 > User guide: the full documentation for server owners/players is in [README.md](README.md) (this file is the developer handover)
 
@@ -1888,15 +1888,128 @@ https://... (network)          → untouched; then commented as HTTP 403 by comm
 
 Second run reports `commented=0`, so idempotency holds.
 
+#### AK. Round 27: track changes no longer "cut first, wait later" + shuffle semantics unified (midday 2026-11-27)
+
+##### What the user asked (three lines, one round)
+
+1. "Track switching is not responsive enough, and there is noise during the switch";
+2. "An empty-volume packet should be silent";
+3. "and playlist shuffle broke again…".
+
+1 and 2 are two faces of the same bug; 3 is a separate thread.
+
+##### Root cause of the noise: `handleChunk` treated "track changed" as "station changed"
+
+When a chunk arrives, three cases ran through **the same block**:
+
+```java
+if (stationChanged || trackChanged || streamRestarted) {
+    stream.close();
+    playTuningNoise(pos);   // ← fires the tuning hiss on a track change too
+    flush();                // ← wipes the jitter buffer on a track change too
+    clearNetworkNoise();
+    beginTransitionSilence();
+}
+```
+
+The user first suspected the silence packet. **It is not** — the `S2C_AUDIO_SILENCE` receiver only calls
+`beginTransitionSilence(millis)`, and its comment states outright that it must never trigger tuning noise.
+What actually plays is that `playTuningNoise()` line: a 0.25-amplitude hiss that follows the silence window,
+designed to mask a **station** jump, but auto-track-change was pulling it in as well.
+
+##### Root cause of the slowness: `flush()` threw away audio that had not played yet
+
+What sat in the jitter buffer was **the last 200–400 ms of the previous track** — part of the programme, not garbage.
+Clearing it invalidates `primed`, so playback only resumes after `jitterTarget` (≥200 ms) refills. Every track change
+therefore went: cut the previous ending → 300 ms of digital silence → noise on top → new track joins in.
+"Half a beat late" and "noise" are two symptoms of one block of code.
+
+##### The fix: split station changes and track changes completely
+
+| | Station change (`stationChanged`) | In-station track change / upstream reconnect |
+|---|---|---|
+| Decoder | rebuilt | rebuilt |
+| Tuning noise | **plays** (masks the jump) | **does not play** |
+| `flush()` | **yes** (the old station must not keep playing) | **no** (tail plays out, new track follows) |
+| Network noise | cleared and re-attributed | untouched (the link never broke) |
+| Transition silence window | 900 ms (default) | **400 ms** as a floor |
+
+Not flushing works because the server pushes a **continuous byte stream** (a track change only swaps the file,
+there is no gap in the middle): the old tail in the client buffer finishes and the new track starts right after.
+Buffer depth does not grow and no data is dropped — genuinely seamless, instead of "cover the seam with noise".
+
+The server side's `TRACK_SWITCH_SILENCE_MILLIS` also drops **900 → 500**: with the gap essentially gone, an
+over-long declaration just keeps genuine dropout noise suppressed for nearly a second.
+
+##### A cross-track contamination fixed along the way
+
+`pendingSkipMillis` is the "discard this leading portion" value handed down by the handshake (subscription ack).
+It used to be **never cleared after use**: after one seek every subsequent track reused the same skip, eating
+hundreds of milliseconds off each track's head. It is now **consumed once and zeroed when the decoder is created**,
+and the track-change branch zeroes it explicitly.
+
+##### Root cause of "shuffle broken": two switches, two semantics
+
+Shuffling had **two entry points** in the config, with completely different behaviour:
+
+| Entry point | Old behaviour | Result |
+|---|---|---|
+| `mode: random` | handed to `PlaylistTimeline`, reshuffles every round | ✅ correct |
+| txt first line `true` | shuffled **once** with a filename-derived fixed seed during parse | ❌ same order every round, every restart |
+
+The second one looks exactly like "it shuffled, but the order never changes". They are now unified:
+
+- `isRandomEffective(station)`: either switch asking for shuffle → the timeline randomises per round;
+- `isPlaylistStation(station)`: "is this a list" is now fully separate from "should it shuffle".
+  `openSource()` used to demand `station.isPlaylist()`, so **a station with `file: xxx.txt` but no `mode`** (default
+  block) **only ever played the first track** — the other source of "playlist playback broken".
+
+##### Two new safety valves (local dead-source detection)
+
+Round 26's "comment out a local file that does not exist" had two ways to cause collateral damage:
+
+1. **A third path base**: `resolveEntry()` now tries
+   **the txt's own directory → `audio/` → the config root → absolute path** in that order.
+   Without the config-root step, an entry written as `audio/01.mp3` would be judged missing;
+2. **if not a single entry resolves, do nothing**: all-missing can only mean "the files really were deleted" or
+   "the path bases are wrong", and the filesystem cannot tell those apart. In that case **nothing is commented**,
+   only a WARN is logged for the owner to judge. Otherwise the whole list would be commented away and the station
+   would vanish with it (or keep one or two tracks — leaving nothing to shuffle anyway).
+
+##### Verification (local fixtures)
+
+```text
+timeline (8 tracks, random=true): 6 consecutive rounds, all different orders   ✅
+txt first line true + mode=sequence → isRandomEffective = true                 ✅
+txt first line true + mode absent   → isRandomEffective = true                 ✅
+single-file block                   → random=false, playlist=false             ✅
+all-missing txt                     → commented=0, file untouched              ✅
+partially missing txt               → only the missing line commented           ✅
+```
+
 ### Current build status
 
-- **`build/libs/radio-smile-1.0.0.jar`, about 355 KB**
+- **`build/libs/radio-smile-1.0.0.jar`, about 357 KB**
 - `gradlew build` → BUILD SUCCESSFUL
-- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 26)
+- **git is initialized**, one commit per round; `main` is in sync with origin/main (round 27)
 
 ### Awaiting user verification (ask these first next session)
 
 > This list keeps only the **unverified** items. Anything that passed verification has moved down to "Historical verification" below.
+
+**Round 27 (midday 2026-11-27, track-change split + shuffle semantics)**:
+- ⚠️ **Are track changes now snappy and hiss-free** — the core item of this round. Previously every change cut the
+  previous track's ending, played a burst of tuning hiss, then waited for the new track. Now it should be
+  "previous track finishes → next one simply starts". To check: listen through two track boundaries; a "shhh" means
+  tuning noise is still being triggered (look for `playTuningNoise` firing on a track change in the log).
+- ⚠️ **Does shuffle produce a different order each round** — use a list with `mode: random` or a txt whose first line
+  is `true`, listen through two full rounds (length × average duration × 2); the orders must differ, and the first
+  track after a server restart should not always be the same one.
+- ⚠️ **Is the playlist actually cycling** — if some station only ever plays its first track, check that its `file`
+  points at a txt (a txt no longer needs `mode`); the log should show "播放列表定位：第 x 轮 第 y/N 首".
+- ⚠️ **Were any local entries wrongly commented** — if a txt shows `# [已禁用：文件不存在]` for a file that clearly
+  exists, re-read the three path bases in `resolveEntry()`; when *every* entry is missing this round does **not**
+  comment anything (WARN only).
 
 **Round 26 (midday 2026-11-27, dead sources disabled automatically)**:
 - ⚠️ **Are txt playlists rewritten as expected after startup** — use `realtest.txt`: the two NetEase links from 11-23

@@ -156,7 +156,7 @@ public final class RadioCommand {
 	private static final SuggestionProvider<CommandSourceStack> TRACK_SUGGESTIONS =
 			(context, builder) -> {
 				RadioStation station = findStation(StringArgumentType.getString(context, "station"));
-				if (station == null || !station.isPlaylist()) {
+				if (station == null || !RadioStationRegistry.isPlaylistStation(station)) {
 					return SharedSuggestionProvider.suggest(List.of(), builder);
 				}
 				// 只数文件，不扫时长：补全要即时返回，不能在这里卡住主线程。
@@ -191,14 +191,15 @@ public final class RadioCommand {
 			source.sendFailure(Component.translatable("command.radio-smile.play.unknown", query));
 			return 0;
 		}
-		if (!station.isPlaylist()) {
+		if (!RadioStationRegistry.isPlaylistStation(station)) {
 			source.sendFailure(Component.translatable("command.radio-smile.play.not_playlist", station.id()));
 			return 0;
 		}
 
 		List<Path> tracks = RadioStationRegistry.resolveTracks(station);
 		PlaylistTimeline timeline = PlaylistTimeline.of(
-				station.id(), tracks, station.isRandom(), station.seed(), null);
+				station.id(), tracks, radiosmile.radio.RadioStationRegistry.isRandomEffective(station),
+				station.seed(), null);
 		if (timeline == null || timeline.size() <= 0) {
 			source.sendFailure(Component.translatable("command.radio-smile.play.no_audio", station.id()));
 			return 0;

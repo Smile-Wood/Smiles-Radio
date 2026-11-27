@@ -250,9 +250,15 @@ public final class AudioStreamManager {
 			}
 
 			// 播放列表：定位到「第几轮、本轮第几首、歌内第几毫秒」
-			if (station.isPlaylist() && tracks.size() > 1) {
+			//
+			// <b>判据不能只看 mode</b>：txt 重定向列表本身就是一份播放列表，
+			// 即使服主没有写 mode（默认 block），也不该把它当成"只有第一首的单曲循环"。
+			// 早期这里要求 {@code station.isPlaylist()}，于是「写了 txt 但没写 mode」
+			// 的频道永远只播第一首——看起来正是「列表播放 / 随机播放失效」。
+			if (RadioStationRegistry.isPlaylistStation(station) && tracks.size() > 1) {
 				radiosmile.radio.PlaylistTimeline timeline =
-						radiosmile.radio.PlaylistTimeline.of(station.id(), tracks, station.isRandom(),
+						radiosmile.radio.PlaylistTimeline.of(station.id(), tracks,
+							RadioStationRegistry.isRandomEffective(station),
 								station.seed(), RadioStationRegistry.headBeforeReload(station.id()));
 				if (timeline != null) {
 					// 轮次与轮内位置都由统一的计时基准算出，因此任何时刻加入的玩家
@@ -739,12 +745,17 @@ public final class AudioStreamManager {
 	/**
 	 * 换曲后的第一块音频之前，声明多长的「过渡静音窗」（毫秒）。
 	 *
-	 * <p>这段时间正好是客户端关旧解码器 + {@code flush()} 声卡 +
-	 * 重新攒够抖动缓冲所需的时间（起播门槛约 300ms，再加重建解码器）。
-	 * 取 900ms 留余量；客户端另有总上限
-	 * （{@code PcmSink.TRANSITION_SILENCE_MAX_MILLIS} = 3 秒），真故障仍会按时报出来。
+	 * <h2>900 → 500（第二十七轮）</h2>
+	 * 早期客户端换曲时会 {@code flush()} 整个抖动缓冲再重新攒够 300ms，
+	 * 空窗确实有近一秒，所以这里声明 900ms。现在客户端<b>台内换曲不再 flush</b>
+	 * （缓冲里上一首的尾巴继续播，新曲的 PCM 直接接在后面），空窗基本消失，
+	 * 900ms 反而会让真断流的底噪被压住近一秒才响。500ms 足够覆盖
+	 * 「解码器重建 + 万一尾巴刚好播完」的几十毫秒，又不会过度掩盖故障。
+	 *
+	 * <p>客户端另有总上限（{@code PcmSink.TRANSITION_SILENCE_MAX_MILLIS} = 3 秒），
+	 * 真故障仍会按时报出来。
 	 */
-	private static final int TRACK_SWITCH_SILENCE_MILLIS = 900;
+	private static final int TRACK_SWITCH_SILENCE_MILLIS = 500;
 
 	/**
 	 * 换曲预载期间，每个空音量包声明掩护的时长（毫秒）。

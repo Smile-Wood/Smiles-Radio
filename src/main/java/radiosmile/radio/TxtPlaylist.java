@@ -301,7 +301,23 @@ public final class TxtPlaylist {
 		return total;
 	}
 
-	/** 注释掉单个 txt 里所有「指向不存在的本地文件」的行（见 {@link #sanitizeLocalMissing}）。 */
+	/**
+	 * 注释掉单个 txt 里所有「指向不存在的本地文件」的行（见 {@link #sanitizeLocalMissing}）。
+	 *
+	 * <h2>安全阀：一条都解析不出来时不动手</h2>
+	 * 「所有本地条目都不存在」有两种可能：
+	 * <ol>
+	 *   <li>服主真的把文件全删了；</li>
+	 *   <li>路径基准不对（列表被挪了位置、写了 {@code ../audio/xxx} 之类）——
+	 *       这是<b>我们的解析没覆盖到</b>，不是文件没了。</li>
+	 * </ol>
+	 * 两种情况从文件系统上无法区分。而在第 2 种情况里动手注释是<b>破坏性</b>的：
+	 * 整个列表会被注释干净，频道随之变成"没有可用音频"从列表里消失，
+	 * 或者只剩一两首——后者看起来正是「随机播放失效（只剩一首无法打乱）」。
+	 *
+	 * <p>所以规则是：<b>只有至少一条本地条目解析成功时，才注释那些失败的</b>。
+	 * 一条都不成功就只记 WARN，把判断权留给服主。
+	 */
 	private static int commentMissingIn(Path txt, Path audioDir) {
 		List<String> lines;
 		try {
@@ -311,7 +327,8 @@ public final class TxtPlaylist {
 			return 0;
 		}
 		boolean firstContentLine = true;
-		int changed = 0;
+		int localEntries = 0;
+		int missing = 0;
 		for (int i = 0; i < lines.size(); i++) {
 			String raw = lines.get(i) == null ? "" : lines.get(i).trim();
 			// 剥掉行尾注释后再判断（"song.mp3  # 备注"）
@@ -331,18 +348,28 @@ public final class TxtPlaylist {
 			if (line.startsWith("http://") || line.startsWith("https://")) {
 				continue;
 			}
+			localEntries++;
 			if (resolveEntry(line, txt, audioDir) != null) {
 				continue;
 			}
 			lines.set(i, "# [已禁用：文件不存在] " + raw);
-			changed++;
+			missing++;
 		}
-		if (changed > 0) {
-			writeAtomically(txt, lines);
-			SmileSRadio.LOGGER.info("已在 txt 播放列表 {} 中注释掉 {} 条不存在的本地文件",
-					txt.getFileName(), changed);
+		if (missing == 0) {
+			return 0;
 		}
-		return changed;
+		if (missing == localEntries) {
+			SmileSRadio.LOGGER.warn(
+					"txt 播放列表 {} 的 {} 条本地条目全部解析失败，未做任何注释——"
+							+ "这更像是路径基准不对（列表可能被移动过），而不是文件被删。"
+							+ "请检查列表里的路径写法（相对 txt 所在目录 / audio/ / 配置根目录均可）",
+					txt.getFileName(), localEntries);
+			return 0;
+		}
+		writeAtomically(txt, lines);
+		SmileSRadio.LOGGER.info("已在 txt 播放列表 {} 中注释掉 {} 条不存在的本地文件",
+				txt.getFileName(), missing);
+		return missing;
 	}
 
 	/**
@@ -471,10 +498,19 @@ public final class TxtPlaylist {
 	/**
 	 * 把一行解析成本地文件路径。
 	 *
-	 * <ul>
-	 *   <li>{@code http(s)://} → 下载并缓存到本地（{@link RemoteAudioCache}）</li>
-	 *   <li>其它 → 先按 txt 所在目录找，再按 {@code audio/} 找</li>
-	 * </ul>
+	 * <h2>解析顺序（三个基准 + 绝对路径）</h2>
+	 * <ol>
+	 *   <li><b>txt 所在目录</b>——最常见的写法：列表和音频放一起，写文件名即可；</li>
+	 *   <li><b>{@code audio/}</b>——历史写法，列表放在子目录（如 {@code audio/lists/}）时
+	 *       仍能引用 {@code audio/} 下的文件；</li>
+	 *   <li><b>配置根目录</b>——把 {@code audio/} 也写进路径（如 {@code audio/01.mp3}）的写法。
+	 *       早期没有这一档，这类条目会被判成"文件不存在"；启动检查一旦据此把它注释掉，
+	 *       整个列表就只剩个别曲目，看起来正是「随机播放失效」（只剩一首时无从打乱）。</li>
+	 *   <li>绝对路径兜底。</li>
+	 * </ol>
+	 *
+	 * <p><b>顺序即优先级</b>：同名文件同时存在于 txt 目录与 {@code audio/} 时，
+	 * 取 txt 目录那一份——列表自己旁边的那份显然是作者想要的。
 	 */
 	private static Path resolveEntry(String line, Path txt, Path audioDir) {
 		if (line.startsWith("http://") || line.startsWith("https://")) {
@@ -497,6 +533,14 @@ public final class TxtPlaylist {
 			Path inAudio = audioDir.resolve(normalized);
 			if (Files.isRegularFile(inAudio)) {
 				return inAudio.normalize();
+			}
+		}
+		// 第三基准：配置根目录（允许写成 "audio/xxx.mp3"）
+		Path base = RadioStationRegistry.baseDir();
+		if (base != null) {
+			Path inBase = base.resolve(normalized);
+			if (Files.isRegularFile(inBase)) {
+				return inBase.normalize();
 			}
 		}
 		// 绝对路径兜底

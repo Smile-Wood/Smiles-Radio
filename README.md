@@ -112,9 +112,11 @@ an error when the signal dies.
 |---|---|
 | **Single-track loop** | `block` / `single` / `false` / `0` |
 | **Sequential loop** (plays the whole list in order, then restarts) | `sequence` / `order` / `loop` / `true` / `1` |
-| **Shuffle** (fixed seed, identical order for every player) | `random` / `shuffle` |
+| **Shuffle** (reshuffled every round, identical order for every player within a round) | `random` / `shuffle` |
 
 > Case-insensitive, leading/trailing whitespace allowed. Omitting `mode` means single-track loop.
+> When `file` points at a `.txt` the station **cycles through the list even without `mode`**; whether it shuffles
+> is decided by the txt's first line.
 
 ### Directory layout
 
@@ -150,16 +152,16 @@ https://example.com/song.mp3
 | Value | Meaning |
 |---|---|
 | `false` / `0` / omitted | **No shuffle**: strict top-to-bottom file order (default) |
-| `true` / `1` | **Shuffle**: fixed seed, identical order for every player |
+| `true` / `1` | **Shuffle**: reshuffled every round, identical order for every player within a round |
 
 > Legacy spellings still work: `random`/`shuffle` = shuffle, `sequence`/`order`/`loop` = no shuffle.
 
 ### Rules
 
-- **Playback order = top to bottom in the file**
+- **Without shuffle**: playback order = top to bottom in the file; **with shuffle**: reshuffled at the start of every round
 - Blank lines and lines starting with `#` are ignored; trailing comments are supported (whitespace required before `#`)
-- Local paths: resolved **relative to the txt file first, then relative to `audio/`** (so `../hit.mp3` inside
-  `audio/lists/rock.txt` points at `audio/hit.mp3`)
+- Local paths are tried against three bases in order: **the txt's own directory → `audio/` → the config root**
+  (so `../hit.mp3` inside `audio/lists/rock.txt` points at `audio/hit.mp3`, and `audio/01.mp3` also resolves)
 - **Remote URLs are downloaded, transcoded to MP3 and then take part in playback** (that is what gives them a definite duration and lets them join the sync timeline)
 
 ### Dead entries are commented out automatically
@@ -177,6 +179,8 @@ reason**, instead of only spamming the log:
 - Remote sources are only commented out on **deterministic 4xx** (400/401/403/404/410) — an expired signed link
   typically answers 403. **408 / 429 / 5xx / timeouts** are treated as transient: logged, file untouched;
 - Local files are commented out only when missing, and **only during the startup check** (never mid-playback);
+- **If not a single entry resolves, nothing is touched** (WARN only) — all-missing almost always means a wrong path,
+  not that every file vanished;
 - A remote entry that already has a complete local copy is **never** commented out — an upstream failure does not stop it
   from playing;
 - Commenting is **idempotent**: prefixes are never stacked.

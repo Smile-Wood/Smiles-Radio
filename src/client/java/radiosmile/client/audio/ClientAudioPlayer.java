@@ -41,6 +41,17 @@ public final class ClientAudioPlayer {
 	private static volatile long pendingSkipMillis;
 
 	/**
+	 * 台内换曲时打开的过渡静音窗（毫秒）。
+	 *
+	 * <h2>为什么只要 400ms，而不是换台那 900ms</h2>
+	 * 换台要 flush 抖冲缓冲 + 清声卡，之后必须重新攒够 {@code jitterTarget} 才能出声；
+	 * 换曲<b>不 flush</b>，缓冲里还有上一首的尾巴在播，理论上没有任何空窗。
+	 * 这里留 400ms 只是兜底：解码器重建的几十毫秒里若恰好把尾巴吃空，
+	 * 别让混音器把那一块当成弱网。窗口短，真断流仍会立刻响，不会被换曲长期掩盖。
+	 */
+	private static final int TRACK_SWITCH_WINDOW_MILLIS = 400;
+
+	/**
 	 * 音频摄入队列：网络线程只管入队，绝不在渲染线程喂解码器。
 	 *
 	 * <p>{@code feed()} 在管道写满时会阻塞；若在渲染线程调用，
@@ -200,7 +211,13 @@ public final class ClientAudioPlayer {
 				}
 				this.decided = true;
 				SmileSRadio.LOGGER.info("音频格式: {}（只走 MP3 解码）", actual);
-				this.mp3 = new Mp3StreamDecoder(this.blockPosKey, pendingSkipMillis);
+				// <b>跳过时长是一次性的</b>：由握手包（订阅确认）下发，只属于
+				// 「这个方块这一次定位」。早期这里直接读字段、从不清零，于是
+				// 一次 seek 之后<b>每次换曲都沿用同一个跳过量</b>——
+				// 每首歌开头都被吞掉几百毫秒，听感正是「换曲后开头不见了」。
+				long skip = pendingSkipMillis;
+				pendingSkipMillis = 0L;
+				this.mp3 = new Mp3StreamDecoder(this.blockPosKey, skip);
 				PcmSink.INSTANCE.start();
 			}
 			if (this.mp3 != null) {
@@ -319,42 +336,70 @@ public final class ClientAudioPlayer {
 			}
 			stream.close();
 			STREAMS.remove(key);
-			// <b>只登记新频道，绝不在这里清增益记录</b>。
-			//
-			// 服务端的发包顺序是「增益包 → 音频块」，所以走到这里时
-			// <b>新台的增益包早已落地</b>；此时若清表，抹掉的正是刚收到的
-			// 新台增益（本地台从此按 100% 电平播放）。
-			//
-			// 旧台的残留记录由<b>频道校验</b>负责失效：混音时拿记录里的
-			// stationId 与这里登记的新频道比对，不匹配就返回 1.0。
-			// 这样既不会误伤新台，也不需要任何"重置为 1.0"的动作。
-			// 换台：登记新频道；换曲/重连：频道没变，保持原登记不动。
 			if (stationChanged) {
+				// ==================== 换台：整条链路重置 ====================
+				// 这里的三件事都是「换台」独有的语义，换曲<b>不适用</b>：
+				//   1) 调台噪 —— 换台是跳变，需要拟音盖住；
+				//   2) flush() —— 旧台已解码的音频必须立刻丢弃，否则会播完；
+				//   3) 清底噪 —— 手动换台是底噪的明确终止点。
+				// <b>只登记新频道，绝不在这里清增益记录</b>。
+				//
+				// 服务端的发包顺序是「增益包 → 音频块」，所以走到这里时
+				// <b>新台的增益包早已落地</b>；此时若清表，抹掉的正是刚收到的
+				// 新台增益（本地台从此按 100% 电平播放）。
+				//
+				// 旧台的残留记录由<b>频道校验</b>负责失效：混音时拿记录里的
+				// stationId 与这里登记的新频道比对，不匹配就返回 1.0。
+				// 这样既不会误伤新台，也不需要任何"重置为 1.0"的动作。
 				PcmSink.INSTANCE.setBlockStation(key, stationId);
+				// <b>先起调台噪、再清声卡</b>（用户反馈：换台时先有一小段数字静音）。
+				// 噪声由混音线程逐块生成，flush 只丢掉声卡里已排队的旧字节，
+				// 不会清掉噪声本身；顺序反了会让「旧音频断裂」与「噪声淡入」之间
+				// 多露出几毫秒数字 0。传入 pos 让噪声跟随【该方块自己的音量滑块】。
+				PcmSink.INSTANCE.playTuningNoise(pos);
+				// 清空声卡缓冲，否则上一台已解码的音频还会播完
+				PcmSink.INSTANCE.flush();
+				// 切台是底噪的明确终止点（用户要求：手动切台后停）。
+				// 注意 clearNetworkNoise() 会把 faultReported 一并撤掉，所以换台后
+				// 若新台也连不上，仍然要靠下面重新注册的锚点 + 混音器自己的欠载判定来响。
+				PcmSink.INSTANCE.clearNetworkNoise();
+				PcmSink.INSTANCE.setNetworkNoiseSource(pos);
+				// <b>标记「这是我们自己造成的空窗」</b>：见 PcmSink#beginTransitionSilence()。
+				//
+				// 上面的 flush() 把抖动缓冲清了，接下来几百毫秒没有任何音源供数——
+				// 混音器的判据分不清这和丢包的区别，8 块（约 160ms）后就会把
+				// 「弱网底噪」拉到满强度，节目接上后还要再沙 500ms。
+				PcmSink.INSTANCE.beginTransitionSilence();
+			} else {
+				// ============ 台内换曲 / 上游重连：只换解码器，其余一动不动 ============
+				//
+				// <h2>为什么这里<b>不能</b> flush</h2>
+				// 抖动缓冲里此刻存的是「上一首还没播到的那一小段」（约 200~400ms），
+				// 它是节目的一部分，不是垃圾。早期和换台共用同一段逻辑，于是每次换曲：
+				//   清掉旧尾巴（上一首被提前掐断）
+				//   → 缓冲归零、primed 失效
+				//   → 必须重新攒满 jitterTarget 才再次出声（200ms 起）
+				// 这两件事叠起来就是用户反馈的「切曲反应慢半拍」。
+				//
+				// <p>而播放列表在服务端是<b>连续字节流</b>：旧曲的尾巴播完，
+				// 新曲开头正好接上，不需要也不应该丢任何数据。
+				//
+				// <h2>为什么这里<b>不能</b>响调台噪</h2>
+				// 调台噪是「换台」的拟音（真实收音机调谐时的沙沙声）。
+				// 台内换曲没有调谐动作、也没有跳变，加噪声纯属自造故障——
+				// 用户明确指出「空音量包应该没有声音」「切曲途中还有噪音」，
+				// 那阵嘶声正是从这里（以及紧随其后的 flush 空窗）来的。
+				//
+				// <h2>只留一个短窗兜底</h2>
+				// 解码器重建有几十毫秒真空，若旧尾巴恰好在这时播完，
+				// 混音器会看到「一块没数据」——短窗让它别把这一块当弱网。
+				// 窗很短（{@link #TRACK_SWITCH_WINDOW_MILLIS}），
+				// 真故障仍然照常响，不会被换曲掩盖。
+				PcmSink.INSTANCE.beginTransitionSilence(TRACK_SWITCH_WINDOW_MILLIS);
+				// 握手包下发的「跳过时长」只属于被替换掉的那一次定位，
+				// 绝不能顺延到下一首（否则每首歌开头都被吞掉一截）。
+				pendingSkipMillis = 0L;
 			}
-			// <b>先起调台噪、再清声卡</b>（用户反馈：换台时先有一小段数字静音）。
-			// 噪声由混音线程逐块生成，flush 只丢掉声卡里已排队的旧字节，
-			// 不会清掉噪声本身；顺序反了会让「旧音频断裂」与「噪声淡入」之间
-			// 多露出几毫秒数字 0。传入 pos 让噪声跟随【该方块自己的音量滑块】。
-			PcmSink.INSTANCE.playTuningNoise(pos);
-			// 清空声卡缓冲，否则上一台已解码的音频还会播完
-			PcmSink.INSTANCE.flush();
-			// 切台是底噪的明确终止点（用户要求：手动切台后停）。
-			// 注意 clearNetworkNoise() 会把 faultReported 一并撤掉，所以换台后
-			// 若新台也连不上，仍然要靠下面重新注册的锚点 + 混音器自己的欠载判定来响。
-			PcmSink.INSTANCE.clearNetworkNoise();
-			PcmSink.INSTANCE.setNetworkNoiseSource(pos);
-			// <b>标记「这是我们自己造成的空窗」</b>：见 PcmSink#beginTransitionSilence()。
-			//
-			// 上面的 flush() 把抖动缓冲清了，接下来几百毫秒没有任何音源供数——
-			// 混音器的判据分不清这和丢包的区别，8 块（约 160ms）后就会把
-			// 「弱网底噪」拉到满强度，节目接上后还要再沙 500ms。
-			// 听感正是「一换歌就沙一阵」。
-			//
-			// 服务端在换曲的第一块之前也会发一个空音量包（S2C_AUDIO_SILENCE）
-			// 做同样的事；这里是<b>兜底</b>：包丢了、或对面是旧服务端时，
-			// 本地判定仍然能把这段空窗认出来。
-			PcmSink.INSTANCE.beginTransitionSilence();
 			stream = null;
 		}
 		if (stream == null) {

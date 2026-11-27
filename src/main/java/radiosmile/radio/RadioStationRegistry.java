@@ -341,7 +341,7 @@ public final class RadioStationRegistry {
 
 	/** 记录单个频道在这一刻正在播的曲目（见 {@link #captureHeadsBeforeReload()}）。 */
 	private static void captureHead(RadioStation station, long elapsed) {
-		if (station == null || !station.isPlaylist()) {
+		if (station == null || !isPlaylistStation(station)) {
 			return;
 		}
 		List<Path> tracks = resolveTracks(station);
@@ -349,7 +349,7 @@ public final class RadioStationRegistry {
 			return;
 		}
 		PlaylistTimeline timeline = PlaylistTimeline.of(
-				station.id(), tracks, station.isRandom(), station.seed(), null);
+				station.id(), tracks, isRandomEffective(station), station.seed(), null);
 		if (timeline == null) {
 			return;
 		}
@@ -950,9 +950,74 @@ public final class RadioStationRegistry {
 			return List.of(path);
 		}
 		if (Files.isDirectory(path)) {
-			return RadioPlaylist.scan(path, station.isRandom(), station.seed());
+			return RadioPlaylist.scan(path, isRandomEffective(station), station.seed());
 		}
 		return List.of();
+	}
+
+	/**
+	 * 该频道是否按<b>播放列表</b>处理（需要时间轴、需要逐曲轮播）。
+	 *
+	 * <p>判据是「有多条来源」，而<b>不是</b>「mode 写了 playlist」：
+	 * <ul>
+	 *   <li>目录：天然可能有多首，由 {@code mode} 决定顺序；</li>
+	 *   <li><b>txt 重定向列表：它本身就是一份播放列表</b>。
+	 *       服主常常只写 {@code file: mylist.txt} 而不写 {@code mode}
+	 *       （默认 block）——早期这里要求 {@code station.isPlaylist()}，
+	 *       于是这种配置被当成「只有第一首的单曲循环」，永远播同一首。
+	 *       用户看到的正是「列表播放 / 随机播放失效」。</li>
+	 * </ul>
+	 *
+	 * <p>是否打乱由 {@link #isRandomEffective} 决定，两者分开：
+	 * 「这是不是列表」与「列表要不要打乱」是两件事，混在一个判断里
+	 * 就是「一个值承担两种语义」的老问题。
+	 */
+	public static boolean isPlaylistStation(RadioStation station) {
+		if (station == null || station.isStreaming()) {
+			return false;
+		}
+		if (station.isPlaylist()) {
+			return true;
+		}
+		Path path = resolveAudioPath(station);
+		return path != null && Files.isRegularFile(path) && TxtPlaylist.isTxtPlaylist(path);
+	}
+
+	/**
+	 * 该频道<b>实际是否按「打乱顺序」播放</b>。
+	 *
+	 * <h2>为什么不能只看 {@link RadioStation#isRandom()}</h2>
+	 * 打乱这件事在配置里有<b>两个入口</b>：
+	 * <ol>
+	 *   <li>频道条目上的 {@code mode: random}；</li>
+	 *   <li>txt 播放列表<b>首行的 {@code true}</b>（文档里叫「打乱顺序」开关）。</li>
+	 * </ol>
+	 *
+	 * <p>而这两种写法此前的行为<b>完全不同</b>：
+	 * {@code mode=random} 交给 {@link PlaylistTimeline}，每轮重新洗牌；
+	 * txt 首行 {@code true} 只在解析时用「文件名派生的固定 seed」洗<b>一次</b>，
+	 * 之后每轮、每次重启都是那一份顺序——用户看到的就是「打了乱，但每次顺序都一样」，
+	 * 即反馈的「列表播放的随机播放又失效了」。
+	 *
+	 * <p>现在把两者<b>合并</b>：只要任一处要求打乱，就交给时间轴做真正的逐轮随机。
+	 * 顺序模式不受影响（两处都是 false 时仍然是自然序）。
+	 *
+	 * <p>注意：这里<b>不改</b>{@link TxtPlaylist} 解析时的那次打乱——它决定了
+	 * 「顺序模式下标了 true 的列表」的第一轮顺序，删掉会改变现有部署的听感。
+	 */
+	public static boolean isRandomEffective(RadioStation station) {
+		if (station == null) {
+			return false;
+		}
+		if (station.isRandom()) {
+			return true;
+		}
+		Path path = resolveAudioPath(station);
+		if (path == null || !Files.isRegularFile(path) || !TxtPlaylist.isTxtPlaylist(path)) {
+			return false;
+		}
+		TxtPlaylist.Parsed parsed = TxtPlaylist.parseCached(path, audioDir());
+		return parsed != null && parsed.random();
 	}
 
 	public static Path resolveIcon(RadioStation station) {
