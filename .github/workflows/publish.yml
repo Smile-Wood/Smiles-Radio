@@ -1,0 +1,117 @@
+# 每次推送到 main 自动构建，并以 beta 版本发布到 Modrinth。
+#
+# 前置配置（仓库 Settings → Secrets and variables → Actions）：
+#   secrets.MODRINTH_TOKEN     Modrinth 个人访问令牌，需要 "Create versions" 权限
+#   vars.MODRINTH_PROJECT_ID   Modrinth 项目 ID（项目页 Settings 里可复制）
+#
+# 两者缺一时只构建、不发布，并在运行摘要里给出提示，避免刚接入就整条流水线标红。
+#
+# 前置库 Smile's Lib Box 不随本模组发布，构建前从它自己的仓库检出并发布到 mavenLocal。
+
+name: publish-beta
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 不并发发布，但也不取消进行中的一次（上传到一半被 kill 会留下半成品版本）
+concurrency:
+  group: publish-beta
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+      MODRINTH_PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: checkout prerequisite library
+        uses: actions/checkout@v6
+        with:
+          repository: Smile-Wood/Smiles-Lib-Box
+          path: .libbox
+      - name: validate gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: make gradle wrapper executable
+        run: chmod +x ./gradlew .libbox/gradlew
+      - name: publish prerequisite library to mavenLocal
+        working-directory: .libbox
+        run: ./gradlew :1.20.1:publishToMavenLocal
+
+      # 版本号取自 gradle.properties 的基础版本，加上 run number 与短哈希：
+      # 同一提交重复跑也不会撞号，Modrinth 不会因为版本号重复而拒绝。
+      - name: derive beta version
+        id: version
+        run: |
+          base=$(sed -n 's/^version=//p' gradle.properties | head -1)
+          echo "value=${base}-beta.${GITHUB_RUN_NUMBER}+$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+      - name: build
+        run: ./gradlew build -Pversion="${{ steps.version.outputs.value }}"
+
+      - name: write changelog
+        run: |
+          {
+            echo "自动构建的 beta 版本，对应提交 \`${GITHUB_SHA::7}\`。"
+            echo
+            if [ -n "${{ github.event.before }}" ] && git rev-parse --verify --quiet "${{ github.event.before }}" >/dev/null; then
+              git log --pretty='- %s（`%h`）' "${{ github.event.before }}..HEAD"
+            else
+              git log --pretty='- %s（`%h`）' -1
+            fi
+            echo
+            echo "> beta 为自动构建产物，未经过完整人工验证。需要同时安装前置库 Smile's Lib Box。"
+          } > changelog.md
+          cat changelog.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: publish to modrinth
+        if: env.MODRINTH_TOKEN != '' && env.MODRINTH_PROJECT_ID != ''
+        uses: Kira-NT/mc-publish@v3.3.2
+        with:
+          # 该 action 原仓库为 Kir-Antipov/mc-publish，已迁移至 Kira-NT，功能相同
+          modrinth-id: ${{ env.MODRINTH_PROJECT_ID }}
+          modrinth-token: ${{ env.MODRINTH_TOKEN }}
+          name: Smile's Radio ${{ steps.version.outputs.value }}
+          version: ${{ steps.version.outputs.value }}
+          version-type: beta
+          changelog: changelog.md
+          loaders: fabric
+          game-versions: 1.20.1
+          files: "build/libs/!(*-@(dev|sources|javadoc)).jar"
+          # 前置库登上 Modrinth 之后取消注释，slug 与版本范围按实际值填：
+          # modrinth-dependencies: |
+          #   smile-libbox(required)@>=1.0.26
+
+      - name: explain the skipped publish
+        if: env.MODRINTH_TOKEN == '' || env.MODRINTH_PROJECT_ID == ''
+        run: |
+          echo "::warning::未配置 MODRINTH_TOKEN 或 MODRINTH_PROJECT_ID，本次只构建不发布。"
+          {
+            echo "### 已跳过 Modrinth 发布"
+            echo
+            echo "缺少以下任一配置："
+            echo
+            echo "- \`secrets.MODRINTH_TOKEN\`（Modrinth 个人访问令牌）"
+            echo "- \`vars.MODRINTH_PROJECT_ID\`（Modrinth 项目 ID）"
+            echo
+            echo "配置方式：仓库 Settings → Secrets and variables → Actions。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: capture build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: beta-jar
+          path: build/libs/
+          if-no-files-found: error

@@ -1,10 +1,17 @@
-# Builds the mod for every push and pull request.
+# Builds the mod for every pull request and for pushes to non-main branches.
+#
+# Pushes to main are handled by publish.yml, which builds the same way and then
+# publishes the result to Modrinth as a beta, so running this workflow there as
+# well would only duplicate the build.
 #
 # The mod does not ship its prerequisite library, so Smile's Lib Box is checked
 # out from its own repository and published to mavenLocal before building.
 
 name: build
-on: [pull_request, push]
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
 
 jobs:
   build:
