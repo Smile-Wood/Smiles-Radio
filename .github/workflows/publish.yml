@@ -90,7 +90,9 @@ jobs:
           loaders: fabric
           game-versions: 1.20.1
           files: "build/libs/!(*-@(dev|sources|javadoc)).jar"
-          # 前置库登上 Modrinth 之后取消注释，slug 与版本范围按实际值填：
+          # 前置库 Smile's Lib Box 已提交 Modrinth 审核。通过后取消下面两行注释，
+          # slug 换成审核后的实际值，版本范围与本模组 depends 里的 >=1.0.26 保持一致。
+          # 审核通过前写进去会导致发布失败，故暂时留空。
           # modrinth-dependencies: |
           #   smile-libbox(required)@>=1.0.26
 

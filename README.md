@@ -33,9 +33,28 @@ an error when the signal dies.
 1. Install Minecraft **1.20.1** + **Fabric Loader** (>= 0.20.1)
 2. Add the required dependencies:
    - [Fabric API](https://modrinth.com/mod/fabric-api) (>= 0.92.12+1.20.1)
-   - **smile_libbox** 1.0.26+1.20.1 (the config screen depends on it)
+   - **smile_libbox** 1.0.26+1.20.1 — required, explained below
 3. Drop `radio-smile-1.0.0.jar` into `mods/`
 4. **Optional**: install [ModMenu](https://modrinth.com/mod/modmenu) to change client settings in game
+
+### Required dependency: Smile's Lib Box
+
+`smile_libbox` is listed under `depends` in `fabric.mod.json`, so it is a hard requirement: without
+it the game refuses to load this mod at all. It is not an optional convenience.
+
+The library carries the two parts this mod deliberately does not ship itself:
+
+- **Config screen framework** — every option in the ModMenu screen is declared through its
+  `ConfigSpec` / `ConfigScreen` API.
+- **Cross-version adaptation layer** — the Minecraft interfaces that differ per game version
+  (screen override signatures, key mappings, input events) are compiled inside the library once per
+  version, so this mod only ever calls one stable API.
+
+Builds are published per game version (`+1.20.1` … `+1.21.11`). For 1.20.1 use
+`smile_libbox-1.0.26+1.20.1.jar` or newer — this mod requires `>= 1.0.26`. A `+generic.jar` exists
+for versions without an exact build, but it carries only the predicate API and enables no
+Minecraft-side adapter, so it is not a substitute on 1.20.1. Install exactly one build, and make
+sure it matches the game version.
 
 ### Optional: ffmpeg
 
