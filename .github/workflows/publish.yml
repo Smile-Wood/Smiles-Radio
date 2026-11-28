@@ -99,14 +99,18 @@ jobs:
       - name: explain the skipped publish
         if: env.MODRINTH_TOKEN == '' || env.MODRINTH_PROJECT_ID == ''
         run: |
-          echo "::warning::未配置 MODRINTH_TOKEN 或 MODRINTH_PROJECT_ID，本次只构建不发布。"
+          echo "::warning::Modrinth 发布配置不完整，本次只构建不发布（详见运行摘要）。"
           {
             echo "### 已跳过 Modrinth 发布"
             echo
-            echo "缺少以下任一配置："
+            echo "缺少以下配置，补齐后本次提交重新跑一次即可发布："
             echo
-            echo "- \`secrets.MODRINTH_TOKEN\`（Modrinth 个人访问令牌）"
-            echo "- \`vars.MODRINTH_PROJECT_ID\`（Modrinth 项目 ID）"
+            if [ -z "$MODRINTH_TOKEN" ]; then
+              echo "- \`secrets.MODRINTH_TOKEN\`：Modrinth 个人访问令牌，需要 Create versions 权限"
+            fi
+            if [ -z "$MODRINTH_PROJECT_ID" ]; then
+              echo "- \`vars.MODRINTH_PROJECT_ID\`：Modrinth 项目 ID"
+            fi
             echo
             echo "配置方式：仓库 Settings → Secrets and variables → Actions。"
           } >> "$GITHUB_STEP_SUMMARY"
