@@ -86,7 +86,7 @@ jobs:
           name: Smile's Radio ${{ steps.version.outputs.value }}
           version: ${{ steps.version.outputs.value }}
           version-type: beta
-          changelog: changelog.md
+          changelog-file: changelog.md
           loaders: fabric
           game-versions: 1.20.1
           files: "build/libs/!(*-@(dev|sources|javadoc)).jar"
