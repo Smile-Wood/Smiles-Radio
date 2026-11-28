@@ -90,11 +90,14 @@ jobs:
           loaders: fabric
           game-versions: 1.20.1
           files: "build/libs/!(*-@(dev|sources|javadoc)).jar"
-          # 前置库 Smile's Lib Box，BncFCksV 是它在 Modrinth 的项目 ID。
-          # 不写版本范围：这里的 version 段只接受具体版本号，范围会被丢掉，
-          # 而最低版本已由 jar 内 fabric.mod.json 的 depends(>=1.0.26) 保证。
+          # 显式声明会顶掉 Modrinth 对 fabric.mod.json 的自动解析，
+          # 因此 depends 里的 fabric-api 与 suggests 里的 modmenu 都要一并写全。
+          # BncFCksV 是 Smile's Lib Box 的项目 ID，其余用官方 slug。
+          # 不写版本范围：这里只接受具体版本号，最低版本由 fabric.mod.json 保证。
           modrinth-dependencies: |
+            P7dR8mSH(required)
             BncFCksV(required)
+            modmenu(optional)
 
       - name: explain the skipped publish
         if: env.MODRINTH_TOKEN == '' || env.MODRINTH_PROJECT_ID == ''
