@@ -301,4 +301,4 @@ https://example.com/song.mp3
 
 ## 许可证
 
-CC0-1.0
+MIT，详见 [LICENSE](LICENSE)。

@@ -10,7 +10,7 @@
 	"contact": {
 		"sources": "https://github.com/Smile-Wood/Smiles-Radio"
 	},
-	"license": "CC0-1.0",
+	"license": "MIT",
 	"icon": "assets/radio-smile/icon.png",
 	"environment": "*",
 	"entrypoints": {

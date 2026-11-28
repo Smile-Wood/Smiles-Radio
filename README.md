@@ -308,4 +308,4 @@ pitfalls that have already been hit (English: [HANDOVER.md](HANDOVER.md), Chines
 
 ## License
 
-CC0-1.0
+MIT — see [LICENSE](LICENSE).
