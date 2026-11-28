@@ -32,23 +32,23 @@ Minecraft 1.20.1 (Fabric) 的**可播放广播的收音机方块**模组。
 1. 安装 Minecraft **1.20.1** + **Fabric Loader**（≥ 0.20.1）
 2. 放入必须的前置：
    - [Fabric API](https://modrinth.com/mod/fabric-api)（≥ 0.92.12+1.20.1）
-   - **smile_libbox** 1.0.26+1.20.1（必需，见下）
 3. 把 `radio-smile-1.0.0.jar` 放进 `mods/`
-4. **可选**：安装 [ModMenu](https://modrinth.com/mod/modmenu) 以便在游戏内改客户端设置
+4. **可选，仅客户端**：安装 **smile_libbox** 以获得游戏内配置界面（见下），再装
+   [ModMenu](https://modrinth.com/mod/modmenu) 才能打开它
 
-### 必需前置：Smile's Lib Box
+### 可选（仅客户端）：Smile's Lib Box
 
-`smile_libbox` 在 `fabric.mod.json` 里写在 `depends` 下，属于硬性前置：缺了它游戏会直接拒绝
-加载本模组，不是「装不装都能跑」的软依赖。
+`smile_libbox` 写在 `recommends` 而不是 `depends` 下：没有它模组照常加载、照常播放。
+它只用来渲染配置界面，因此：
 
-这个库承担本模组刻意不自带的两个部分：
+- **专用服务端完全不需要装**——服务端没有任何代码碰这个库。
+- 客户端没装也能用，直接改 `config/radio-smile-client.json` 即可。
+- 装了的话，ModMenu 界面里的每一项都由它的 `ConfigSpec` / `ConfigScreen` 声明。
 
-- **配置界面框架**——ModMenu 界面里的每一项都由它的 `ConfigSpec` / `ConfigScreen` 声明。
-- **跨版本适配层**——各版本之间有差异的 Minecraft 接口（Screen 覆写签名、按键映射、输入事件）
-  在库里按版本各编译一份，本模组始终只调用一套稳定 API。
+缺库时 ModMenu 入口返回空屏幕，启动日志提示一句，不会因为缺类而加载失败。
 
 产物按游戏版本分别发布（`+1.20.1` … `+1.21.11`）。1.20.1 用 `smile_libbox-1.0.26+1.20.1.jar`
-或更高版本——本模组要求 `>= 1.0.26`。`+generic.jar` 是给没有精确对应版本的场合用的，只含谓词
+或更高版本——本模组推荐 `>= 1.0.26`。`+generic.jar` 是给没有精确对应版本的场合用的，只含谓词
 API、不启用任何 Minecraft 侧适配，在 1.20.1 上不能替代。`mods/` 里只放一份，并与游戏版本对应。
 
 ### 可选：ffmpeg

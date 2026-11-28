@@ -72,7 +72,7 @@ jobs:
               git log --pretty='- %s（`%h`）' -1
             fi
             echo
-            echo "> beta 为自动构建产物，未经过完整人工验证。需要同时安装前置库 Smile's Lib Box。"
+            echo "> beta 为自动构建产物，未经过完整人工验证。客户端另装前置库 Smile's Lib Box 才有配置界面，服务端无需安装。"
           } > changelog.md
           cat changelog.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -92,11 +92,12 @@ jobs:
           files: "build/libs/!(*-@(dev|sources|javadoc)).jar"
           # 显式声明会顶掉 Modrinth 对 fabric.mod.json 的自动解析，
           # 因此 depends 里的 fabric-api 与 suggests 里的 modmenu 都要一并写全。
-          # BncFCksV 是 Smile's Lib Box 的项目 ID，其余用官方 slug。
+          # BncFCksV 是 Smile's Lib Box 的项目 ID，只用于客户端配置界面，故标 optional：
+          # 缺了照常运行，专用服务端不需要装。其余用官方 slug。
           # 不写版本范围：这里只接受具体版本号，最低版本由 fabric.mod.json 保证。
           modrinth-dependencies: |
             P7dR8mSH(required)
-            BncFCksV(required)
+            BncFCksV(optional)
             modmenu(optional)
 
       - name: explain the skipped publish
